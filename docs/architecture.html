@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ETH Trading Bot - AWS Architecture</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #1a1a2e;
+            font-family: 'Segoe UI', sans-serif;
+            overflow: auto;
+        }
+        h1 {
+            color: #ff9900;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+        .controls {
+            position: fixed;
+            top: 10px;
+            right: 20px;
+            z-index: 1000;
+            background: #232f3e;
+            padding: 10px 15px;
+            border-radius: 8px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        .controls button {
+            background: #ff9900;
+            border: none;
+            color: #232f3e;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 16px;
+        }
+        .controls button:hover {
+            background: #ffb84d;
+        }
+        .controls span {
+            color: white;
+            font-size: 14px;
+        }
+        #diagram-container {
+            transform-origin: top left;
+            transition: transform 0.2s ease;
+        }
+        .mermaid {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            display: inline-block;
+            min-width: 100%;
+        }
+        .info {
+            color: #aaa;
+            text-align: center;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+        .cost-info {
+            color: #4CAF50;
+            text-align: center;
+            margin-bottom: 20px;
+            font-size: 16px;
+            font-weight: bold;
+        }
+        .note {
+            color: #888;
+            text-align: center;
+            font-size: 12px;
+            margin-bottom: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>ETH Trading Bot - AWS Architecture</h1>
+    <p class="cost-info">推定コスト: AWS約$2-8/月 + CryptoPanic Growth $199/月</p>
+    <p class="note">Lambda VPC外実行によりNAT Gateway ($45/月) を削減</p>
+    <p class="info">Ctrl+マウスホイールでズーム / ドラッグでスクロール</p>
+    
+    <div class="controls">
+        <button onclick="zoomIn()">+</button>
+        <span id="zoom-level">100%</span>
+        <button onclick="zoomOut()">-</button>
+        <button onclick="resetZoom()">Reset</button>
+    </div>
+
+    <div id="diagram-container">
+        <div class="mermaid">
+flowchart LR
+    subgraph External["External APIs"]
+        API_BINANCE["Binance API<br/>価格取得(ETH/USDT)"]
+        API_COINCHECK["Coincheck API<br/>取引執行(ETH/JPY)"]
+        API_CRYPTOPANIC["CryptoPanic API v2<br/>Growth Plan $199/月<br/>/api/growth/v2/posts/"]
+        SLACK["Slack Webhook"]
+    end
+
+    subgraph EventBridge["EventBridge Scheduler"]
+        EB_PRICE["5分間隔<br/>price-collection"]
+        EB_POSITION["5分間隔<br/>position-monitor"]
+        EB_NEWS["30分間隔<br/>news-collection"]
+        EB_ANALYSIS["analysis-trigger<br/>イベントパターン:<br/>source=eth-trading.price-collector<br/>detail-type=analysis-required"]
+    end
+
+    subgraph Lambda["Lambda Functions (VPC外)"]
+        L_PRICE["price-collector<br/>256MB/30s"]
+        L_TECH["technical<br/>512MB/60s<br/>SMA20/200対応"]
+        L_CHRONOS["chronos-caller<br/>1024MB/120s"]
+        L_SENTIMENT["sentiment-getter<br/>256MB/60s"]
+        L_AGG["aggregator<br/>256MB/60s"]
+        L_ORDER["order-executor<br/>256MB/30s"]
+        L_POSITION["position-monitor<br/>256MB/30s"]
+        L_NEWS["news-collector<br/>256MB/60s<br/>時間加重センチメント"]
+        L_SLACK["slack-notifier<br/>SNS→Slack転送"]
+        L_WARMUP["warm-up<br/>512MB/300s<br/>手動実行"]
+    end
+
+    subgraph StepFunctions["Step Functions"]
+        SF_START["Start"]
+        SF_PARALLEL["Parallel"]
+        SF_MERGE["Merge"]
+        SF_END["End"]
+    end
+
+    subgraph Messaging["Messaging"]
+        SQS_ORDER[["[SQS] order-queue"]]
+        SQS_DLQ[["[SQS] order-dlq"]]
+        SNS_NOTIFY{{"[SNS] notifications"}}
+        SNS_ALERT{{"[SNS] alerts"}}
+        CW_ALARM["CloudWatch Alarm<br/>DLQメッセージ数 > 0"]
+    end
+
+    subgraph DynamoDB["DynamoDB (6 Tables)"]
+        DB_PRICES[("prices<br/>TTL:14日")]
+        DB_SENTIMENT[("sentiment<br/>TTL:14日")]
+        DB_POSITIONS[("positions")]
+        DB_TRADES[("trades")]
+        DB_SIGNALS[("signals<br/>TTL:90日")]
+        DB_STATE[("analysis_state")]
+    end
+
+    subgraph Secrets["Secrets Manager"]
+        SM_COINCHECK["coincheck/api-credentials"]
+    end
+
+    %% ========== 定期実行フロー ==========
+    EB_PRICE -->|"毎5分起動"| L_PRICE
+    EB_POSITION -->|"毎5分起動"| L_POSITION
+    EB_NEWS -->|"30分毎"| L_NEWS
+
+    %% ========== 変動検知→分析フロー ==========
+    L_PRICE -->|"1. 5分足価格取得"| API_BINANCE
+    L_PRICE -->|"2. 現在価格を保存"| DB_PRICES
+    L_PRICE -->|"3. 1時間前と比較"| DB_PRICES
+    L_PRICE -->|"4. 変動>=0.3%の場合<br/>PutEvents発行"| EB_ANALYSIS
+    EB_ANALYSIS -->|"イベント受信<br/>→ワークフロー起動"| SF_START
+
+    %% ========== Step Functions分析フロー ==========
+    SF_START --> SF_PARALLEL
+    SF_PARALLEL -->|"Branch 1"| L_TECH
+    SF_PARALLEL -->|"Branch 2"| L_CHRONOS
+    SF_PARALLEL -->|"Branch 3"| L_SENTIMENT
+    L_TECH -->|"RSI,MACD計算結果"| SF_MERGE
+    L_CHRONOS -->|"AI予測結果"| SF_MERGE
+    L_SENTIMENT -->|"センチメント"| SF_MERGE
+    SF_MERGE --> L_AGG
+    L_AGG --> SF_END
+
+    %% Lambda → DynamoDB
+    L_TECH -->|"直近250件取得<br/>SMA200計算"| DB_PRICES
+    L_CHRONOS -->|"直近60件取得"| DB_PRICES
+    L_SENTIMENT -->|"最新取得"| DB_SENTIMENT
+    L_NEWS -->|"スコア保存"| DB_SENTIMENT
+    L_AGG -->|"シグナル保存"| DB_SIGNALS
+    L_AGG -->|"状態更新"| DB_STATE
+    L_ORDER -->|"残高確認"| DB_POSITIONS
+    L_ORDER -->|"約定記録"| DB_TRADES
+    L_POSITION -->|"ポジション確認"| DB_POSITIONS
+
+    %% warm-up Lambda
+    L_WARMUP -->|"過去1000件取得"| API_BINANCE
+    L_WARMUP -->|"一括投入"| DB_PRICES
+
+    %% ========== 注文実行フロー ==========
+    L_AGG -->|"シグナル発生時<br/>SendMessage"| SQS_ORDER
+    SQS_ORDER -->|"トリガー"| L_ORDER
+    SQS_ORDER -.->|"3回失敗"| SQS_DLQ
+
+    %% ========== DLQ → Slack通知 ==========
+    SQS_DLQ -->|"メッセージ数監視"| CW_ALARM
+    CW_ALARM -->|"アラーム発火"| SNS_ALERT
+    SNS_ALERT -->|"Subscribe"| L_SLACK
+    L_SLACK -->|"Webhook POST"| SLACK
+
+    %% ========== 取引通知 → Slack ==========
+    L_ORDER -->|"約定時Publish"| SNS_NOTIFY
+    SNS_NOTIFY -->|"Subscribe"| L_SLACK
+
+    %% Lambda → External (直接アクセス - VPC外)
+    L_ORDER -->|"成行注文"| API_COINCHECK
+    L_POSITION -->|"残高API"| API_COINCHECK
+    L_NEWS -->|"ニュース取得"| API_CRYPTOPANIC
+
+    %% Secrets
+    L_ORDER -->|"認証情報"| SM_COINCHECK
+    L_POSITION -->|"認証情報"| SM_COINCHECK
+
+    %% Styles
+    classDef lambda fill:#ff9900,stroke:#232f3e,stroke-width:2px,color:#232f3e
+    classDef dynamodb fill:#3b48cc,stroke:#232f3e,stroke-width:2px,color:white
+    classDef eventbridge fill:#ff4f8b,stroke:#232f3e,stroke-width:2px,color:white
+    classDef sqs fill:#d86613,stroke:#232f3e,stroke-width:2px,color:white
+    classDef sns fill:#c41e3a,stroke:#232f3e,stroke-width:2px,color:white
+    classDef external fill:#232f3e,stroke:#ff9900,stroke-width:2px,color:white
+    classDef secrets fill:#d32f2f,stroke:#232f3e,stroke-width:2px,color:white
+    classDef sfn fill:#ff4f8b,stroke:#232f3e,stroke-width:2px,color:white
+    classDef alarm fill:#ff5722,stroke:#232f3e,stroke-width:2px,color:white
+
+    class L_PRICE,L_TECH,L_CHRONOS,L_SENTIMENT,L_AGG,L_ORDER,L_POSITION,L_NEWS,L_SLACK,L_WARMUP lambda
+    class DB_PRICES,DB_SENTIMENT,DB_POSITIONS,DB_TRADES,DB_SIGNALS,DB_STATE dynamodb
+    class EB_PRICE,EB_POSITION,EB_NEWS,EB_ANALYSIS eventbridge
+    class SQS_ORDER,SQS_DLQ sqs
+    class SNS_NOTIFY,SNS_ALERT sns
+    class API_BINANCE,API_COINCHECK,API_CRYPTOPANIC,SLACK external
+    class SM_COINCHECK secrets
+    class SF_START,SF_PARALLEL,SF_MERGE,SF_END sfn
+    class CW_ALARM alarm
+        </div>
+    </div>
+
+    <script>
+        mermaid.initialize({ 
+            startOnLoad: true,
+            theme: 'default',
+            flowchart: {
+                useMaxWidth: false,
+                htmlLabels: true,
+                curve: 'basis'
+            }
+        });
+
+        let scale = 1;
+        const container = document.getElementById('diagram-container');
+        const zoomDisplay = document.getElementById('zoom-level');
+
+        function updateZoom() {
+            container.style.transform = `scale(${scale})`;
+            zoomDisplay.textContent = Math.round(scale * 100) + '%';
+        }
+
+        function zoomIn() {
+            scale = Math.min(scale + 0.1, 3);
+            updateZoom();
+        }
+
+        function zoomOut() {
+            scale = Math.max(scale - 0.1, 0.3);
+            updateZoom();
+        }
+
+        function resetZoom() {
+            scale = 1;
+            updateZoom();
+        }
+
+        document.addEventListener('wheel', (e) => {
+            if (e.ctrlKey) {
+                e.preventDefault();
+                if (e.deltaY < 0) {
+                    zoomIn();
+                } else {
+                    zoomOut();
+                }
+            }
+        }, { passive: false });
+    </script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+# =============================================================================
+# Terraform Variables (EXAMPLE)
+# =============================================================================
+# Copy this file to terraform.tfvars and fill in your values
+# DO NOT commit terraform.tfvars to git!
+
+# プロジェクト設定
+environment = "prod"
+aws_region  = "ap-northeast-1"
+
+# トレーディング設定
+volatility_threshold = 0.3
+max_position_jpy     = 100000
+
+# Slack Webhook URL (create at https://api.slack.com/apps)
+slack_webhook_url = ""
+
+# CryptoPanic API Key (https://cryptopanic.com/developers/api/)
+cryptopanic_api_key = ""
