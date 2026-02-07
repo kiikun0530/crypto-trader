@@ -13,8 +13,7 @@ AWS Serverless で構築した暗号通貨（ETH）自動売買システム
 
 ## アーキテクチャ
 
-- **構成図**: [docs/architecture.html](docs/architecture.html) をブラウザで開く
-- **設計思想**: [docs/architecture.md](docs/architecture.md) でアーキテクチャの設計理由を解説
+- **構成図・設計思想**: [docs/architecture.md](docs/architecture.md) ← GitHub上でMermaidダイアグラムがレンダリングされます
 
 ### Lambda関数（9個）
 
@@ -226,7 +225,7 @@ crypto-trader/
 │   ├── news-collector/
 │   └── warm-up/
 ├── docs/
-│   └── architecture.html  # アーキテクチャ図
+│   └── architecture.md  # アーキテクチャ設計書（構成図含む）
 └── README.md
 ```
 

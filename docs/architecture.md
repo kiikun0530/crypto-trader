@@ -1,7 +1,105 @@
 # アーキテクチャ設計書
 
-このドキュメントは、Crypto Traderの設計思想と各技術選定の理由を説明します。  
-システム構成図は [architecture.html](architecture.html) をブラウザで開いてください。
+このドキュメントは、Crypto Traderの設計思想と各技術選定の理由を説明します。
+
+---
+
+## システム構成図
+
+> **推定コスト**: AWS約$4-5/月 + CryptoPanic Growth $199/月（オプション）  
+> Lambda VPC外実行により NAT Gateway ($45/月) を削減
+
+```mermaid
+flowchart LR
+    subgraph External["External APIs"]
+        API_BINANCE["Binance API<br/>価格取得(ETH/USDT)"]
+        API_COINCHECK["Coincheck API<br/>取引執行(ETH/JPY)"]
+        API_CRYPTOPANIC["CryptoPanic API v2<br/>Growth Plan $199/月"]
+        SLACK["Slack Webhook"]
+    end
+
+    subgraph EventBridge["EventBridge Scheduler"]
+        EB_PRICE["5分間隔<br/>price-collection"]
+        EB_POSITION["5分間隔<br/>position-monitor"]
+        EB_NEWS["30分間隔<br/>news-collection"]
+        EB_ANALYSIS["analysis-trigger<br/>イベントパターン"]
+    end
+
+    subgraph Lambda["Lambda Functions (VPC外)"]
+        L_PRICE["price-collector<br/>256MB"]
+        L_TECH["technical<br/>512MB"]
+        L_CHRONOS["chronos-caller<br/>1024MB"]
+        L_SENTIMENT["sentiment-getter<br/>256MB"]
+        L_AGG["aggregator<br/>256MB"]
+        L_ORDER["order-executor<br/>256MB"]
+        L_POSITION["position-monitor<br/>256MB"]
+        L_NEWS["news-collector<br/>256MB"]
+    end
+
+    subgraph StepFunctions["Step Functions"]
+        SF_START["Start"]
+        SF_PARALLEL["Parallel"]
+        SF_MERGE["Merge"]
+        SF_END["End"]
+    end
+
+    subgraph Messaging["Messaging"]
+        SQS_ORDER[["order-queue"]]
+        SQS_DLQ[["order-dlq"]]
+        SNS_NOTIFY{{"notifications"}}
+    end
+
+    subgraph DynamoDB["DynamoDB (6 Tables)"]
+        DB_PRICES[("prices<br/>TTL:14日")]
+        DB_SENTIMENT[("sentiment<br/>TTL:14日")]
+        DB_POSITIONS[("positions")]
+        DB_TRADES[("trades")]
+        DB_SIGNALS[("signals<br/>TTL:90日")]
+        DB_STATE[("analysis_state")]
+    end
+
+    %% 定期実行フロー
+    EB_PRICE -->|"毎5分"| L_PRICE
+    EB_POSITION -->|"毎5分"| L_POSITION
+    EB_NEWS -->|"30分毎"| L_NEWS
+
+    %% 変動検知→分析フロー
+    L_PRICE -->|"価格取得"| API_BINANCE
+    L_PRICE -->|"保存"| DB_PRICES
+    L_PRICE -->|"変動>=0.3%"| EB_ANALYSIS
+    EB_ANALYSIS -->|"起動"| SF_START
+
+    %% Step Functions
+    SF_START --> SF_PARALLEL
+    SF_PARALLEL --> L_TECH
+    SF_PARALLEL --> L_CHRONOS
+    SF_PARALLEL --> L_SENTIMENT
+    L_TECH --> SF_MERGE
+    L_CHRONOS --> SF_MERGE
+    L_SENTIMENT --> SF_MERGE
+    SF_MERGE --> L_AGG
+    L_AGG --> SF_END
+
+    %% DynamoDB連携
+    L_TECH --> DB_PRICES
+    L_SENTIMENT --> DB_SENTIMENT
+    L_NEWS --> DB_SENTIMENT
+    L_AGG --> DB_SIGNALS
+    L_ORDER --> DB_TRADES
+
+    %% 注文実行
+    L_AGG -->|"シグナル"| SQS_ORDER
+    SQS_ORDER --> L_ORDER
+    SQS_ORDER -.->|"失敗"| SQS_DLQ
+
+    %% 通知
+    L_ORDER --> SNS_NOTIFY
+    SNS_NOTIFY --> SLACK
+
+    %% 外部API
+    L_ORDER --> API_COINCHECK
+    L_NEWS --> API_CRYPTOPANIC
+```
 
 ---
 
