@@ -47,6 +47,7 @@ flowchart LR
         SQS_ORDER[["order-queue"]]
         SQS_DLQ[["order-dlq"]]
         SNS_NOTIFY{{"notifications"}}
+        SNS_ALERTS{{"alerts"}}
     end
 
     subgraph DynamoDB["DynamoDB (6 Tables)"]
@@ -60,7 +61,7 @@ flowchart LR
 
     subgraph Monitoring["Monitoring & Alerting"]
         CW_LOGS["CloudWatch Logs<br/>全Lambda自動出力"]
-        CW_ALARM["CloudWatch Alarms<br/>エラー検知"]
+        CW_ALARM["CloudWatch Alarm<br/>DLQメッセージ監視"]
     end
 
     %% 定期実行フロー
@@ -108,7 +109,9 @@ flowchart LR
     %% Monitoring
     L_PRICE -.->|"ログ"| CW_LOGS
     L_ORDER -.->|"ログ"| CW_LOGS
-    CW_ALARM -->|"エラー通知"| SNS_NOTIFY
+    SQS_DLQ -.->|"メッセージ数監視"| CW_ALARM
+    CW_ALARM -->|"アラーム発火"| SNS_ALERTS
+    SNS_ALERTS -->|"エラー通知"| SLACK
 ```
 
 ---
