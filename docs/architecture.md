@@ -58,6 +58,11 @@ flowchart LR
         DB_STATE[("analysis_state")]
     end
 
+    subgraph Monitoring["Monitoring & Alerting"]
+        CW_LOGS["CloudWatch Logs<br/>全Lambda自動出力"]
+        CW_ALARM["CloudWatch Alarms<br/>エラー検知"]
+    end
+
     %% 定期実行フロー
     EB_PRICE -->|"毎5分"| L_PRICE
     EB_POSITION -->|"毎5分"| L_POSITION
@@ -99,6 +104,11 @@ flowchart LR
     %% 外部API
     L_ORDER --> API_COINCHECK
     L_NEWS --> API_CRYPTOPANIC
+
+    %% Monitoring
+    L_PRICE -.->|"ログ"| CW_LOGS
+    L_ORDER -.->|"ログ"| CW_LOGS
+    CW_ALARM -->|"エラー通知"| SNS_NOTIFY
 ```
 
 ---
