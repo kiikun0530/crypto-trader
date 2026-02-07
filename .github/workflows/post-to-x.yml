@@ -1,11 +1,11 @@
-name: Post to X on Push
+name: Generate X Post on Push
 
 on:
   push:
     branches: [main]
 
 jobs:
-  post-to-x:
+  generate-x-post:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,21 +18,18 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests requests-oauthlib
+        run: pip install requests
 
-      - name: Get commit info and post to X
+      - name: Generate X post and send to Slack
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          X_API_KEY: ${{ secrets.X_API_KEY }}
-          X_API_SECRET: ${{ secrets.X_API_SECRET }}
-          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
-          X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           python << 'SCRIPT'
           import os
           import subprocess
           import requests
-          from requests_oauthlib import OAuth1
+          import json
 
           # コミット情報取得
           commit_message = subprocess.check_output(
@@ -87,31 +84,68 @@ jobs:
               tweet = f"🚀 crypto-trader更新\n{commit_message[:80]}\n\nhttps://github.com/kiikun0530/crypto-trader\n\n#個人開発 #AWS #仕事ほしい"
               print(f"Using fallback: {tweet}")
 
-          # X API投稿
-          api_key = os.environ.get('X_API_KEY', '')
-          api_secret = os.environ.get('X_API_SECRET', '')
-          access_token = os.environ.get('X_ACCESS_TOKEN', '')
-          access_secret = os.environ.get('X_ACCESS_SECRET', '')
-
-          if not all([api_key, api_secret, access_token, access_secret]):
-              print("X API credentials not set")
+          # Slack通知
+          slack_url = os.environ.get('SLACK_WEBHOOK_URL', '')
+          if not slack_url:
+              print("SLACK_WEBHOOK_URL not set")
+              print(f"\n📝 X投稿用テキスト:\n{tweet}")
               exit(0)
 
-          auth = OAuth1(api_key, api_secret, access_token, access_secret)
+          slack_message = {
+              "blocks": [
+                  {
+                      "type": "header",
+                      "text": {
+                          "type": "plain_text",
+                          "text": "📝 X投稿用テキスト生成",
+                          "emoji": True
+                      }
+                  },
+                  {
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": f"*コミット:* `{commit_sha}`\n*メッセージ:* {commit_message}"
+                      }
+                  },
+                  {
+                      "type": "divider"
+                  },
+                  {
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": f"*コピペしてXに投稿してね👇*\n```{tweet}```"
+                      }
+                  },
+                  {
+                      "type": "actions",
+                      "elements": [
+                          {
+                              "type": "button",
+                              "text": {
+                                  "type": "plain_text",
+                                  "text": "🐦 Xを開く",
+                                  "emoji": True
+                              },
+                              "url": "https://twitter.com/intent/tweet"
+                          }
+                      ]
+                  }
+              ]
+          }
 
           try:
               resp = requests.post(
-                  'https://api.twitter.com/2/tweets',
-                  auth=auth,
-                  json={'text': tweet},
-                  timeout=30
+                  slack_url,
+                  json=slack_message,
+                  timeout=10
               )
-              print(f"X API Response: {resp.status_code}")
-              print(f"Response body: {resp.text}")
-              if resp.status_code == 201:
-                  print("Tweet posted successfully!")
+              print(f"Slack Response: {resp.status_code}")
+              if resp.status_code == 200:
+                  print("Slack notification sent!")
               else:
-                  print("Failed to post tweet")
+                  print(f"Slack failed: {resp.text}")
           except Exception as e:
-              print(f"X API error: {e}")
+              print(f"Slack error: {e}")
           SCRIPT
