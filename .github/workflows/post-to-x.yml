@@ -12,163 +12,106 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Get commit info
-        id: commit
-        run: |
-          echo "message<<EOF" >> $GITHUB_OUTPUT
-          git log -1 --pretty=format:"%s" >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          echo "author=$(git log -1 --pretty=format:'%an')" >> $GITHUB_OUTPUT
-          echo "sha=$(git log -1 --pretty=format:'%h')" >> $GITHUB_OUTPUT
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-      - name: Summarize with GitHub Models
-        id: summarize
-        uses: actions/github-script@v7
+      - name: Install dependencies
+        run: pip install requests requests-oauthlib
+
+      - name: Get commit info and post to X
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          script: |
-            const commitMessage = `${{ steps.commit.outputs.message }}`;
-            const sha = `${{ steps.commit.outputs.sha }}`;
-            
-            // GitHub Models API呼び出し
-            const response = await fetch('https://models.inference.ai.azure.com/chat/completions', {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`,
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify({
-                model: 'gpt-4o-mini',
-                messages: [
-                  {
-                    role: 'system',
-                    content: `あなたはX（Twitter）投稿を作成するアシスタントです。
-以下のルールに従ってください：
-- 日本語で書く
-- 絵文字を適度に使う
-- 140文字以内に収める
-- ハッシュタグは最後に「#個人開発 #AWS #仕事ほしい」を必ず入れる
-- 技術的な内容をわかりやすく
-- 「crypto-trader更新」で始める`
-                  },
-                  {
-                    role: 'user',
-                    content: `以下のGitコミットメッセージをX投稿用に変換してください：
-
-コミット: ${sha}
-メッセージ: ${commitMessage}
-
-リポジトリURL: https://github.com/kiikun0530/crypto-trader`
-                  }
-                ],
-                max_tokens: 200,
-                temperature: 0.7
-              })
-            });
-            
-            if (!response.ok) {
-              console.log('GitHub Models API failed, using fallback');
-              // フォールバック：シンプルな投稿
-              const fallback = `🚀 crypto-trader更新\n${commitMessage.substring(0, 80)}\n\nhttps://github.com/kiikun0530/crypto-trader\n\n#個人開発 #AWS #仕事ほしい`;
-              core.setOutput('tweet', fallback);
-              return;
-            }
-            
-            const data = await response.json();
-            const tweet = data.choices[0].message.content.trim();
-            console.log('Generated tweet:', tweet);
-            core.setOutput('tweet', tweet);
-
-      - name: Post to X
-        uses: actions/github-script@v7
-        env:
           X_API_KEY: ${{ secrets.X_API_KEY }}
           X_API_SECRET: ${{ secrets.X_API_SECRET }}
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
           X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
-        with:
-          script: |
-            const crypto = require('crypto');
-            const https = require('https');
-            
-            const tweet = `${{ steps.summarize.outputs.tweet }}`;
-            
-            // OAuth 1.0a署名生成
-            function generateOAuthSignature(method, url, params, consumerSecret, tokenSecret) {
-              const sortedParams = Object.keys(params).sort().map(k => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`).join('&');
-              const baseString = `${method}&${encodeURIComponent(url)}&${encodeURIComponent(sortedParams)}`;
-              const signingKey = `${encodeURIComponent(consumerSecret)}&${encodeURIComponent(tokenSecret)}`;
-              return crypto.createHmac('sha1', signingKey).update(baseString).digest('base64');
-            }
-            
-            function generateNonce() {
-              return crypto.randomBytes(16).toString('hex');
-            }
-            
-            const url = 'https://api.twitter.com/2/tweets';
-            const method = 'POST';
-            const oauthParams = {
-              oauth_consumer_key: process.env.X_API_KEY,
-              oauth_token: process.env.X_ACCESS_TOKEN,
-              oauth_signature_method: 'HMAC-SHA1',
-              oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
-              oauth_nonce: generateNonce(),
-              oauth_version: '1.0'
-            };
-            
-            const signature = generateOAuthSignature(
-              method, 
-              url, 
-              oauthParams, 
-              process.env.X_API_SECRET, 
-              process.env.X_ACCESS_SECRET
-            );
-            
-            oauthParams.oauth_signature = signature;
-            
-            const authHeader = 'OAuth ' + Object.keys(oauthParams)
-              .sort()
-              .map(k => `${encodeURIComponent(k)}="${encodeURIComponent(oauthParams[k])}"`)
-              .join(', ');
-            
-            const postData = JSON.stringify({ text: tweet });
-            
-            const options = {
-              hostname: 'api.twitter.com',
-              path: '/2/tweets',
-              method: 'POST',
-              headers: {
-                'Authorization': authHeader,
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(postData)
-              }
-            };
-            
-            return new Promise((resolve, reject) => {
-              const req = https.request(options, (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => {
-                  console.log('Response status:', res.statusCode);
-                  console.log('Response:', data);
-                  if (res.statusCode === 201) {
-                    console.log('Tweet posted successfully!');
-                    resolve();
-                  } else {
-                    console.log('Failed to post tweet');
-                    // 失敗してもワークフローは成功扱いにする
-                    resolve();
-                  }
-                });
-              });
-              
-              req.on('error', (e) => {
-                console.log('Request error:', e.message);
-                resolve(); // エラーでもワークフローは成功扱い
-              });
-              
-              req.write(postData);
-              req.end();
-            });
+        run: |
+          python << 'SCRIPT'
+          import os
+          import subprocess
+          import requests
+          from requests_oauthlib import OAuth1
+
+          # コミット情報取得
+          commit_message = subprocess.check_output(
+              ['git', 'log', '-1', '--pretty=format:%s'],
+              text=True
+          ).strip()
+          commit_sha = subprocess.check_output(
+              ['git', 'log', '-1', '--pretty=format:%h'],
+              text=True
+          ).strip()
+
+          print(f"Commit: {commit_sha}")
+          print(f"Message: {commit_message}")
+
+          # GitHub Models APIで要約
+          github_token = os.environ.get('GITHUB_TOKEN', '')
+          tweet = None
+
+          try:
+              resp = requests.post(
+                  'https://models.inference.ai.azure.com/chat/completions',
+                  headers={
+                      'Authorization': f'Bearer {github_token}',
+                      'Content-Type': 'application/json'
+                  },
+                  json={
+                      'model': 'gpt-4o-mini',
+                      'messages': [
+                          {
+                              'role': 'system',
+                              'content': 'あなたはX投稿を作成するアシスタントです。ルール：日本語で書く、絵文字を適度に使う、140文字以内、最後に「#個人開発 #AWS #仕事ほしい」を必ず入れる、「crypto-trader更新」で始める'
+                          },
+                          {
+                              'role': 'user',
+                              'content': f'以下のGitコミットをX投稿用に変換:\nコミット: {commit_sha}\nメッセージ: {commit_message}'
+                          }
+                      ],
+                      'max_tokens': 200,
+                      'temperature': 0.7
+                  },
+                  timeout=30
+              )
+              if resp.status_code == 200:
+                  data = resp.json()
+                  tweet = data['choices'][0]['message']['content'].strip()
+                  print(f"Generated tweet: {tweet}")
+          except Exception as e:
+              print(f"GitHub Models failed: {e}")
+
+          # フォールバック
+          if not tweet:
+              tweet = f"🚀 crypto-trader更新\n{commit_message[:80]}\n\nhttps://github.com/kiikun0530/crypto-trader\n\n#個人開発 #AWS #仕事ほしい"
+              print(f"Using fallback: {tweet}")
+
+          # X API投稿
+          api_key = os.environ.get('X_API_KEY', '')
+          api_secret = os.environ.get('X_API_SECRET', '')
+          access_token = os.environ.get('X_ACCESS_TOKEN', '')
+          access_secret = os.environ.get('X_ACCESS_SECRET', '')
+
+          if not all([api_key, api_secret, access_token, access_secret]):
+              print("X API credentials not set")
+              exit(0)
+
+          auth = OAuth1(api_key, api_secret, access_token, access_secret)
+
+          try:
+              resp = requests.post(
+                  'https://api.twitter.com/2/tweets',
+                  auth=auth,
+                  json={'text': tweet},
+                  timeout=30
+              )
+              print(f"X API Response: {resp.status_code}")
+              print(f"Response body: {resp.text}")
+              if resp.status_code == 201:
+                  print("Tweet posted successfully!")
+              else:
+                  print("Failed to post tweet")
+          except Exception as e:
+              print(f"X API error: {e}")
+          SCRIPT
