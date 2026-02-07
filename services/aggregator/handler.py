@@ -7,12 +7,14 @@ import os
 import time
 import boto3
 from decimal import Decimal
+import urllib.request
 
 dynamodb = boto3.resource('dynamodb')
 sqs = boto3.client('sqs')
 
 SIGNALS_TABLE = os.environ.get('SIGNALS_TABLE', 'eth-trading-signals')
 ORDER_QUEUE_URL = os.environ.get('ORDER_QUEUE_URL', '')
+SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL', '')
 
 # 重み設定
 TECHNICAL_WEIGHT = float(os.environ.get('TECHNICAL_WEIGHT', '0.45'))
@@ -91,6 +93,9 @@ def handler(event, context):
         
         result['has_signal'] = has_signal
         
+        # Slackに分析結果を通知
+        notify_slack(result)
+        
         return result
         
     except Exception as e:
@@ -141,3 +146,88 @@ def send_order_message(pair: str, signal: str, score: float, timestamp: int):
             'timestamp': timestamp
         })
     )
+
+def notify_slack(result: dict):
+    """Slackに分析結果を通知"""
+    if not SLACK_WEBHOOK_URL:
+        print("SLACK_WEBHOOK_URL not set, skipping notification")
+        return
+    
+    try:
+        signal = result.get('signal', 'UNKNOWN')
+        total_score = result.get('total_score', 0)
+        components = result.get('components', {})
+        
+        # シグナルに応じた絵文字
+        emoji = {
+            'BUY': '🟢',
+            'SELL': '🔴',
+            'HOLD': '⚪'
+        }.get(signal, '❓')
+        
+        # 閾値情報
+        threshold_info = f"BUY閾値: {BUY_THRESHOLD} / SELL閾値: {SELL_THRESHOLD}"
+        
+        # スコアバー生成（-1〜1を可視化）
+        def score_bar(score):
+            # -1〜1を0〜10に変換
+            pos = int((score + 1) * 5)
+            pos = max(0, min(10, pos))
+            return '▓' * pos + '░' * (10 - pos)
+        
+        message = {
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": f"{emoji} ETH分析結果: {signal}",
+                        "emoji": True
+                    }
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*総合スコア*\n`{total_score:+.4f}`"},
+                        {"type": "mrkdwn", "text": f"*判定*\n{signal}"}
+                    ]
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*スコア内訳*\n"
+                                f"テクニカル (40%): `{components.get('technical', 0):+.3f}` {score_bar(components.get('technical', 0))}\n"
+                                f"Chronos AI (40%): `{components.get('chronos', 0):+.3f}` {score_bar(components.get('chronos', 0))}\n"
+                                f"センチメント (20%): `{components.get('sentiment', 0):+.3f}` {score_bar(components.get('sentiment', 0))}"
+                    }
+                },
+                {
+                    "type": "context",
+                    "elements": [
+                        {"type": "mrkdwn", "text": f"📊 {threshold_info}"}
+                    ]
+                }
+            ]
+        }
+        
+        # BUY/SELL時は強調
+        if signal in ['BUY', 'SELL']:
+            message["blocks"].append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"⚡ *注文キューに送信しました*"
+                }
+            })
+        
+        req = urllib.request.Request(
+            SLACK_WEBHOOK_URL,
+            data=json.dumps(message).encode('utf-8'),
+            headers={'Content-Type': 'application/json'}
+        )
+        urllib.request.urlopen(req, timeout=5)
+        print("Slack notification sent")
+        
+    except Exception as e:
+        print(f"Slack notification failed: {e}")
