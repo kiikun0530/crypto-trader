@@ -49,7 +49,7 @@ jobs:
 - 日本語で書く
 - 絵文字を適度に使う
 - 140文字以内に収める
-- ハッシュタグは最後に2-3個
+- ハッシュタグは最後に「#個人開発 #AWS #仕事ほしい」を必ず入れる
 - 技術的な内容をわかりやすく
 - 「crypto-trader更新」で始める`
                   },
@@ -71,7 +71,7 @@ jobs:
             if (!response.ok) {
               console.log('GitHub Models API failed, using fallback');
               // フォールバック：シンプルな投稿
-              const fallback = `🚀 crypto-trader更新\n${commitMessage.substring(0, 80)}\n\nhttps://github.com/kiikun0530/crypto-trader\n\n#個人開発 #AWS`;
+              const fallback = `🚀 crypto-trader更新\n${commitMessage.substring(0, 80)}\n\nhttps://github.com/kiikun0530/crypto-trader\n\n#個人開発 #AWS #仕事ほしい`;
               core.setOutput('tweet', fallback);
               return;
             }
