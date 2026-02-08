@@ -1,33 +1,53 @@
 # Crypto Trader
 
-AWS Serverless で構築した暗号通貨（ETH）自動売買システム
+AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買システム
 
 ## 概要
 
-- **価格データ**: Binance API（5分足 OHLC）
-- **取引執行**: Coincheck API（ETH/JPY）
-- **テクニカル分析**: SMA20/200、ゴールデンクロス検出
-- **ニュースセンチメント**: CryptoPanic API（時間加重分析）
-- **時系列予測**: Amazon Chronos
-- **通知**: Slack Webhook
+6通貨（ETH / BTC / XRP / DOT / LINK / AVAX）を同時に分析し、最も期待値の高い通貨を自動で選択・売買する。
+
+- **対象通貨**: 6通貨（Binance + Coincheck 両対応の銘柄を厳選）
+- **価格データ**: Binance API（5分足 OHLC × 6通貨）
+- **取引執行**: Coincheck API（各通貨/JPY）
+- **テクニカル分析**: SMA20/200、RSI、MACD、ボリンジャーバンド
+- **ニュースセンチメント**: CryptoPanic API（全通貨一括取得 + BTC相関分析）
+- **時系列予測**: Amazon Chronos（ECS未デプロイ時はモメンタム代替）
+- **ポジション管理**: 1通貨のみ保有（他通貨排他制御）
+- **通知**: Slack Webhook（全通貨ランキング付き）
 
 ## アーキテクチャ
 
-- **構成図・設計思想**: [docs/architecture.md](docs/architecture.md) ← GitHub上でMermaidダイアグラムがレンダリングされます
+- **設計ドキュメント**:
+  - [docs/architecture.md](docs/architecture.md) — システム構成・設計思想
+  - [docs/trading-strategy.md](docs/trading-strategy.md) — 売買戦略・スコアリング
+  - [docs/lambda-reference.md](docs/lambda-reference.md) — Lambda関数リファレンス
+
+> GitHub上でMermaidダイアグラムがレンダリングされます
+
+### 対象通貨（6通貨）
+
+| 通貨 | Binanceペア | Coincheckペア | 選定理由 |
+|------|------------|--------------|----------|
+| ETH | ETHUSDT | eth_jpy | DeFi基盤、高流動性 |
+| BTC | BTCUSDT | btc_jpy | 市場牽引力、Coincheck対応 |
+| XRP | XRPUSDT | xrp_jpy | 送金特化、高速決済 |
+| DOT | DOTUSDT | dot_jpy | クロスチェーン基盤 |
+| LINK | LINKUSDT | link_jpy | オラクル需要 |
+| AVAX | AVAXUSDT | avax_jpy | 高速L1、DeFi成長 |
 
 ### Lambda関数（9個）
 
 | 関数名 | 役割 | 実行間隔 |
 |--------|------|----------|
-| price-collector | Binanceから価格取得、変動検知 | 5分 |
-| technical | SMA計算、ゴールデンクロス検出 | イベント駆動 |
-| chronos-caller | Amazon Chronos時系列予測 | イベント駆動 |
-| sentiment-getter | センチメントスコア取得 | イベント駆動 |
-| aggregator | 分析結果統合、シグナル生成 | イベント駆動 |
-| order-executor | Coincheckで注文実行 | SQSトリガー |
-| position-monitor | ポジション監視、損切り/利確 | 5分 |
-| news-collector | CryptoPanicからニュース取得 | 30分 |
-| warm-up | 初回データ投入（手動） | - |
+| price-collector | 全6通貨の価格取得・変動検知 | 5分 |
+| technical | テクニカル指標計算（RSI, MACD, SMA, BB） | Step Functions (×6) |
+| chronos-caller | AI時系列予測 / モメンタム代替 | Step Functions (×6) |
+| sentiment-getter | 通貨別センチメントスコア取得 | Step Functions (×6) |
+| aggregator | 全通貨スコアリング・ランキング・売買判定 | Step Functions |
+| order-executor | Coincheckで成行注文実行（1ポジション制御） | SQSトリガー |
+| position-monitor | 全通貨のSL(-5%)/TP(+10%)監視 | 5分 |
+| news-collector | 全通貨ニュース一括取得・BTC相関分析 | 30分 |
+| warm-up | 全通貨の初回データ投入（手動） | - |
 
 ### DynamoDBテーブル（6個）
 
@@ -42,16 +62,16 @@ AWS Serverless で構築した暗号通貨（ETH）自動売買システム
 
 ## 推定コスト
 
-### AWSインフラ費用
+### AWSインフラ費用（6通貨分析時）
 
 | 項目 | 月額 |
 |------|------|
-| Lambda | ~$3.50 |
-| DynamoDB | ~$0.15 |
-| Step Functions | ~$0.05 |
-| CloudWatch | ~$0.05 |
+| Lambda | ~$5.00 |
+| DynamoDB | ~$0.25 |
+| Step Functions | ~$0.10 |
+| CloudWatch | ~$0.10 |
 | Secrets Manager | ~$0.50 |
-| **合計** | **~$4-5** |
+| **合計** | **~$6** |
 
 > 詳細な計算式は [docs/architecture.md](docs/architecture.md) を参照
 
@@ -63,7 +83,7 @@ AWS Serverless で構築した暗号通貨（ETH）自動売買システム
 | CryptoPanic | 無料 or $199/月 | Growth Planでリアルタイムニュース取得 |
 | Coincheck | 0% | 取引所取引は手数料無料 |
 
-> **総コスト目安**: 無料構成 ~$4-5/月、Growth Plan ~$203-205/月
+> **総コスト目安**: 無料構成 ~$6/月、Growth Plan ~$205/月
 
 ## 前提条件
 
@@ -77,7 +97,7 @@ AWS Serverless で構築した暗号通貨（ETH）自動売買システム
 
 | 項目 | 値 |
 |------|-----|
-| ETH最低取引量 | 0.001 ETH（Coincheck仕様） |
+| 最低取引量 | 通貨により異なる（例: ETH 0.001, BTC 0.001） |
 | システム最低注文額 | 500円（MIN_ORDER_JPY） |
 | 推奨入金額 | 10,000円〜 |
 
@@ -156,10 +176,18 @@ terraform apply
 ### 8. 初回データ投入
 
 ```bash
-# 過去1000件の価格データを投入
+# 全6通貨の過去1000件の価格データを一括投入
 aws lambda invoke \
   --function-name eth-trading-warm-up \
   --payload '{}' \
+  --cli-binary-format raw-in-base64-out \
+  response.json
+
+# 特定の通貨のみ投入する場合
+aws lambda invoke \
+  --function-name eth-trading-warm-up \
+  --payload '{"pair": "btc_usdt"}' \
+  --cli-binary-format raw-in-base64-out \
   response.json
 ```
 
@@ -195,7 +223,7 @@ aws logs tail /aws/lambda/eth-trading-price-collector --since 5m
 
 ## 手数料
 
-Coincheck取引所のETH取引手数料は **0%** です（2026年2月時点）。
+Coincheck取引所の取引手数料は **0%** です（2026年2月時点、対象通貨: ETH, BTC, XRP等）。
 
 ## ローカル開発
 
@@ -236,7 +264,9 @@ crypto-trader/
 │   ├── news-collector/
 │   └── warm-up/
 ├── docs/
-│   └── architecture.md  # アーキテクチャ設計書（構成図含む）
+│   ├── architecture.md     # システム構成・設計思想
+│   ├── trading-strategy.md # 売買戦略・スコアリング
+│   └── lambda-reference.md # Lambda関数リファレンス
 └── README.md
 ```
 
