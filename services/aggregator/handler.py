@@ -405,20 +405,13 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
                         pos_name = config['name']
                         break
 
-                # 現在価格を scored_pairs から取得（フォールバック: Coincheck API）
+                # 現在価格をCoincheck APIから取得（JPY建て）
+                # scored_pairsのcurrent_priceはBinance USDT建てなのでP/L計算に使えない
                 current_price = 0
-                for pair_key, config in TRADING_PAIRS.items():
-                    if config['coincheck'] == pos_pair:
-                        pair_data = next((s for s in scored_pairs if s['pair'] == pair_key), None)
-                        if pair_data:
-                            current_price = pair_data.get('current_price', 0)
-                        break
-
-                if not current_price:
-                    try:
-                        current_price = get_current_price(pos_pair)
-                    except Exception:
-                        pass
+                try:
+                    current_price = get_current_price(pos_pair)
+                except Exception as e:
+                    print(f"Failed to get current price for {pos_pair}: {e}")
 
                 if entry_price > 0 and current_price > 0:
                     pnl = (current_price - entry_price) * amount
