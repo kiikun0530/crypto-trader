@@ -115,19 +115,19 @@ jobs:
           - 「feat: add ONNX support」← コミットログそのまま"""
 
           # LLMに渡すユーザーメッセージ（リッチなコンテキスト）
-          user_message = f"""以下のコミット情報からX投稿を生成してください。
-コミットログだけでなく、変更ファイルや差分から「何をなぜやったか」を読み取って、開発者の視点で語ってください。
-
-## コミット
-件名: {commit_subject}
-本文:
-{commit_body if commit_body else '(なし)'}
-
-## 変更ファイル
-{changed_files}
-
-## 差分サマリ
-{diff_stat}"""
+          body_text = commit_body if commit_body else '(なし)'
+          user_message = (
+              "以下のコミット情報からX投稿を生成してください。\n"
+              "コミットログだけでなく、変更ファイルや差分から「何をなぜやったか」を読み取って、開発者の視点で語ってください。\n\n"
+              "## コミット\n"
+              f"件名: {commit_subject}\n"
+              "本文:\n"
+              f"{body_text}\n\n"
+              "## 変更ファイル\n"
+              f"{changed_files}\n\n"
+              "## 差分サマリ\n"
+              f"{diff_stat}"
+          )
 
           try:
               resp = requests.post(
