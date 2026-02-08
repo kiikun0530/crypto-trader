@@ -132,6 +132,16 @@ EOF
   }
 }
 
+resource "aws_cloudwatch_log_group" "slack_notifier" {
+  count             = var.slack_webhook_url != "" ? 1 : 0
+  name              = "/aws/lambda/${local.name_prefix}-slack-notifier"
+  retention_in_days = 14
+
+  tags = {
+    Name = "${local.name_prefix}-slack-notifier"
+  }
+}
+
 resource "aws_lambda_function" "slack_notifier" {
   count            = var.slack_webhook_url != "" ? 1 : 0
   function_name    = "${local.name_prefix}-slack-notifier"
@@ -151,6 +161,8 @@ resource "aws_lambda_function" "slack_notifier" {
   tags = {
     Name = "${local.name_prefix}-slack-notifier"
   }
+
+  depends_on = [aws_cloudwatch_log_group.slack_notifier]
 }
 
 # notifications → Slack
