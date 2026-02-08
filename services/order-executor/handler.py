@@ -7,6 +7,19 @@ SQSからシグナルを受信し、Coincheck APIで注文実行
 - 任意の通貨ペアで買い・売りが可能
 - 1ポジション制約（他通貨にポジションがある場合は買わない）
 - スコアに応じた投資金額調整（期待値連動）
+
+⚠️ Coincheck成行注文の重要な仕様:
+- market_buy / market_sell のレスポンスは amount=None, rate=None
+- 約定データは非同期で /api/exchange/orders/transactions から取得
+- 約定は複数トランザクションに分割されることがある（limit=100必須）
+- 各fundsの値は正負が混在するため abs() で処理する
+- 詳細: docs/bugfix-history.md
+
+⚠️ SQSバッチ処理の注意点:
+- handler()でraiseすると未処理レコード含むバッチ全体が再配信される
+- 注文成功後にDB保存で失敗→raise→再配信→二重注文のリスク
+- エラーはログ+Slack通知のみ、raiseしない設計
+- _just_bought_pairs: 同一バッチ内のBUY→即SELL防止
 """
 import json
 import os
@@ -79,6 +92,8 @@ def get_currency_name(pair: str) -> str:
 
 
 # 同一Lambda呼び出し内で買った通貨を追跡（バッチ内即売り防止）
+# SQSバッチにBUY+SELLが同居すると、BUY直後にSELLが実行される問題の対策
+# execute_buy()成功時にペアを追加、process_order()のSELL分岐でチェック
 _just_bought_pairs = set()
 
 
@@ -97,9 +112,10 @@ def handler(event, context):
             import traceback
             traceback.print_exc()
             errors.append(str(e))
-            # raiseしない → 他のレコードは正常処理を継続
-            # 注文自体が成功してDB保存だけ失敗したケースでは
-            # raiseすると再試行→二重注文の原因となるため
+            # ⚠️ 絶対にraiseしない（SQSバッチ再配信→二重注文防止）
+            # Coincheck注文APIは成功したがDB保存で例外 → raiseすると
+            # SQSがバッチ全体を再配信 → 同じ注文がもう一度実行される
+            # 代わりにSlack通知で人間に知らせる
             send_notification('System', f'❌ 注文処理エラー\n{str(e)}')
 
     if errors:

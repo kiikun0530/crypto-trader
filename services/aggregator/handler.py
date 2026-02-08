@@ -157,7 +157,10 @@ def score_pair(pair: str, result: dict) -> dict:
             'chronos': round(chronos_normalized, 3),
             'sentiment': round(sentiment_normalized, 3)
         },
-        'current_price': result.get('technical', {}).get('current_price', 0),
+        # ⚠️ この価格はBinance USDT建て（例: ETH ~$2,100）
+        # Coincheck JPY建てのポジション価格と比較してはいけない
+        # P/L計算にはget_current_price()でJPY価格を別途取得すること
+        'current_price_usd': result.get('technical', {}).get('current_price', 0),
         'bb_width': bb_width
     }
 
@@ -295,7 +298,12 @@ def find_all_active_positions() -> list:
 
 
 def get_current_price(pair: str) -> float:
-    """Coincheck ticker APIから現在価格を取得"""
+    """
+    Coincheck ticker APIから現在価格を取得（JPY建て）
+
+    ⚠️ score_pair()のcurrent_price_usdはBinance USDT建て。
+    ポジションP/L計算には必ずこの関数でJPY価格を取得すること。
+    """
     url = f"https://coincheck.com/api/ticker?pair={pair}"
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=10) as response:
