@@ -10,11 +10,10 @@ import boto3
 
 dynamodb = boto3.resource('dynamodb')
 sqs = boto3.client('sqs')
-sns = boto3.client('sns')
 
 POSITIONS_TABLE = os.environ.get('POSITIONS_TABLE', 'eth-trading-positions')
 ORDER_QUEUE_URL = os.environ.get('ORDER_QUEUE_URL', '')
-NOTIFICATIONS_TOPIC_ARN = os.environ.get('NOTIFICATIONS_TOPIC_ARN', '')
+SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL', '')
 
 # 通貨ペア設定
 DEFAULT_PAIRS = {
@@ -147,9 +146,25 @@ def trigger_sell(pair: str, name: str, reason: str, current_price: float, entry_
         f"変動: {pnl_percent:+.2f}%"
     )
 
-    if NOTIFICATIONS_TOPIC_ARN:
-        sns.publish(
-            TopicArn=NOTIFICATIONS_TOPIC_ARN,
-            Subject=f'{name} {reason_text}',
-            Message=message
-        )
+    if SLACK_WEBHOOK_URL:
+        try:
+            payload = {
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": message
+                        }
+                    }
+                ]
+            }
+            req = urllib.request.Request(
+                SLACK_WEBHOOK_URL,
+                data=json.dumps(payload).encode('utf-8'),
+                headers={'Content-Type': 'application/json'}
+            )
+            response = urllib.request.urlopen(req, timeout=5)
+            print(f"Slack notification sent (status: {response.status})")
+        except Exception as e:
+            print(f"Slack notification failed: {e}")

@@ -19,12 +19,11 @@ import boto3
 from decimal import Decimal
 
 dynamodb = boto3.resource('dynamodb')
-sns = boto3.client('sns')
 secrets = boto3.client('secretsmanager')
 
 POSITIONS_TABLE = os.environ.get('POSITIONS_TABLE', 'eth-trading-positions')
 TRADES_TABLE = os.environ.get('TRADES_TABLE', 'eth-trading-trades')
-NOTIFICATIONS_TOPIC_ARN = os.environ.get('NOTIFICATIONS_TOPIC_ARN', '')
+SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL', '')
 COINCHECK_SECRET_ARN = os.environ.get('COINCHECK_SECRET_ARN', '')
 MAX_POSITION_JPY = float(os.environ.get('MAX_POSITION_JPY', '15000'))
 
@@ -497,10 +496,30 @@ def save_trade(pair: str, timestamp: int, action: str, result: dict):
 
 
 def send_notification(name: str, message: str):
-    """SNS通知送信"""
-    if NOTIFICATIONS_TOPIC_ARN:
-        sns.publish(
-            TopicArn=NOTIFICATIONS_TOPIC_ARN,
-            Subject=f'{name} Trading Alert',
-            Message=message
+    """Slack通知送信"""
+    if not SLACK_WEBHOOK_URL:
+        print(f"SLACK_WEBHOOK_URL not set, skipping notification: {message}")
+        return
+
+    try:
+        payload = {
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": message
+                    }
+                }
+            ]
+        }
+
+        req = urllib.request.Request(
+            SLACK_WEBHOOK_URL,
+            data=json.dumps(payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json'}
         )
+        response = urllib.request.urlopen(req, timeout=5)
+        print(f"Slack notification sent (status: {response.status})")
+    except Exception as e:
+        print(f"Slack notification failed: {e}")
