@@ -117,14 +117,16 @@ resource "aws_iam_role_policy" "lambda_custom" {
           "arn:aws:states:${var.aws_region}:${local.account_id}:stateMachine:${local.name_prefix}-*"
         ]
       },
-      # SageMaker Endpoint 呼び出し (Chronos AI価格予測)
+      # S3: ONNXモデル読み取り (Chronos AI価格予測)
       {
         Effect = "Allow"
         Action = [
-          "sagemaker:InvokeEndpoint"
+          "s3:GetObject",
+          "s3:ListBucket"
         ]
         Resource = [
-          "arn:aws:sagemaker:${var.aws_region}:${local.account_id}:endpoint/${local.name_prefix}-*"
+          "arn:aws:s3:::${local.name_prefix}-sagemaker-models-${local.account_id}",
+          "arn:aws:s3:::${local.name_prefix}-sagemaker-models-${local.account_id}/*"
         ]
       }
     ]

@@ -423,7 +423,10 @@ def notify_slack(result: dict, scored_pairs: list, active_position: dict,
             data=json.dumps(message).encode('utf-8'),
             headers={'Content-Type': 'application/json'}
         )
-        urllib.request.urlopen(req, timeout=5)
+        response = urllib.request.urlopen(req, timeout=5)
+        print(f"Slack notification sent (status: {response.status})")
 
     except Exception as e:
         print(f"Slack notification failed: {e}")
+        import traceback
+        traceback.print_exc()

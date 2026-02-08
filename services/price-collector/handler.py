@@ -111,16 +111,17 @@ def save_price(pair: str, timestamp: int, price: float):
 
 
 def get_price_at(pair: str, target_time: int) -> float:
-    """指定時刻付近の価格取得"""
+    """指定時刻付近の価格取得（5分足のキャンドル境界に対応するため±300秒）"""
     table = dynamodb.Table(PRICES_TABLE)
     response = table.query(
         KeyConditionExpression='pair = :pair AND #ts BETWEEN :start AND :end',
         ExpressionAttributeNames={'#ts': 'timestamp'},
         ExpressionAttributeValues={
             ':pair': pair,
-            ':start': target_time - 60,
-            ':end': target_time + 60
+            ':start': target_time - 300,
+            ':end': target_time + 300
         },
+        ScanIndexForward=False,
         Limit=1
     )
     items = response.get('Items', [])

@@ -62,9 +62,9 @@ locals {
       handler     = "handler.handler"
     }
     chronos-caller = {
-      description = "Amazon Chronos予測呼び出し"
+      description = "Chronos AI予測 (ONNX Runtime)"
       timeout     = 120
-      memory      = 1024
+      memory      = 1536
       handler     = "handler.handler"
     }
     sentiment-getter = {
@@ -120,7 +120,8 @@ locals {
     ORDER_QUEUE_URL      = "https://sqs.${var.aws_region}.amazonaws.com/${local.account_id}/${local.name_prefix}-order-queue"
     SLACK_WEBHOOK_URL      = var.slack_webhook_url
     TRADING_PAIRS_CONFIG   = trimspace(var.trading_pairs_config)
-    CHRONOS_ENDPOINT_NAME  = "${local.name_prefix}-chronos-tiny"
+    MODEL_BUCKET           = "${local.name_prefix}-sagemaker-models-${local.account_id}"
+    MODEL_PREFIX           = "chronos-onnx"
   }
 }
 
@@ -155,8 +156,11 @@ resource "aws_lambda_function" "functions" {
     variables = local.lambda_environment
   }
 
-  # Lambda Layerがある場合のみ設定
-  layers = length(aws_lambda_layer_version.common) > 0 ? [aws_lambda_layer_version.common[0].arn] : []
+  # Lambda Layer設定 (共通 + chronos-caller用ONNX Runtime)
+  layers = compact(concat(
+    length(aws_lambda_layer_version.common) > 0 ? [aws_lambda_layer_version.common[0].arn] : [],
+    each.key == "chronos-caller" ? ["arn:aws:lambda:${var.aws_region}:${local.account_id}:layer:${local.name_prefix}-onnxruntime:2"] : []
+  ))
 
   depends_on = [
     aws_iam_role_policy.lambda_custom,

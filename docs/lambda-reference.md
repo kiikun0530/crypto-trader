@@ -21,6 +21,8 @@
 | `ORDER_QUEUE_URL` | SQS注文キューURL |
 | `SLACK_WEBHOOK_URL` | Slack通知用Webhook |
 | `TRADING_PAIRS_CONFIG` | 通貨ペア設定JSON |
+| `MODEL_BUCKET` | ONNXモデル格納S3バケット |
+| `MODEL_PREFIX` | ONNXモデルのS3プレフィックス |
 | `CRYPTOPANIC_API_KEY` | CryptoPanic APIキー |
 | `VOLATILITY_THRESHOLD` | 変動閾値（%） |
 | `MAX_POSITION_JPY` | 最大ポジション額（円） |
@@ -149,22 +151,34 @@ DynamoDB から価格履歴を読み取り、テクニカル指標を計算し�
 
 ## chronos-caller
 
-SageMaker Serverless Endpoint 上の Amazon Chronos-T5-Tiny を呼び出して AI 価格予測を実行。SageMaker 未デプロイ時はモメンタムベースの代替スコアにフォールバック。
+ONNX Runtime で Amazon Chronos-T5-Tiny を実行し、AI 価格予測を行う。ONNX モデルは S3 から /tmp にダウンロード＆キャッシュ。推論失敗時はモメンタムベースの代替スコアにフォールバック。
 
 | 項目 | 値 |
 |---|---|
 | トリガー | Step Functions (Map > Parallel) |
-| メモリ | 1024MB |
+| メモリ | 1536MB |
 | タイムアウト | 120秒 |
 | DynamoDB | prices (R) |
-| SageMaker | Chronos-T5-Tiny Serverless Endpoint |
+| S3 | chronos-onnx/ (ONNXモデル読み取り) |
+| Lambda Layer | onnxruntime + numpy |
 
 ### 動作モード
 
-| `CHRONOS_ENDPOINT_NAME` | 動作 |
+| ONNX モデル | 動作 |
 |---|---|
-| 設定あり | SageMaker Serverless Endpoint で AI 価格予測（12ステップ先） |
-| 未設定 | モメンタムベーススコア（短期60% + 中期40%）にフォールバック |
+| S3にモデルあり | ONNX Runtime で AI 価格予測（12ステップ先） |
+| モデル読み込み失敗 | モメンタムベーススコア（短期60% + 中期40%）にフォールバック |
+
+### ONNX モデルのセットアップ
+
+```bash
+# 1. ONNX変換（要: torch, transformers, chronos-forecasting, optimum）
+pip install torch transformers chronos-forecasting optimum[onnxruntime]
+python scripts/convert_chronos_onnx.py
+
+# 2. S3にアップロード
+aws s3 sync models/chronos-onnx/ s3://eth-trading-sagemaker-models-<ACCOUNT_ID>/chronos-onnx/
+```
 
 ### 予測 → スコア変換
 

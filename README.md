@@ -11,7 +11,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 - **取引執行**: Coincheck API（各通貨/JPY）
 - **テクニカル分析**: SMA20/200、RSI、MACD、ボリンジャーバンド
 - **ニュースセンチメント**: CryptoPanic API（全通貨一括取得 + BTC相関分析）
-- **時系列予測**: Amazon Chronos-T5-Tiny（SageMaker Serverless Inference）
+- **時系列予測**: Amazon Chronos-T5-Tiny（ONNX Runtime on Lambda）
 - **ポジション管理**: 1通貨のみ保有（他通貨排他制御）
 - **通知**: Slack Webhook（全通貨ランキング付き）
 
@@ -41,7 +41,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 |--------|------|----------|
 | price-collector | 全6通貨の価格取得・変動検知 | 5分 |
 | technical | テクニカル指標計算（RSI, MACD, SMA, BB） | Step Functions (×6) |
-| chronos-caller | AI時系列予測 (SageMaker Chronos-T5-Tiny) | Step Functions (×6) |
+| chronos-caller | AI時系列予測 (ONNX Runtime, Chronos-T5-Tiny) | Step Functions (×6) |
 | sentiment-getter | 通貨別センチメントスコア取得 | Step Functions (×6) |
 | aggregator | 全通貨スコアリング・ランキング・売買判定 | Step Functions |
 | order-executor | Coincheckで成行注文実行（1ポジション制御） | SQSトリガー |
@@ -67,12 +67,11 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | 項目 | 月額 |
 |------|------|
 | Lambda | ~$5.00 |
-| SageMaker Serverless | ~$3-8 |
 | DynamoDB | ~$0.25 |
 | Step Functions | ~$0.10 |
 | CloudWatch | ~$0.10 |
 | Secrets Manager | ~$0.50 |
-| **合計** | **~$9-14** |
+| **合計** | **~$6** |
 
 > 詳細な計算式は [docs/architecture.md](docs/architecture.md) を参照
 
@@ -84,7 +83,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | CryptoPanic | 無料 or $199/月 | Growth Planでリアルタイムニュース取得 |
 | Coincheck | 0% | 取引所取引は手数料無料 |
 
-> **総コスト目安**: 無料構成 ~$9-14/月、Growth Plan ~$208-213/月
+> **総コスト目安**: 無料構成 ~$6/月、Growth Plan ~$205/月
 
 ## 前提条件
 
@@ -174,7 +173,22 @@ terraform plan
 terraform apply
 ```
 
-### 8. 初回データ投入
+### 8. Chronos ONNXモデルの準備
+
+```bash
+# ONNX変換に必要なパッケージをインストール
+pip install torch transformers chronos-forecasting "optimum[onnxruntime]"
+
+# Chronos-T5-Tiny を ONNX 形式に変換
+python scripts/convert_chronos_onnx.py
+
+# 変換したモデルを S3 にアップロード
+aws s3 sync models/chronos-onnx/ s3://eth-trading-sagemaker-models-$(aws sts get-caller-identity --query Account --output text)/chronos-onnx/
+```
+
+> ONNX変換は初回のみ必要です。モデルファイル（~62.5MB）は `.gitignore` で除外されています。
+
+### 9. 初回データ投入
 
 ```bash
 # 全6通貨の過去1000件の価格データを一括投入
@@ -264,6 +278,10 @@ crypto-trader/
 │   ├── position-monitor/
 │   ├── news-collector/
 │   └── warm-up/
+├── scripts/
+│   └── convert_chronos_onnx.py  # ONNX変換スクリプト
+├── models/
+│   └── chronos-onnx/            # ONNX変換済みモデル (gitignore対象)
 ├── docs/
 │   ├── architecture.md     # システム構成・設計思想
 │   ├── trading-strategy.md # 売買戦略・スコアリング
