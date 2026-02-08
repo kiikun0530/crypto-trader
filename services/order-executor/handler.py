@@ -264,10 +264,43 @@ def execute_buy(pair: str, score: float):
     print(f"Order amount: ¥{order_amount:,.0f} (score: {score:.3f}, "
           f"ratio: {order_amount/available_jpy*100:.1f}%)")
 
+    # 2.5. 既に暗号通貨を保有していないかチェック（SQSリトライによる重複購入防止）
+    currency = get_currency_from_pair(pair)
+    crypto_balance = balance.get(currency, 0)
+    if crypto_balance > 0:
+        rules = CURRENCY_ORDER_RULES.get(currency, {'min_amount': 0.001, 'decimals': 8})
+        if crypto_balance >= rules['min_amount']:
+            print(f"Already holding {crypto_balance} {currency.upper()}, skipping duplicate buy")
+            send_notification(
+                name,
+                f"⚠️ {name}重複購入をブロック\n"
+                f"既に {crypto_balance:.6f} {currency.upper()} を保有中"
+            )
+            return
+
     # 3. Coincheck APIで成行買い
     result = place_market_order(pair, 'buy', order_amount)
 
     if result and result.get('success'):
+        order_id = result.get('id')
+
+        # 成行買いはamount/rateがNoneで返るため、約定情報を取得
+        fill_amount, fill_rate = get_market_buy_fill(pair, order_id, currency)
+
+        # 約定情報で result を補完
+        if fill_amount and fill_rate:
+            result['amount'] = fill_amount
+            result['rate'] = fill_rate
+        else:
+            # フォールバック: 残高差分から推定
+            new_balance = get_balance()
+            new_crypto = new_balance.get(currency, 0)
+            estimated_amount = new_crypto - crypto_balance
+            estimated_rate = order_amount / estimated_amount if estimated_amount > 0 else 0
+            result['amount'] = estimated_amount if estimated_amount > 0 else 0
+            result['rate'] = estimated_rate
+            print(f"Fill info unavailable, estimated: amount={estimated_amount}, rate={estimated_rate}")
+
         # ポジション保存
         save_position(pair, timestamp, 'long', result, order_amount)
 
@@ -276,11 +309,12 @@ def execute_buy(pair: str, score: float):
 
         # 通知
         ratio_pct = (order_amount / available_jpy) * 100
+        fill_info = f"\n数量: {result.get('amount', 0):.6f} {currency.upper()}" if result.get('amount') else ""
         send_notification(
             name,
             f"🟢 {name}買い約定\n"
             f"通貨ペア: {pair}\n"
-            f"金額: ¥{order_amount:,.0f} ({ratio_pct:.0f}%)\n"
+            f"金額: ¥{order_amount:,.0f} ({ratio_pct:.0f}%){fill_info}\n"
             f"スコア: {score:.3f}\n"
             f"残高: ¥{available_jpy - order_amount:,.0f}"
         )
@@ -446,12 +480,66 @@ def call_coincheck_api(path: str, method: str, params: dict, creds: dict) -> dic
         return json.loads(response.read().decode())
 
 
+def get_market_buy_fill(pair: str, order_id, currency: str, max_retries: int = 3) -> tuple:
+    """
+    成行買いの約定情報を取得
+    Coincheckの成行買いレスポンスはamount/rateがNoneのため、
+    約定後に取引履歴APIで実際の約定量・約定価格を取得する
+    """
+    if not order_id:
+        return None, None
+
+    creds = get_api_credentials()
+    if not creds:
+        return None, None
+
+    for attempt in range(max_retries):
+        time.sleep(2 * (attempt + 1))  # 2秒, 4秒, 6秒待機
+        try:
+            # 注文のトランザクション（約定履歴）を取得
+            result = call_coincheck_api(
+                f'/api/exchange/orders/transactions?order_id={order_id}',
+                'GET', None, creds
+            )
+
+            if result and result.get('success') and result.get('transactions'):
+                transactions = result['transactions']
+                total_amount = sum(float(t.get('funds', {}).get(currency, 0)) for t in transactions)
+                total_jpy = sum(abs(float(t.get('funds', {}).get('jpy', 0))) for t in transactions)
+
+                if total_amount > 0:
+                    avg_rate = total_jpy / total_amount
+                    print(f"Fill data retrieved (attempt {attempt+1}): "
+                          f"amount={total_amount}, rate={avg_rate:.2f}")
+                    return total_amount, avg_rate
+
+            print(f"Fill data not ready yet (attempt {attempt+1})")
+        except Exception as e:
+            print(f"Error fetching fill data (attempt {attempt+1}): {e}")
+
+    print("Could not retrieve fill data after retries")
+    return None, None
+
+
 def save_position(pair: str, timestamp: int, side: str, result: dict, order_amount_jpy: float = None):
     """ポジション保存"""
     table = dynamodb.Table(POSITIONS_TABLE)
 
-    amount = result.get('amount', 0)
-    rate = result.get('rate', 0)
+    amount = result.get('amount') or 0
+    rate = result.get('rate') or 0
+
+    # None や無効な値をフロートに変換（Decimalクラッシュ防止）
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        amount = 0
+    try:
+        rate = float(rate)
+    except (TypeError, ValueError):
+        rate = 0
+
+    if amount <= 0 or rate <= 0:
+        print(f"WARNING: Saving position with incomplete fill data: amount={amount}, rate={rate}")
 
     table.put_item(Item={
         'pair': pair,
@@ -461,8 +549,8 @@ def save_position(pair: str, timestamp: int, side: str, result: dict, order_amou
         'entry_price': Decimal(str(rate)),
         'entry_time': timestamp,
         'order_amount_jpy': Decimal(str(order_amount_jpy or 0)),
-        'stop_loss': Decimal(str(float(rate) * 0.95)),
-        'take_profit': Decimal(str(float(rate) * 1.10)),
+        'stop_loss': Decimal(str(rate * 0.95)),
+        'take_profit': Decimal(str(rate * 1.10)),
         'closed': False
     })
 
@@ -470,12 +558,19 @@ def save_position(pair: str, timestamp: int, side: str, result: dict, order_amou
 def close_position(pair: str, position: dict, timestamp: int, result: dict):
     """ポジションクローズ"""
     table = dynamodb.Table(POSITIONS_TABLE)
+
+    exit_rate = result.get('rate') or 0
+    try:
+        exit_rate = float(exit_rate)
+    except (TypeError, ValueError):
+        exit_rate = 0
+
     table.update_item(
         Key={'pair': pair, 'position_id': position['position_id']},
         UpdateExpression='SET closed = :closed, exit_price = :exit, exit_time = :time',
         ExpressionAttributeValues={
             ':closed': True,
-            ':exit': Decimal(str(result.get('rate', 0))),
+            ':exit': Decimal(str(exit_rate)),
             ':time': timestamp
         }
     )
@@ -484,13 +579,25 @@ def close_position(pair: str, position: dict, timestamp: int, result: dict):
 def save_trade(pair: str, timestamp: int, action: str, result: dict):
     """取引履歴保存"""
     table = dynamodb.Table(TRADES_TABLE)
+
+    amount = result.get('amount') or 0
+    rate = result.get('rate') or 0
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        amount = 0
+    try:
+        rate = float(rate)
+    except (TypeError, ValueError):
+        rate = 0
+
     table.put_item(Item={
         'pair': pair,
         'timestamp': timestamp,
         'action': action,
-        'amount': Decimal(str(result.get('amount', 0))),
-        'rate': Decimal(str(result.get('rate', 0))),
-        'order_id': result.get('id', ''),
+        'amount': Decimal(str(amount)),
+        'rate': Decimal(str(rate)),
+        'order_id': str(result.get('id', '')),
         'fee_rate': Decimal(str(TAKER_FEE_RATE))
     })
 
