@@ -1,6 +1,6 @@
 # Lambda関数リファレンス
 
-全9つの Lambda 関数の仕様、入出力、設定の詳細。
+全10個の Lambda 関数の仕様、入出力、設定の詳細。
 
 ---
 
@@ -184,7 +184,7 @@ aws s3 sync models/chronos-onnx/ s3://eth-trading-sagemaker-models-<ACCOUNT_ID>/
 
 予測系列の加重平均（遠い将来ほど重みが大きい）と現在価格の変化率から算出:
 - `change_percent = (weighted_avg - current_price) / current_price × 100`
-- ±3% の変動予測で ±1.0 にスケール
+- ±5% の変動予測で ±1.0 にスケール（暗号通貨のボラティリティに適した閾値）
 
 ### 出力
 
@@ -434,17 +434,61 @@ aws lambda invoke --function-name eth-trading-warm-up \
 
 ---
 
+## error-remediator
+
+CloudWatch Logs のエラーパターンを検知し、Slack通知 + GitHub Actions 自動修復パイプラインをトリガー。
+
+| 項目 | 値 |
+|---|---|
+| トリガー | CloudWatch Subscription Filter (8 Lambda) |
+| メモリ | 256MB |
+| タイムアウト | 30秒 |
+| DynamoDB | error-remediator-cooldown (R/W) |
+| 外部API | Slack Webhook, GitHub API |
+
+### 処理フロー
+
+1. CloudWatch Subscription Filter からエラーログイベントを受信
+2. Base64 + gzip デコードしてエラーメッセージを抽出
+3. DynamoDB でクールダウン確認（同一関数は30分間隔）
+4. Slack にエラー内容を即座に通知
+5. GitHub API で `repository_dispatch` イベントを送信
+6. GitHub Actions が Claude AI でエラー分析 → コード修正 → デプロイ → 検証
+
+### クールダウン
+
+| 項目 | 値 |
+|---|---|
+| クールダウン時間 | 30分 |
+| スコープ | Lambda関数ごと |
+| 保存先 | DynamoDB (TTL: 24時間) |
+
+同一関数のエラーが30分以内に再発した場合は、重複トリガーを防止してスキップ。
+
+### GitHub Actions 連携
+
+```
+error-remediator → GitHub API (repository_dispatch)
+                      → auto-fix-errors.yml ワークフロー
+                          → Claude Sonnet でエラー分析
+                          → コード修正 → デプロイ → 検証
+                          → 成功時: git push + Slack通知
+                          → 失敗時: Slack通知のみ
+```
+
+---
+
 ## slack-notifier (内部Lambda)
 
 Terraform で自動生成されるインライン Lambda。SNS メッセージを Slack に転送する。
 
 | 項目 | 値 |
 |---|---|
-| トリガー | SNS (notifications, alerts) |
+| トリガー | SNS (alerts) |
 | メモリ | 128MB |
 | コード | Terraform内に定義（インライン） |
 
-notifications（取引通知）と alerts（システムアラート）の両方を Slack Webhook に転送。
+DLQ滞留等のシステムアラートを Slack Webhook に転送。取引通知は order-executor / position-monitor が直接 Slack Webhook に送信。
 
 ---
 
@@ -484,5 +528,11 @@ flowchart TD
         AGG -->|"SQS"| OE["order-executor"]
         PM -->|"SQS"| OE
         OE -->|"Coincheck API"| TRADE["取引"]
+    end
+
+    subgraph 監視・自動修復
+        CW["CloudWatch Logs"] -->|"Subscription Filter"| ER["error-remediator"]
+        ER -->|"Slack通知"| SLACK["Slack"]
+        ER -->|"repository_dispatch"| GH["GitHub Actions<br/>Claude自動修復"]
     end
 ```

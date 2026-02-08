@@ -36,6 +36,7 @@ flowchart LR
         L_ORDER["order-executor<br/>注文実行"]
         L_POSITION["position-monitor<br/>全通貨SL/TP監視"]
         L_NEWS["news-collector<br/>ニュース収集"]
+        L_REMEDIATE["error-remediator<br/>エラー自動修復"]
     end
 
     subgraph StepFunctions["Step Functions (Map State)"]
@@ -47,7 +48,6 @@ flowchart LR
     subgraph Messaging["Messaging"]
         SQS_ORDER[["order-queue"]]
         SQS_DLQ[["order-dlq"]]
-        SNS_NOTIFY{{"notifications"}}
         SNS_ALERTS{{"alerts"}}
     end
 
@@ -66,7 +66,9 @@ flowchart LR
 
     subgraph Monitoring["Monitoring"]
         CW_LOGS["CloudWatch Logs"]
-        CW_ALARM["CloudWatch Alarm<br/>DLQ監視"]
+        CW_ALARM["CloudWatch Alarms<br/>全Lambda監視<br/>(Errors + Duration)"]
+        CW_FILTER["Subscription Filters<br/>エラーログ検知"]
+        GH_ACTIONS["GitHub Actions<br/>Claude自動修復"]
     end
 
     %% 定期実行
@@ -110,18 +112,23 @@ flowchart LR
     %% ポジション監視
     L_POSITION -->|"全通貨チェック"| API_COINCHECK
 
-    %% 通知
-    L_ORDER --> SNS_NOTIFY
-    SNS_NOTIFY --> SLACK
+    %% 通知（直接Slack Webhook）
+    L_ORDER -->|"Slack通知"| SLACK
+    L_AGG -->|"ランキング通知"| SLACK
+    L_POSITION -->|"SL/TP通知"| SLACK
 
     %% 外部API
     L_ORDER --> API_COINCHECK
     L_NEWS --> API_CRYPTOPANIC
 
-    %% 監視
+    %% 監視・自動修復
     SQS_DLQ -.->|"滞留監視"| CW_ALARM
     CW_ALARM -->|"アラート"| SNS_ALERTS
     SNS_ALERTS --> SLACK
+    CW_LOGS -->|"エラーパターン"| CW_FILTER
+    CW_FILTER --> L_REMEDIATE
+    L_REMEDIATE -->|"Slack通知"| SLACK
+    L_REMEDIATE -->|"repository_dispatch"| GH_ACTIONS
 ```
 
 ---
@@ -265,6 +272,23 @@ aggregator → SQS(order-queue) → order-executor
 
 注文は絶対に失落させてはいけない。SQS は自動リトライ（3回）を提供し、DLQ で失敗した注文を捕捉して即座に通知。
 
+### 監視・自動修復パイプライン
+
+全 Lambda に CloudWatch Metric Alarms（Errors + Duration）を設定し、異常検知時は即座に Slack 通知。さらに、エラーログを自動検知して Claude AI が修正コードを生成・デプロイする自動修復パイプラインを構築。
+
+```
+CloudWatch Logs → Subscription Filter → error-remediator Lambda
+                                            ├→ Slack通知（エラー内容）
+                                            └→ GitHub Actions (repository_dispatch)
+                                                  └→ Claude AI エラー分析
+                                                        └→ コード修正 → デプロイ → 検証
+```
+
+- **CloudWatch Alarms (18個)**: 全9 Lambda × (Errors + Duration) で異常検知
+- **Subscription Filters (8個)**: warm-up以外の全Lambdaのエラーログを検知
+- **error-remediator Lambda**: エラー検知 → Slack通知 + GitHub Actions トリガー（30分クールダウン付き）
+- **GitHub Actions**: Claude Sonnet によるエラー分析 → コード修正 → Terraform デプロイ → 検証 → 自動push
+
 ### DynamoDB
 
 | 選択肢 | メリット | デメリット | 採用 |
@@ -309,6 +333,8 @@ aggregator → SQS(order-queue) → order-executor
 |---|---|---|
 | AWS認証 | IAMロール | Lambda実行ロールで自動付与 |
 | Coincheck API | Secrets Manager | 取引に直結するため厳重管理 |
+| GitHub PAT | Secrets Manager | 自動修復パイプライン用（repo権限） |
+| Anthropic API | GitHub Secrets | 自動修復パイプライン用 |
 | CryptoPanic API | Lambda環境変数 | 読み取り専用、リスク低 |
 | Slack Webhook | Lambda環境変数 | 読み取り専用、リスク低 |
 
@@ -322,13 +348,13 @@ IAM ロールは最小権限原則で設計。各 Lambda は必要な DynamoDB �
 
 | 項目 | 月額 | 備考 |
 |---|---|---|
-| Lambda | ~$5.00 | 6通貨分析 + ONNX推論含む |
-| DynamoDB | ~$0.30 | 6テーブル×6通貨分のR/W |
+| Lambda | ~$5.00 | 6通貨分析 + ONNX推論 + error-remediator含む |
+| DynamoDB | ~$0.30 | 6テーブル×6通貨分のR/W + クールダウン |
 | Step Functions | ~$0.10 | Map State で遷移数増加 |
-| CloudWatch | ~$0.05 | ログ保存14日 |
-| Secrets Manager | ~$0.50 | 1シークレット |
+| CloudWatch | ~$0.50 | ログ保存14日 + Metric Alarms 18個 + Subscription Filters |
+| Secrets Manager | ~$0.50 | Coincheck + GitHub PAT |
 | SQS/SNS/EventBridge | ~$0.05 | 軽微 |
-| **AWS合計** | **~$6/月** | |
+| **AWS合計** | **~$7/月** | |
 
 ### 外部API費用
 
@@ -337,13 +363,14 @@ IAM ロールは最小権限原則で設計。各 Lambda は必要な DynamoDB �
 | Binance | 無料 | 6通貨分の価格取得（認証不要） |
 | CryptoPanic | 無料 or $199/月 | Growth Plan でリアルタイム取得 |
 | Coincheck | 0% | 取引手数料無料 |
+| Anthropic | 従量制 | 自動修復パイプライン (~$0.01-0.03/修復) |
 
 ### 総コスト
 
 | 構成 | 月額 |
 |---|---|
-| 無料プラン | **~$6/月** |
-| Growth Plan | **~$205/月** |
+| 無料プラン | **~$7/月** |
+| Growth Plan | **~$206/月** |
 
 ---
 

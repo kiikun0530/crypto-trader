@@ -327,7 +327,7 @@ def predictions_to_score(predictions: list, current_price: float) -> float:
     ロジック:
     - 予測系列の加重平均を計算（直近予測を軽く、遠い予測を重く）
     - 現在価格との変化率を計算
-    - ±3% の変動で ±1.0 にスケール
+    - ±5% の変動で ±1.0 にスケール（暗号通貨の3時間予測窓に適切）
     """
     if not predictions or current_price <= 0:
         return 0.0
@@ -340,7 +340,8 @@ def predictions_to_score(predictions: list, current_price: float) -> float:
 
     change_percent = (weighted_avg - current_price) / current_price * 100
 
-    score = change_percent / 3.0
+    # ±5%の変動で±1.0にスケール（±3%では暗号通貨のボラティリティに対してクリップが頻発するため拡張）
+    score = change_percent / 5.0
     return max(-1.0, min(1.0, score))
 
 

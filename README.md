@@ -35,7 +35,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | DOGE | DOGEUSDT | doge_jpy | 高流動性、ミーム経済 |
 | AVAX | AVAXUSDT | avax_jpy | 高速L1、DeFi成長 |
 
-### Lambda関数（9個）
+### Lambda関数（10個）
 
 | 関数名 | 役割 | 実行間隔 |
 |--------|------|----------|
@@ -47,6 +47,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | order-executor | Coincheckで成行注文実行（1ポジション制御） | SQSトリガー |
 | position-monitor | 全通貨のSL(-5%)/TP(+10%)監視 | 5分 |
 | news-collector | 全通貨ニュース一括取得・BTC相関分析 | 30分 |
+| error-remediator | Lambdaエラー検知→Slack通知→自動修復 | CloudWatch Logs |
 | warm-up | 全通貨の初回データ投入（手動） | - |
 
 ### DynamoDBテーブル（6個）
@@ -67,11 +68,11 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | 項目 | 月額 |
 |------|------|
 | Lambda | ~$5.00 |
-| DynamoDB | ~$0.25 |
+| DynamoDB | ~$0.30 |
 | Step Functions | ~$0.10 |
-| CloudWatch | ~$0.10 |
+| CloudWatch | ~$0.50 |
 | Secrets Manager | ~$0.50 |
-| **合計** | **~$6** |
+| **合計** | **~$7** |
 
 > 詳細な計算式は [docs/architecture.md](docs/architecture.md) を参照
 
@@ -83,7 +84,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | CryptoPanic | 無料 or $199/月 | Growth Planでリアルタイムニュース取得 |
 | Coincheck | 0% | 取引所取引は手数料無料 |
 
-> **総コスト目安**: 無料構成 ~$6/月、Growth Plan ~$205/月
+> **総コスト目安**: 無料構成 ~$7/月、Growth Plan ~$206/月
 
 ## 前提条件
 
@@ -224,6 +225,28 @@ aws dynamodb scan \
 aws logs tail /aws/lambda/eth-trading-price-collector --since 5m
 ```
 
+## 監視・自動修復
+
+### CloudWatch 監視
+
+- **Metric Alarms (18個)**: 全10 Lambda × Errors + 主要Lambda × Duration
+- **Subscription Filters (8個)**: warm-up以外の全Lambdaのエラーログをリアルタイム検知
+- 異常検知時は即座に Slack 通知
+
+### Claude AI 自動修復パイプライン
+
+```
+CloudWatch Logs → Subscription Filter → error-remediator Lambda
+                                            ├→ Slack通知（エラー内容）
+                                            └→ GitHub Actions (repository_dispatch)
+                                                  └→ Claude Sonnet でエラー分析
+                                                        └→ コード修正 → デプロイ → 検証
+```
+
+- エラー検知から修正・デプロイまで完全自動化
+- 同一関数のエラーは30分間隔でクールダウン
+- Anthropic API (~$0.01-0.03/修復) でコスト効率的
+
 ## スコアベースの投資ロジック
 
 シグナルスコアに応じて投資金額が自動調整されます：
@@ -261,12 +284,16 @@ python -c "from handler import handler; print(handler({}, None))"
 
 ```
 crypto-trader/
+├── .github/
+│   └── workflows/
+│       └── auto-fix-errors.yml  # Claude自動修復パイプライン
 ├── terraform/           # Terraform IaC
 │   ├── main.tf
 │   ├── lambda.tf
 │   ├── dynamodb.tf
 │   ├── eventbridge.tf
 │   ├── stepfunctions.tf
+│   ├── monitoring.tf    # CloudWatch Alarms + Subscription Filters
 │   └── ...
 ├── services/            # Lambda関数
 │   ├── price-collector/
@@ -277,6 +304,7 @@ crypto-trader/
 │   ├── order-executor/
 │   ├── position-monitor/
 │   ├── news-collector/
+│   ├── error-remediator/
 │   └── warm-up/
 ├── scripts/
 │   └── convert_chronos_onnx.py  # ONNX変換スクリプト
