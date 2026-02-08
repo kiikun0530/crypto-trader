@@ -238,7 +238,7 @@ CryptoPanic API から全通貨のニュースを取得し、通貨別にセン�
 ### API最適化
 
 ```
-1回目: ?currencies=ETH,BTC,XRP,DOT,LINK,AVAX  → 全通貨ニュース一括
+1回目: ?currencies=ETH,BTC,XRP,SOL,DOGE,AVAX  → 全通貨ニュース一括
 2回目: (通貨指定なし)                          → 全体市場ニュース
 合計: 2 API calls × 48回/日 × 30日 = 2,880/月 (Growth Plan 3,000内)
 ```

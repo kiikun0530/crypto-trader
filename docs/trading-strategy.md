@@ -61,8 +61,9 @@ total_score = technical × 0.45 + chronos × 0.40 + sentiment × 0.15
 
 ### AI予測 (Chronos)
 
-- ECS上のChronos API が設定されている場合: 時系列予測で±3%以上の変動予測を最大スコアに変換
-- ECS未デプロイ時の代替: **モメンタムベーススコア**
+- **ONNX Runtime on Lambda**: Chronos-T5-Tiny を ONNX 変換し Lambda 上で直接推論。S3 からモデルをダウンロード＆ /tmp キャッシュ
+- 時系列予測で±3%以上の変動予測を最大スコアに変換（12ステップ先、加重平均）
+- ONNX推論失敗時の代替: **モメンタムベーススコア**
   - 短期モメンタム（5期間）× 60% + 中期モメンタム（10期間）× 40%
   - ±2%の変動で±1のスコア
 
@@ -240,8 +241,9 @@ aggregator → SQS → order-executor
 - `MAX_CONCURRENT_POSITIONS` 環境変数で同時保有数を制御
 - 通貨間の相関を考慮した分散投資ロジック
 
-### ECS追加時
+### より大きなモデルへの移行
 
-Amazon Chronos を本格的に実行する場合:
-- ECS Fargate ($15/月) + ALB ($5/月) + NAT Gateway ($45/月) = +$65/月
-- `CHRONOS_API_URL` 環境変数を設定するだけで切り替え可能
+現在は Chronos-T5-Tiny (8Mパラメータ) を Lambda + ONNX Runtime で実行しているが、将来的に精度向上が必要な場合:
+- **SageMaker Serverless**: Chronos-Small/Base を SageMaker エンドポイントで実行（要クォータ申請）
+- **ECS Fargate**: Chronos-Small コンテナ ($15/月) + ALB ($5/月) = +$20/月
+- いずれの場合もフォールバック（モメンタムベーススコア）は維持
