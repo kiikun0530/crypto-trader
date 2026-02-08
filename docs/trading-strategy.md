@@ -9,7 +9,7 @@
 ```mermaid
 flowchart TD
     subgraph 収集["5分毎: 価格収集"]
-        P1["ETH/USDT"] & P2["BTC/USDT"] & P3["XRP/USDT"] & P4["DOT/USDT"] & P5["LINK/USDT"] & P6["AVAX/USDT"]
+        P1["ETH/USDT"] & P2["BTC/USDT"] & P3["XRP/USDT"] & P4["SOL/USDT"] & P5["DOGE/USDT"] & P6["AVAX/USDT"]
     end
 
     subgraph 分析["変動検知時: 全通貨一括分析"]

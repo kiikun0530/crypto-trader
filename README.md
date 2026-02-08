@@ -31,8 +31,8 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | ETH | ETHUSDT | eth_jpy | DeFi基盤、高流動性 |
 | BTC | BTCUSDT | btc_jpy | 市場牽引力、Coincheck対応 |
 | XRP | XRPUSDT | xrp_jpy | 送金特化、高速決済 |
-| DOT | DOTUSDT | dot_jpy | クロスチェーン基盤 |
-| LINK | LINKUSDT | link_jpy | オラクル需要 |
+| SOL | SOLUSDT | sol_jpy | 高速L1、DeFi/NFT基盤 |
+| DOGE | DOGEUSDT | doge_jpy | 高流動性、ミーム経済 |
 | AVAX | AVAXUSDT | avax_jpy | 高速L1、DeFi成長 |
 
 ### Lambda関数（9個）

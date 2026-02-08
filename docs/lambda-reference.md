@@ -88,7 +88,7 @@
 
 ```json
 {
-  "pairs": ["eth_usdt", "btc_usdt", "xrp_usdt", "dot_usdt", "link_usdt", "avax_usdt"],
+  "pairs": ["eth_usdt", "btc_usdt", "xrp_usdt", "sol_usdt", "doge_usdt", "avax_usdt"],
   "timestamp": 1770523800,
   "trigger_reasons": ["volatility", "periodic"]
 }

@@ -11,6 +11,7 @@ SQSからシグナルを受信し、Coincheck APIで注文実行
 import json
 import os
 import time
+import math
 import hmac
 import hashlib
 import urllib.request
@@ -33,12 +34,22 @@ DEFAULT_PAIRS = {
 }
 TRADING_PAIRS = json.loads(os.environ.get('TRADING_PAIRS_CONFIG', json.dumps(DEFAULT_PAIRS)))
 
-# 手数料設定（Coincheck販売所: スプレッドに含まれる）
+# 手数料設定（Coincheck取引所: 対象通貨は全て0%）
 MAKER_FEE_RATE = float(os.environ.get('MAKER_FEE_RATE', '0.0'))
 TAKER_FEE_RATE = float(os.environ.get('TAKER_FEE_RATE', '0.0'))
 
 # 最小注文金額（Coincheck: 500円相当）
 MIN_ORDER_JPY = float(os.environ.get('MIN_ORDER_JPY', '500'))
+
+# Coincheck取引所: 通貨別最小注文数量・小数点以下桁数
+CURRENCY_ORDER_RULES = {
+    'btc': {'min_amount': 0.001, 'decimals': 8},
+    'eth': {'min_amount': 0.001, 'decimals': 8},
+    'xrp': {'min_amount': 1.0,   'decimals': 6},
+    'sol': {'min_amount': 0.01,  'decimals': 8},
+    'doge': {'min_amount': 1.0,  'decimals': 2},
+    'avax': {'min_amount': 0.01, 'decimals': 8},
+}
 
 # 予備資金（常に残しておく金額）
 RESERVE_JPY = float(os.environ.get('RESERVE_JPY', '1000'))
@@ -289,6 +300,24 @@ def execute_sell(pair: str, position: dict, score: float):
         print(f"No {currency.upper()} amount in position")
         return
 
+    # 通貨別の最小注文数量・小数点桁数チェック
+    rules = CURRENCY_ORDER_RULES.get(currency, {'min_amount': 0.001, 'decimals': 8})
+    decimals = rules['decimals']
+    min_amount = rules['min_amount']
+
+    # 小数点以下を適切な桁数に切り捨て（切り上げると残高不足になる）
+    amount = math.floor(amount * (10 ** decimals)) / (10 ** decimals)
+
+    if amount < min_amount:
+        print(f"{currency.upper()} amount {amount} below minimum {min_amount}")
+        send_notification(
+            name,
+            f"⚠️ {currency.upper()}売りスキップ: 最小注文数量未満\n"
+            f"保有: {amount} {currency.upper()}\n"
+            f"最小: {min_amount} {currency.upper()}"
+        )
+        return
+
     # 残高確認
     balance = get_balance()
     available = balance.get(currency, 0) - balance.get(f'{currency}_reserved', 0)
@@ -296,7 +325,9 @@ def execute_sell(pair: str, position: dict, score: float):
     if available < amount:
         print(f"{currency.upper()} balance mismatch: position={amount}, available={available}")
         amount = available
-        if amount <= 0:
+        # 再度小数点丸め・最小数量チェック
+        amount = math.floor(amount * (10 ** decimals)) / (10 ** decimals)
+        if amount < min_amount:
             send_notification(
                 name,
                 f"⚠️ {currency.upper()}残高不足\n保有: {available:.6f} {currency.upper()}"

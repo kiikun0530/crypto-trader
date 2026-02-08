@@ -128,15 +128,16 @@ flowchart LR
 | ETHUSDT | eth_jpy | ETH | Ethereum |
 | BTCUSDT | btc_jpy | BTC | Bitcoin |
 | XRPUSDT | xrp_jpy | XRP | XRP |
-| DOTUSDT | dot_jpy | DOT | Polkadot |
-| LINKUSDT | link_jpy | LINK | Chainlink |
+| SOLUSDT | sol_jpy | SOL | Solana |
+| DOGEUSDT | doge_jpy | DOGE | Dogecoin |
 | AVAXUSDT | avax_jpy | AVAX | Avalanche |
 
 ### なぜこの6通貨か
 
-**選定基準**: Binance（分析用）と Coincheck（取引用）の **両方で扱える** + **流動性が高い** 通貨
+**選定基準**: Binance（分析用）と **Coincheck取引所**（取引用）の **両方で扱える** + **流動性が高い** + **取引所手数料0%** の通貨
 
 - 日本の法規制上、取引は金融庁登録業者（Coincheck）で行う必要がある
+- Coincheck「販売所」はスプレッドが大きいため、**取引所**で売買可能な通貨のみ選定
 - テクニカル分析用のOHLCデータは Binance の方が高品質かつ無料
 - 6通貨は分析コスト（Lambda 18回/分析）と網羅性のバランスが良い
 - 10通貨以上にすると CryptoPanic API レスポンスが肥大化し、Lambda実行時間が増加
@@ -209,7 +210,7 @@ Lambda を VPC 内に配置すると、外部 API（Binance, Coincheck, CryptoPa
 ```
 price-collector
   └→ Step Functions
-       └→ Map: [eth_usdt, btc_usdt, xrp_usdt, dot_usdt, link_usdt, avax_usdt]
+       └→ Map: [eth_usdt, btc_usdt, xrp_usdt, sol_usdt, doge_usdt, avax_usdt]
             └→ Parallel: [テクニカル分析, AI予測, センチメント取得]
        └→ Aggregator: 全通貨のスコアを比較 → 最高期待値の通貨を選定
 ```
