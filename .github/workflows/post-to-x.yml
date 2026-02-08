@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  models: read
+
 jobs:
   post-to-x:
     runs-on: ubuntu-latest
