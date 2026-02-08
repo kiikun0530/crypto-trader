@@ -4,9 +4,6 @@ on:
   push:
     branches: [main]
 
-permissions:
-  models: read
-
 jobs:
   post-to-x:
     runs-on: ubuntu-latest
@@ -25,7 +22,6 @@ jobs:
 
       - name: Generate tweet and post to X
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           X_API_KEY: ${{ secrets.X_API_KEY }}
           X_API_SECRET: ${{ secrets.X_API_SECRET }}
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
@@ -37,28 +33,11 @@ jobs:
           import requests
           from requests_oauthlib import OAuth1
 
-          # コミット情報取得（件名 + 本文）
+          # コミット情報取得
           commit_subject = subprocess.check_output(
               ['git', 'log', '-1', '--pretty=format:%s'],
               text=True
           ).strip()
-          commit_body = subprocess.check_output(
-              ['git', 'log', '-1', '--pretty=format:%b'],
-              text=True
-          ).strip()
-          commit_sha = subprocess.check_output(
-              ['git', 'log', '-1', '--pretty=format:%h'],
-              text=True
-          ).strip()
-
-          # 差分情報（変更ファイル・行数）
-          try:
-              diff_stat = subprocess.check_output(
-                  ['git', 'diff', '--stat', 'HEAD~1', 'HEAD'],
-                  text=True
-              ).strip()
-          except Exception:
-              diff_stat = "(diff not available)"
 
           # 変更ファイル名一覧
           try:
@@ -69,143 +48,32 @@ jobs:
           except Exception:
               changed_files = ""
 
-          print(f"Commit: {commit_sha}")
           print(f"Subject: {commit_subject}")
-          print(f"Body: {commit_body[:200]}")
           print(f"Changed files: {changed_files[:300]}")
 
           # ワークフロー自体の変更のみのコミットはスキップ
           file_list = [f.strip() for f in changed_files.split('\n') if f.strip()]
           if all(f.startswith('.github/') for f in file_list) and file_list:
-              print("Skipping: only workflow files changed, nothing to tweet about")
+              print("Skipping: only workflow files changed")
               exit(0)
 
-          # GitHub Models APIでX投稿文を生成
-          github_token = os.environ.get('GITHUB_TOKEN', '')
-          tweet = None
-
-          SYSTEM_PROMPT = """あなたはフリーランスエンジニアの個人開発日記をX（Twitter）に投稿する代筆者です。
-
-          【あなたの役割】
-          コミットログと差分情報を「参考資料」として読み取り、そこから開発者の気持ちや学びを想像して、
-          「開発者本人がふと呟いたかのような」自然なX投稿を生成する。
-          あなたの出力は「つぶやき」であり、「変更ログ」ではない。
-
-          【最重要ルール】
-          - ファイル名（*.md, *.py, *.tf 等）を投稿に絶対に含めない
-          - コミットメッセージをそのまま使わない。自分の言葉で言い換える
-          - 箇条書き・リスト形式にしない。自然な文章で書く
-          - 「修正しました」「更新しました」「追加しました」で終わる文を書かない
-          - 投稿の自動化・仕組み自体について絶対に語らない（「X投稿」「ツイート生成」「SYSTEM_PROMPT」「フィルター」「NGワード」「回避」等）
-          - TOKEN, SECRET, API_KEY, credential, password 等のセキュリティ用語を含めない
-          - 開発の中身（アーキテクチャ、設計、技術的学び）だけにフォーカスする
-
-          【投稿の組み立て方】
-          1. まず「なぜこの作業をしたのか」を1文で書く（動機・背景・気づき）
-          2. 次に「やったことの本質」を技術的に1文で書く（具体的だが簡潔に）
-          3. 最後に「感想・学び・次への展望」を1文添える（人間味のある締め）
-          この3要素のうち2つ以上を含めること。
-
-          【トーンとスタイル】
-          - 日本語で書く
-          - 280文字以内（厳守）
-          - 一人称は使わないか「自分」。「私」は使わない
-          - 等身大で素直。技術への真剣さが伝わるトーン
-          - 絵文字は0-2個（なくてもいい）
-          - 技術用語は正確に使う（エンジニアに刺さる内容を優先）
-          - 大げさ・煽り・自画自賛は絶対NG
-          - 友人のエンジニアに話しかけるような口調
-
-          【ドキュメント系コミットの場合】
-          docsやREADMEの変更でも「ファイルを更新した」とは書かない。代わりに:
-          - なぜドキュメントを直す必要があったのか（設計変更の経緯）
-          - 書いてて気づいた設計上の発見
-          - 「コード書くよりドキュメント揃える方が大変」的な開発あるある
-          など、作業の裏にある文脈を語る。
-
-          【必須要素】
-          - リポジトリURL: https://github.com/kiikun0530/crypto-trader
-          - ハッシュタグ 2-3個（末尾に）: #個人開発 #AWS #Python #Terraform #フリーランスエンジニア #サーバーレス から選択
-
-          【良い投稿例】
-          「SageMakerのクォータ承認が数日かかりそうだったので、Chronos-T5-TinyをONNXに変換してLambda直接実行に切り替えた。結果的にSageMaker不要でコスト$8/月削減。制約が良い設計を生むこともある https://github.com/kiikun0530/crypto-trader #個人開発 #AWS」
-
-          「6通貨同時分析するとLambda 18並列になるけど、DynamoDBのオンデマンドなら全然耐えられる。月$0.30。サーバーレスのコスト感覚がだいぶ掴めてきた https://github.com/kiikun0530/crypto-trader #個人開発 #サーバーレス」
-
-          「価格変動の検知窓を±60秒→±300秒に広げただけで、5分足のキャンドル境界問題が解決。地味だけどこういうバグが一番つらい https://github.com/kiikun0530/crypto-trader #個人開発 #Python」
-
-          「SageMakerからONNX Runtimeに乗り換えたら、設計ドキュメントの半分が嘘になってた。コード直すより整合性取る方が地味につらい https://github.com/kiikun0530/crypto-trader #個人開発 #AWS」
-
-          【悪い例（避けるべき）】
-          - 「trading-strategy.md: ECS参照をONNXに修正」← ファイル名が入っている
-          - 「crypto-trader更新: XXXを追加しました」← 更新報告でしかない
-          - 「🚀🔥すごいの作った！！」← 煽り
-          - 「feat: add ONNX support」← コミットログそのまま
-          - 「- xxx修正 - yyy更新 - zzz追加」← 箇条書きになっている"""
-
-          # LLMに渡すユーザーメッセージ（リッチなコンテキスト）
-          body_text = commit_body if commit_body else '(なし)'
-          user_message = (
-              "以下のコミット情報からX投稿を生成してください。\n"
-              "コミットログだけでなく、変更ファイルや差分から「何をなぜやったか」を読み取って、開発者の視点で語ってください。\n\n"
-              "## コミット\n"
-              f"件名: {commit_subject}\n"
-              "本文:\n"
-              f"{body_text}\n\n"
-              "## 変更ファイル\n"
-              f"{changed_files}\n\n"
-              "## 差分サマリ\n"
-              f"{diff_stat}"
+          # シンプルなテンプレートで投稿文を生成
+          tweet = (
+              f"crypto-trader更新: {commit_subject}\n"
+              f"https://github.com/kiikun0530/crypto-trader\n"
+              f"#個人開発 #AWS #フリーランスエンジニア"
           )
 
-          try:
-              resp = requests.post(
-                  'https://models.inference.ai.azure.com/chat/completions',
-                  headers={
-                      'Authorization': f'Bearer {github_token}',
-                      'Content-Type': 'application/json'
-                  },
-                  json={
-                      'model': 'gpt-4o-mini',
-                      'messages': [
-                          {
-                              'role': 'system',
-                              'content': SYSTEM_PROMPT
-                          },
-                          {
-                              'role': 'user',
-                              'content': user_message
-                          }
-                      ],
-                      'max_tokens': 350,
-                      'temperature': 0.7
-                  },
-                  timeout=30
-              )
-              if resp.status_code == 200:
-                  data = resp.json()
-                  tweet = data['choices'][0]['message']['content'].strip()
-                  # 余分なクォートを除去
-                  if tweet.startswith('"') and tweet.endswith('"'):
-                      tweet = tweet[1:-1]
-                  if tweet.startswith("'") and tweet.endswith("'"):
-                      tweet = tweet[1:-1]
-                  print(f"Generated tweet: {tweet}")
-              else:
-                  print(f"GitHub Models failed: {resp.status_code} {resp.text}")
-          except Exception as e:
-              print(f"GitHub Models failed: {e}")
-
-          # フォールバック
-          if not tweet:
-              # コミット本文があれば使う、なければ件名を使う
-              detail = commit_body.split('\n')[0][:80] if commit_body else commit_subject[:80]
+          # 280文字制限チェック
+          if len(tweet) > 280:
+              max_subject = 280 - len("crypto-trader更新: \nhttps://github.com/kiikun0530/crypto-trader\n#個人開発 #AWS #フリーランスエンジニア")
               tweet = (
-                  f"{detail}\n"
+                  f"crypto-trader更新: {commit_subject[:max_subject]}...\n"
                   f"https://github.com/kiikun0530/crypto-trader\n"
                   f"#個人開発 #AWS #フリーランスエンジニア"
               )
-              print(f"Using fallback: {tweet}")
+
+          print(f"Tweet ({len(tweet)} chars):\n{tweet}")
 
           # X API投稿
           api_key = os.environ.get('X_API_KEY', '')
@@ -215,7 +83,6 @@ jobs:
 
           if not all([api_key, api_secret, access_token, access_secret]):
               print("X API credentials not set, skipping post")
-              print(f"\nGenerated tweet:\n{tweet}")
               exit(0)
 
           auth = OAuth1(api_key, api_secret, access_token, access_secret)
@@ -232,7 +99,9 @@ jobs:
               if resp.status_code == 201:
                   print("Tweet posted successfully!")
               else:
-                  print("Failed to post tweet")
+                  print(f"Failed to post tweet: {resp.status_code}")
+                  exit(1)
           except Exception as e:
               print(f"X API error: {e}")
+              exit(1)
           SCRIPT
