@@ -12,7 +12,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 - **テクニカル分析**: SMA20/200、RSI、MACD、ボリンジャーバンド
 - **ニュースセンチメント**: CryptoPanic API（全通貨一括取得 + BTC相関分析）
 - **時系列予測**: Amazon Chronos-T5-Tiny（ONNX Runtime on Lambda）
-- **ポジション管理**: 1通貨のみ保有（他通貨排他制御）
+- **ポジション管理**: 複数通貨同時保有対応（SELL優先 → 未保有通貨をBUY）
 - **通知**: Slack Webhook（全通貨ランキング付き）
 
 ## アーキテクチャ
@@ -21,6 +21,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
   - [docs/architecture.md](docs/architecture.md) — システム構成・設計思想
   - [docs/trading-strategy.md](docs/trading-strategy.md) — 売買戦略・スコアリング
   - [docs/lambda-reference.md](docs/lambda-reference.md) — Lambda関数リファレンス
+  - [docs/bugfix-history.md](docs/bugfix-history.md) — バグ修正履歴・設計原則
 
 > GitHub上でMermaidダイアグラムがレンダリングされます
 
@@ -44,7 +45,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | chronos-caller | AI時系列予測 (ONNX Runtime, Chronos-T5-Tiny) | Step Functions (×6) |
 | sentiment-getter | 通貨別センチメントスコア取得 | Step Functions (×6) |
 | aggregator | 全通貨スコアリング・ランキング・売買判定 | Step Functions |
-| order-executor | Coincheckで成行注文実行（1ポジション制御） | SQSトリガー |
+| order-executor | Coincheckで成行注文実行（同一通貨重複防止） | SQSトリガー |
 | position-monitor | 全通貨のSL(-5%)/TP(+10%)監視 | 5分 |
 | news-collector | 全通貨ニュース一括取得・BTC相関分析 | 30分 |
 | error-remediator | Lambdaエラー検知→Slack通知→自動修復 | CloudWatch Logs |

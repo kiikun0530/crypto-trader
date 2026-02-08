@@ -306,10 +306,10 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
    - `buy_threshold = 0.20 × vol_ratio`, `sell_threshold = -0.20 × vol_ratio`
 3. 全通貨のシグナルを DynamoDB に保存（動的閾値・BB幅も記録）
 4. 全通貨をスコア降順でランキング
-5. ポジションの有無を確認（全通貨を横断チェック）
-6. 売買判定（動的閾値で判定）:
-   - ポジションなし & 最高スコア >= buy_threshold → BUY
-   - ポジションあり & 保有通貨 <= sell_threshold → SELL
+5. 全通貨のアクティブポジションを取得（複数保有対応）
+6. 売買判定（SELL優先、動的閾値で判定）:
+   - SELL判定: 保有中の全ポジションについて、スコア <= sell_threshold → SELL
+   - BUY判定: 未保有通貨の中で最高スコア >= buy_threshold → BUY
    - それ以外 → HOLD
 7. シグナルがあれば SQS に注文メッセージ送信
 8. Slack にランキング + 動的閾値付き分析結果を通知
@@ -327,7 +327,7 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
     {"pair": "btc_usdt", "name": "Bitcoin", "score": 0.4521},
     ...
   ],
-  "active_position": null,
+  "active_positions": ["eth_jpy", "btc_jpy"],
   "buy_threshold": 0.2000,
   "sell_threshold": -0.2000
 }
@@ -347,12 +347,13 @@ SQSから注文メッセージを受信し、Coincheck APIで成行注文を実�
 | DynamoDB | positions (R/W), trades (W) |
 | 外部API | Coincheck |
 
-### 1ポジション排他制御
+### 同一通貨重複防止
 
-BUY注文時、対象通貨以外にアクティブポジションがあるかチェック。例:
+BUY注文時、対象通貨のアクティブポジションが既に存在するかチェック。例:
 
 ```
-BTC保有中にETHのBUYシグナル → BTC保有中のためスキップ（Slack通知）
+ETH保有中にETHのBUYシグナル → 既にETH保有中のためスキップ（Slack通知）
+ETH保有中にBTCのBUYシグナル → 異なる通貨なのでBTC購入を実行
 ```
 
 ### Coincheck API 呼び出し
