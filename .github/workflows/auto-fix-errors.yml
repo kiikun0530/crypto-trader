@@ -105,6 +105,7 @@ jobs:
       - name: Analyze and fix with Claude
         id: claude
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 << 'CLAUDE_SCRIPT'
@@ -131,14 +132,29 @@ jobs:
           except:
               pass
 
-          # GitHub Models API 経由で Claude を使用（無料）
-          token = os.environ.get('GITHUB_TOKEN', '')
-          api_url = "https://models.inference.ai.azure.com/chat/completions"
-          headers = {
-              "Authorization": f"Bearer {token}",
-              "Content-Type": "application/json"
-          }
-          model = "claude-sonnet-4-20250514"
+          # Anthropic API (Claude Sonnet) 優先、GitHub Models API フォールバック
+          api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+
+          if api_key:
+              api_url = "https://api.anthropic.com/v1/messages"
+              headers = {
+                  "x-api-key": api_key,
+                  "anthropic-version": "2023-06-01",
+                  "content-type": "application/json"
+              }
+              model = "claude-sonnet-4-20250514"
+              use_anthropic = True
+              print("Using Anthropic API (Claude Sonnet)")
+          else:
+              token = os.environ.get('GITHUB_TOKEN', '')
+              api_url = "https://models.inference.ai.azure.com/chat/completions"
+              headers = {
+                  "Authorization": f"Bearer {token}",
+                  "Content-Type": "application/json"
+              }
+              model = "gpt-4o-mini"
+              use_anthropic = False
+              print("Fallback: Using GitHub Models API (GPT-4o-mini)")
 
           prompt = f"""あなたはAWS Lambdaのエラーを自動修復するエキスパートエンジニアです。
 
@@ -187,15 +203,21 @@ jobs:
           - エラーに無関係な変更は加えないこと
           """
 
-          # GitHub Models API (OpenAI互換フォーマット)
-          request_body = {
-              "model": model,
-              "max_tokens": 8192,
-              "messages": [
-                  {"role": "system", "content": "You are an expert AWS Lambda error fixer."},
-                  {"role": "user", "content": prompt}
-              ]
-          }
+          if use_anthropic:
+              request_body = {
+                  "model": model,
+                  "max_tokens": 8192,
+                  "messages": [{"role": "user", "content": prompt}]
+              }
+          else:
+              request_body = {
+                  "model": model,
+                  "max_tokens": 8192,
+                  "messages": [
+                      {"role": "system", "content": "You are an expert AWS Lambda error fixer."},
+                      {"role": "user", "content": prompt}
+                  ]
+              }
 
           req = urllib.request.Request(
               api_url,
@@ -208,7 +230,10 @@ jobs:
               response = urllib.request.urlopen(req, timeout=120)
               result = json.loads(response.read().decode('utf-8'))
 
-              content = result['choices'][0]['message']['content']
+              if use_anthropic:
+                  content = result['content'][0]['text']
+              else:
+                  content = result['choices'][0]['message']['content']
 
               print("=== Claude Response (first 500 chars) ===")
               print(content[:500])
