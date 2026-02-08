@@ -75,12 +75,12 @@ def handler(event, context):
         # 4. スコア順にソート（期待値の高い順）
         scored_pairs.sort(key=lambda x: x['total_score'], reverse=True)
 
-        # 5. 現在のポジション確認
-        active_position = find_active_position()
+        # 5. 現在のポジション確認（複数対応）
+        active_positions = find_all_active_positions()
 
         # 6. 売買判定（動的閾値で判定）
         signal, target_pair, target_score = decide_action(
-            scored_pairs, active_position, buy_threshold, sell_threshold
+            scored_pairs, active_positions, buy_threshold, sell_threshold
         )
 
         has_signal = signal in ['BUY', 'SELL']
@@ -102,14 +102,14 @@ def handler(event, context):
                 }
                 for s in scored_pairs
             ],
-            'active_position': active_position.get('pair') if active_position else None,
+            'active_positions': [p.get('pair') for p in active_positions],
             'buy_threshold': round(buy_threshold, 4),
             'sell_threshold': round(sell_threshold, 4),
             'timestamp': int(time.time())
         }
 
-        # 8. Slack通知（ランキング付き + 動的閾値表示）
-        notify_slack(result, scored_pairs, active_position, buy_threshold, sell_threshold)
+        # 8. Slack通知（ランキング付き + 動的閾値 + 含み損益表示）
+        notify_slack(result, scored_pairs, active_positions, buy_threshold, sell_threshold)
 
         return result
 
@@ -213,14 +213,14 @@ def calculate_dynamic_thresholds(scored_pairs: list) -> tuple:
     return buy_threshold, sell_threshold
 
 
-def decide_action(scored_pairs: list, active_position: dict,
+def decide_action(scored_pairs: list, active_positions: list,
                    buy_threshold: float, sell_threshold: float) -> tuple:
     """
-    全通貨のスコアから最適なアクションを決定（動的閾値対応）
+    全通貨のスコアから最適なアクションを決定（動的閾値対応・複数ポジション対応）
 
     ルール:
     1. ポジションなし → 最高スコアの通貨がBUY閾値以上なら買い
-    2. ポジションあり → その通貨がSELL閾値以下なら売り
+    2. ポジションあり → 各ポジションをチェック、SELL閾値以下の最悪スコアを売り
     3. それ以外 → HOLD
 
     Returns: (signal, target_pair, target_score)
@@ -228,25 +228,34 @@ def decide_action(scored_pairs: list, active_position: dict,
     if not scored_pairs:
         return 'HOLD', None, None
 
-    if active_position:
-        # ポジションあり → 現在の通貨のスコアをチェック
-        position_pair = active_position['pair']  # Coincheck pair (e.g., eth_jpy)
+    if active_positions:
+        # ポジションあり → 各ポジションのスコアをチェック
+        sell_candidates = []
+        for position in active_positions:
+            position_pair = position['pair']  # Coincheck pair (e.g., eth_jpy)
 
-        # Coincheck pair → analysis pair の逆引き
-        analysis_pair = None
-        for pair, config in TRADING_PAIRS.items():
-            if config['coincheck'] == position_pair:
-                analysis_pair = pair
-                break
+            # Coincheck pair → analysis pair の逆引き
+            analysis_pair = None
+            for pair, config in TRADING_PAIRS.items():
+                if config['coincheck'] == position_pair:
+                    analysis_pair = pair
+                    break
 
-        if analysis_pair:
-            pair_data = next((s for s in scored_pairs if s['pair'] == analysis_pair), None)
-            if pair_data and pair_data['total_score'] <= sell_threshold:
-                print(f"SELL signal for {position_pair}: score={pair_data['total_score']:.4f} "
-                      f"(threshold: {sell_threshold:.3f})")
-                return 'SELL', position_pair, pair_data['total_score']
+            if analysis_pair:
+                pair_data = next((s for s in scored_pairs if s['pair'] == analysis_pair), None)
+                if pair_data and pair_data['total_score'] <= sell_threshold:
+                    sell_candidates.append((position_pair, pair_data['total_score']))
 
-        print(f"HOLD: active position in {position_pair}")
+        if sell_candidates:
+            # 最もスコアが低い（最も売りシグナルが強い）ものを売る
+            sell_candidates.sort(key=lambda x: x[1])
+            target_pair, target_score = sell_candidates[0]
+            print(f"SELL signal for {target_pair}: score={target_score:.4f} "
+                  f"(threshold: {sell_threshold:.3f})")
+            return 'SELL', target_pair, target_score
+
+        pos_pairs = ', '.join(p['pair'] for p in active_positions)
+        print(f"HOLD: active positions in {pos_pairs}")
         return 'HOLD', None, None
 
     else:
@@ -262,9 +271,10 @@ def decide_action(scored_pairs: list, active_position: dict,
         return 'HOLD', None, None
 
 
-def find_active_position() -> dict:
-    """全通貨のアクティブポジションを検索"""
+def find_all_active_positions() -> list:
+    """全通貨のアクティブポジションを全て検索"""
     table = dynamodb.Table(POSITIONS_TABLE)
+    positions = []
 
     for pair, config in TRADING_PAIRS.items():
         coincheck_pair = config['coincheck']
@@ -277,11 +287,20 @@ def find_active_position() -> dict:
             )
             items = response.get('Items', [])
             if items and not items[0].get('closed'):
-                return items[0]
+                positions.append(items[0])
         except Exception as e:
             print(f"Error checking position for {coincheck_pair}: {e}")
 
-    return {}
+    return positions
+
+
+def get_current_price(pair: str) -> float:
+    """Coincheck ticker APIから現在価格を取得"""
+    url = f"https://coincheck.com/api/ticker?pair={pair}"
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=10) as response:
+        data = json.loads(response.read().decode())
+        return float(data['last'])
 
 
 def extract_score(result: dict, key: str, default: float) -> float:
@@ -336,9 +355,9 @@ def send_order_message(pair: str, signal: str, score: float, timestamp: int):
     )
 
 
-def notify_slack(result: dict, scored_pairs: list, active_position: dict,
+def notify_slack(result: dict, scored_pairs: list, active_positions: list,
                  buy_threshold: float = None, sell_threshold: float = None):
-    """Slackに分析結果を通知（通貨ランキング + 動的閾値表示）"""
+    """Slackに分析結果を通知（通貨ランキング + 複数ポジションP/L表示）"""
     buy_threshold = buy_threshold or BASE_BUY_THRESHOLD
     sell_threshold = sell_threshold or BASE_SELL_THRESHOLD
     if not SLACK_WEBHOOK_URL:
@@ -369,54 +388,108 @@ def notify_slack(result: dict, scored_pairs: list, active_position: dict,
                 f"Sent: `{s['components']['sentiment']:+.3f}`\n"
             )
 
-        # ポジション情報
-        position_text = "なし"
-        if active_position:
-            pos_pair = active_position.get('pair', '?')
-            entry_price = float(active_position.get('entry_price', 0))
-            position_text = f"{pos_pair} (参入: ¥{entry_price:,.0f})"
+        # ポジション情報（複数対応 + 含み損益表示）
+        position_text = ""
+        if active_positions:
+            total_unrealized = 0
+            position_lines = []
+            for pos in active_positions:
+                pos_pair = pos.get('pair', '?')
+                entry_price = float(pos.get('entry_price', 0))
+                amount = float(pos.get('amount', 0))
 
-        message = {
-            "blocks": [
-                {
-                    "type": "header",
-                    "text": {
-                        "type": "plain_text",
-                        "text": f"{emoji} マルチ通貨分析: {signal}",
-                        "emoji": True
-                    }
-                },
-                {
-                    "type": "section",
-                    "fields": [
-                        {"type": "mrkdwn", "text": f"*判定*\n{signal}"},
-                        {"type": "mrkdwn", "text": f"*対象*\n{target_pair or '-'}"}
-                    ]
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*📊 通貨ランキング（期待値順）*\n{ranking_text}"
-                    }
-                },
-                {
-                    "type": "context",
-                    "elements": [
-                        {"type": "mrkdwn", "text": f"📍 ポジション: {position_text} | BUY閾値: {buy_threshold:+.3f} / SELL閾値: {sell_threshold:+.3f}"}
-                    ]
+                # 通貨名を取得
+                pos_name = pos_pair
+                for pair_key, config in TRADING_PAIRS.items():
+                    if config['coincheck'] == pos_pair:
+                        pos_name = config['name']
+                        break
+
+                # 現在価格を scored_pairs から取得（フォールバック: Coincheck API）
+                current_price = 0
+                for pair_key, config in TRADING_PAIRS.items():
+                    if config['coincheck'] == pos_pair:
+                        pair_data = next((s for s in scored_pairs if s['pair'] == pair_key), None)
+                        if pair_data:
+                            current_price = pair_data.get('current_price', 0)
+                        break
+
+                if not current_price:
+                    try:
+                        current_price = get_current_price(pos_pair)
+                    except Exception:
+                        pass
+
+                if entry_price > 0 and current_price > 0:
+                    pnl = (current_price - entry_price) * amount
+                    pnl_pct = (current_price - entry_price) / entry_price * 100
+                    total_unrealized += pnl
+                    pnl_emoji = '📈' if pnl >= 0 else '📉'
+                    position_lines.append(
+                        f"{pnl_emoji} *{pos_name}* (`{pos_pair}`)\n"
+                        f"    参入: ¥{entry_price:,.0f} → 現在: ¥{current_price:,.0f} | "
+                        f"P/L: `¥{pnl:+,.0f}` (`{pnl_pct:+.2f}%`)"
+                    )
+                else:
+                    position_lines.append(
+                        f"📍 *{pos_name}* (`{pos_pair}`) 参入: ¥{entry_price:,.0f}"
+                    )
+
+            position_text = '\n'.join(position_lines)
+            if len(active_positions) > 1:
+                total_emoji = '💰' if total_unrealized >= 0 else '💸'
+                position_text += f"\n{total_emoji} *合計含み損益: `¥{total_unrealized:+,.0f}`*"
+        else:
+            position_text = "なし"
+
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": f"{emoji} マルチ通貨分析: {signal}",
+                    "emoji": True
                 }
-            ]
-        }
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*判定*\n{signal}"},
+                    {"type": "mrkdwn", "text": f"*対象*\n{target_pair or '-'}"}
+                ]
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*📊 通貨ランキング（期待値順）*\n{ranking_text}"
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*💼 ポジション ({len(active_positions)}件)*\n{position_text}"
+                }
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {"type": "mrkdwn", "text": f"BUY閾値: `{buy_threshold:+.3f}` / SELL閾値: `{sell_threshold:+.3f}`"}
+                ]
+            }
+        ]
 
         if signal in ['BUY', 'SELL']:
-            message["blocks"].append({
+            blocks.append({
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
                     "text": f"⚡ *{signal}注文をキューに送信しました* ({target_pair})"
                 }
             })
+
+        message = {"blocks": blocks}
 
         req = urllib.request.Request(
             SLACK_WEBHOOK_URL,
