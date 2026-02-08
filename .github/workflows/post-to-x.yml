@@ -90,6 +90,7 @@ jobs:
           - コミットメッセージをそのまま使わない。自分の言葉で言い換える
           - 箇条書き・リスト形式にしない。自然な文章で書く
           - 「修正しました」「更新しました」「追加しました」で終わる文を書かない
+          - Xのスパムフィルター回避: TOKEN, SECRET, API_KEY, credential, password, 認証情報 等のセキュリティ用語を投稿に含めない。技術的な話をする場合は「認証まわり」「権限設定」程度の抽象的な表現にとどめる
 
           【投稿の組み立て方】
           1. まず「なぜこの作業をしたのか」を1文で書く（動機・背景・気づき）
@@ -203,13 +204,6 @@ jobs:
           api_secret = os.environ.get('X_API_SECRET', '')
           access_token = os.environ.get('X_ACCESS_TOKEN', '')
           access_secret = os.environ.get('X_ACCESS_SECRET', '')
-
-          # デバッグ: 各シークレットの読み込み状態（値は隠す）
-          print(f"X_API_KEY: {'set (' + str(len(api_key)) + ' chars)' if api_key else 'EMPTY'}")
-          print(f"X_API_SECRET: {'set (' + str(len(api_secret)) + ' chars)' if api_secret else 'EMPTY'}")
-          print(f"X_ACCESS_TOKEN: {'set (' + str(len(access_token)) + ' chars)' if access_token else 'EMPTY'}")
-          print(f"X_ACCESS_SECRET: {'set (' + str(len(access_secret)) + ' chars)' if access_secret else 'EMPTY'}")
-          print(f"Tweet length: {len(tweet)} chars")
 
           if not all([api_key, api_secret, access_token, access_secret]):
               print("X API credentials not set, skipping post")
