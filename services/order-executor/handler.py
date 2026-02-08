@@ -78,15 +78,32 @@ def get_currency_name(pair: str) -> str:
     return currency.upper()
 
 
+# 同一Lambda呼び出し内で買った通貨を追跡（バッチ内即売り防止）
+_just_bought_pairs = set()
+
+
 def handler(event, context):
     """注文実行"""
+    global _just_bought_pairs
+    _just_bought_pairs = set()
+    errors = []
+
     for record in event.get('Records', []):
         try:
             body = json.loads(record['body'])
             process_order(body)
         except Exception as e:
             print(f"Error processing order: {str(e)}")
-            raise  # DLQへ送信
+            import traceback
+            traceback.print_exc()
+            errors.append(str(e))
+            # raiseしない → 他のレコードは正常処理を継続
+            # 注文自体が成功してDB保存だけ失敗したケースでは
+            # raiseすると再試行→二重注文の原因となるため
+            send_notification('System', f'❌ 注文処理エラー\n{str(e)}')
+
+    if errors:
+        print(f"Completed with {len(errors)} error(s): {errors}")
 
     return {'statusCode': 200, 'body': 'OK'}
 
@@ -127,6 +144,16 @@ def process_order(order: dict):
     elif signal == 'SELL':
         if not current_position or current_position.get('side') != 'long':
             print(f"No long position to sell for {pair}")
+            return
+
+        # 同一バッチ内で買ったばかりの通貨は売らない（BUY→即SELL防止）
+        if pair in _just_bought_pairs:
+            print(f"Skipping sell for {pair}: just bought in this batch")
+            send_notification(
+                name,
+                f"⚠️ {name}売りスキップ\n"
+                f"理由: 同一実行内でBUY直後のため"
+            )
             return
 
         # 売り注文
@@ -307,6 +334,9 @@ def execute_buy(pair: str, score: float):
         # 取引履歴保存
         save_trade(pair, timestamp, 'BUY', result)
 
+        # 同一バッチ内即売り防止フラグ
+        _just_bought_pairs.add(pair)
+
         # 通知
         ratio_pct = (order_amount / available_jpy) * 100
         fill_info = f"\n数量: {result.get('amount', 0):.6f} {currency.upper()}" if result.get('amount') else ""
@@ -369,10 +399,41 @@ def execute_sell(pair: str, position: dict, score: float):
             )
             return
 
+    # 売り前の暗号通貨残高を記録（フォールバック推定用）
+    pre_sell_crypto = balance.get(currency, 0)
+
     # Coincheck APIで成行売り
     result = place_market_order(pair, 'sell', amount_crypto=amount)
 
     if result and result.get('success'):
+        order_id = result.get('id')
+
+        # 成行売りもamount/rateがNoneで返ることがあるため、約定情報を取得
+        sell_rate = result.get('rate')
+        sell_amount = result.get('amount')
+
+        # rate が None または無効な場合、約定履歴から取得
+        if sell_rate is None or sell_amount is None:
+            fill_amount, fill_rate = get_market_sell_fill(pair, order_id, currency)
+            if fill_rate:
+                sell_rate = fill_rate
+                result['rate'] = fill_rate
+            if fill_amount:
+                sell_amount = fill_amount
+                result['amount'] = fill_amount
+
+        # それでもrateが取れない場合、現在価格から推定
+        if not sell_rate:
+            try:
+                import urllib.request as _ur
+                ticker = json.loads(_ur.urlopen(f'https://coincheck.com/api/ticker?pair={pair}', timeout=5).read())
+                sell_rate = float(ticker.get('last', 0))
+                result['rate'] = sell_rate
+                print(f"Sell rate unavailable, using ticker price: {sell_rate}")
+            except Exception as e:
+                print(f"Ticker fallback failed: {e}")
+                sell_rate = 0
+
         # ポジションクローズ
         close_position(pair, position, timestamp, result)
 
@@ -381,12 +442,10 @@ def execute_sell(pair: str, position: dict, score: float):
 
         # P/L計算
         entry_price = float(position.get('entry_price', 0))
-        exit_price = result.get('rate') or 0
         try:
-            exit_price = float(exit_price)
+            exit_price = float(sell_rate) if sell_rate else 0
         except (TypeError, ValueError):
             exit_price = 0
-            print(f"WARNING: Invalid exit_price from API result: {result.get('rate')}")
 
         gross_pnl = (exit_price - entry_price) * amount
 
@@ -395,12 +454,13 @@ def execute_sell(pair: str, position: dict, score: float):
 
         emoji = '💰' if net_pnl > 0 else '💸'
         fee_info = f"\n手数料: ¥{sell_fee:,.0f}" if sell_fee > 0 else ""
+        pnl_text = f"¥{net_pnl:,.0f}" if exit_price > 0 else "不明（約定価格取得失敗）"
         send_notification(
             name,
             f"{emoji} {name}売り約定\n"
             f"通貨ペア: {pair}\n"
             f"数量: {amount:.6f} {currency.upper()}\n"
-            f"P/L: ¥{net_pnl:,.0f}{fee_info}\n"
+            f"P/L: {pnl_text}{fee_info}\n"
             f"スコア: {score:.3f}"
         )
     else:
@@ -491,6 +551,9 @@ def get_market_buy_fill(pair: str, order_id, currency: str, max_retries: int = 3
     成行買いの約定情報を取得
     Coincheckの成行買いレスポンスはamount/rateがNoneのため、
     約定後に取引履歴APIで実際の約定量・約定価格を取得する
+    
+    注意: 約定は複数のトランザクションに分割されることがあるため
+    ページネーションのlimit=100で十分なデータを取得する
     """
     if not order_id:
         return None, None
@@ -503,20 +566,22 @@ def get_market_buy_fill(pair: str, order_id, currency: str, max_retries: int = 3
         time.sleep(2 * (attempt + 1))  # 2秒, 4秒, 6秒待機
         try:
             # 注文のトランザクション（約定履歴）を取得
+            # limit=100で十分（1注文で100分割はほぼない）
             result = call_coincheck_api(
-                f'/api/exchange/orders/transactions?order_id={order_id}',
+                f'/api/exchange/orders/transactions?order_id={order_id}&limit=100',
                 'GET', None, creds
             )
 
             if result and result.get('success') and result.get('transactions'):
                 transactions = result['transactions']
-                total_amount = sum(float(t.get('funds', {}).get(currency, 0)) for t in transactions)
+                total_amount = sum(abs(float(t.get('funds', {}).get(currency, 0))) for t in transactions)
                 total_jpy = sum(abs(float(t.get('funds', {}).get('jpy', 0))) for t in transactions)
 
                 if total_amount > 0:
                     avg_rate = total_jpy / total_amount
                     print(f"Fill data retrieved (attempt {attempt+1}): "
-                          f"amount={total_amount}, rate={avg_rate:.2f}")
+                          f"amount={total_amount}, rate={avg_rate:.2f}, "
+                          f"txn_count={len(transactions)}")
                     return total_amount, avg_rate
 
             print(f"Fill data not ready yet (attempt {attempt+1})")
@@ -524,6 +589,46 @@ def get_market_buy_fill(pair: str, order_id, currency: str, max_retries: int = 3
             print(f"Error fetching fill data (attempt {attempt+1}): {e}")
 
     print("Could not retrieve fill data after retries")
+    return None, None
+
+
+def get_market_sell_fill(pair: str, order_id, currency: str, max_retries: int = 3) -> tuple:
+    """
+    成行売りの約定情報を取得
+    Coincheckの成行売りレスポンスもrateがNoneになることがあるため、
+    約定後に取引履歴APIで実際の約定価格を取得する
+    """
+    if not order_id:
+        return None, None
+
+    creds = get_api_credentials()
+    if not creds:
+        return None, None
+
+    for attempt in range(max_retries):
+        time.sleep(2 * (attempt + 1))  # 2秒, 4秒, 6秒待機
+        try:
+            result = call_coincheck_api(
+                f'/api/exchange/orders/transactions?order_id={order_id}',
+                'GET', None, creds
+            )
+
+            if result and result.get('success') and result.get('transactions'):
+                transactions = result['transactions']
+                total_amount = sum(abs(float(t.get('funds', {}).get(currency, 0))) for t in transactions)
+                total_jpy = sum(abs(float(t.get('funds', {}).get('jpy', 0))) for t in transactions)
+
+                if total_amount > 0 and total_jpy > 0:
+                    avg_rate = total_jpy / total_amount
+                    print(f"Sell fill data retrieved (attempt {attempt+1}): "
+                          f"amount={total_amount}, rate={avg_rate:.2f}, jpy={total_jpy:.0f}")
+                    return total_amount, avg_rate
+
+            print(f"Sell fill data not ready yet (attempt {attempt+1})")
+        except Exception as e:
+            print(f"Error fetching sell fill data (attempt {attempt+1}): {e}")
+
+    print("Could not retrieve sell fill data after retries")
     return None, None
 
 
