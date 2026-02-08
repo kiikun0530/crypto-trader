@@ -129,13 +129,16 @@ def handler(event, context):
 
 def is_about_currency(article: dict, currency: str) -> bool:
     """記事が特定の通貨に関連するかチェック"""
-    currencies = article.get('currencies', [])
-    if isinstance(currencies, list):
-        for c in currencies:
-            if isinstance(c, dict) and c.get('code', '').upper() == currency.upper():
-                return True
-            elif isinstance(c, str) and c.upper() == currency.upper():
-                return True
+    # CryptoPanic API v2 では 'instruments' フィールドに通貨情報がある
+    # v1 の 'currencies' フィールドもフォールバックで対応
+    for field in ['instruments', 'currencies']:
+        items = article.get(field, [])
+        if isinstance(items, list):
+            for c in items:
+                if isinstance(c, dict) and c.get('code', '').upper() == currency.upper():
+                    return True
+                elif isinstance(c, str) and c.upper() == currency.upper():
+                    return True
     return False
 
 
@@ -212,9 +215,10 @@ def analyze_sentiment_weighted(news: list) -> tuple:
             article_score = 0.5 + (article_score - 0.5) * vote_confidence
         else:
             vote_unreliable_count += 1
-            article_score = 0.5
+            # 投票データ不足時はタイトルベースの簡易センチメント
+            article_score = estimate_sentiment_from_title(article.get('title', ''))
 
-        # CryptoPanicのsentimentフィールド
+        # CryptoPanicのsentimentフィールド（v1互換）
         sentiment = article.get('sentiment', '')
         if sentiment:
             sentiment_field_count += 1
@@ -222,6 +226,13 @@ def analyze_sentiment_weighted(news: list) -> tuple:
                 article_score = min(article_score + 0.15, 1.0)
             elif sentiment == 'bearish':
                 article_score = max(article_score - 0.15, 0.0)
+
+        # panic_score があれば補助的に使用（v2）
+        panic_score = article.get('panic_score')
+        if panic_score is not None and isinstance(panic_score, (int, float)):
+            # panic_score: 0=ネガティブ, 2=中立, 4=ポジティブ
+            panic_adjustment = (panic_score - 2) * 0.05  # ±0.10 の微調整
+            article_score = max(0.0, min(1.0, article_score + panic_adjustment))
 
         weight = time_weight * currency_weight
         total_weighted_score += article_score * weight
@@ -255,6 +266,41 @@ def get_article_age_hours(published_at: str) -> float:
         return max(0, age_seconds / 3600)
     except:
         return 24
+
+
+def estimate_sentiment_from_title(title: str) -> float:
+    """タイトルからセンチメントを簡易推定（投票データ不足時のフォールバック）"""
+    if not title:
+        return 0.5
+
+    title_lower = title.lower()
+
+    bullish_keywords = [
+        'surge', 'soar', 'rally', 'breakout', 'bullish', 'pump', 'moon',
+        'all-time high', 'ath', 'gain', 'rises', 'jumps', 'boost',
+        'adoption', 'partnership', 'upgrade', 'approval', 'etf approved',
+        'inflow', 'accumulate', 'buying', 'bought', 'record high',
+        'outperform', 'momentum', 'recovery', 'rebound', 'reclaim',
+    ]
+    bearish_keywords = [
+        'crash', 'plunge', 'dump', 'bearish', 'sell-off', 'selloff',
+        'collapse', 'decline', 'drop', 'falls', 'tank', 'slump',
+        'hack', 'exploit', 'vulnerability', 'fraud', 'scam',
+        'ban', 'restriction', 'crackdown', 'regulate', 'lawsuit',
+        'outflow', 'liquidat', 'fear', 'panic', 'warning', 'risk',
+        'fud', 'bubble', 'overvalued', 'correction',
+    ]
+
+    bullish_count = sum(1 for kw in bullish_keywords if kw in title_lower)
+    bearish_count = sum(1 for kw in bearish_keywords if kw in title_lower)
+
+    if bullish_count == 0 and bearish_count == 0:
+        return 0.5
+
+    # スコア調整: キーワード1つにつき ±0.1、最大 ±0.3
+    net_score = (bullish_count - bearish_count) * 0.1
+    net_score = max(-0.3, min(0.3, net_score))
+    return 0.5 + net_score
 
 
 def save_sentiment(pair: str, timestamp: int, score: float, news_count: int, fresh_count: int):
