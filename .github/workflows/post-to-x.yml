@@ -74,6 +74,12 @@ jobs:
           print(f"Body: {commit_body[:200]}")
           print(f"Changed files: {changed_files[:300]}")
 
+          # ワークフロー自体の変更のみのコミットはスキップ
+          file_list = [f.strip() for f in changed_files.split('\n') if f.strip()]
+          if all(f.startswith('.github/') for f in file_list) and file_list:
+              print("Skipping: only workflow files changed, nothing to tweet about")
+              exit(0)
+
           # GitHub Models APIでX投稿文を生成
           github_token = os.environ.get('GITHUB_TOKEN', '')
           tweet = None
