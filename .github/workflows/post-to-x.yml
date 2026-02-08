@@ -204,6 +204,13 @@ jobs:
           access_token = os.environ.get('X_ACCESS_TOKEN', '')
           access_secret = os.environ.get('X_ACCESS_SECRET', '')
 
+          # デバッグ: 各シークレットの読み込み状態（値は隠す）
+          print(f"X_API_KEY: {'set (' + str(len(api_key)) + ' chars)' if api_key else 'EMPTY'}")
+          print(f"X_API_SECRET: {'set (' + str(len(api_secret)) + ' chars)' if api_secret else 'EMPTY'}")
+          print(f"X_ACCESS_TOKEN: {'set (' + str(len(access_token)) + ' chars)' if access_token else 'EMPTY'}")
+          print(f"X_ACCESS_SECRET: {'set (' + str(len(access_secret)) + ' chars)' if access_secret else 'EMPTY'}")
+          print(f"Tweet length: {len(tweet)} chars")
+
           if not all([api_key, api_secret, access_token, access_secret]):
               print("X API credentials not set, skipping post")
               print(f"\nGenerated tweet:\n{tweet}")
