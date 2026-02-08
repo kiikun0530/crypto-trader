@@ -1,11 +1,11 @@
-name: Generate X Post on Push
+name: Post to X on Push
 
 on:
   push:
     branches: [main]
 
 jobs:
-  generate-x-post:
+  post-to-x:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,18 +18,21 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install requests requests-oauthlib
 
-      - name: Generate X post and send to Slack
+      - name: Generate tweet and post to X
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
         run: |
           python << 'SCRIPT'
           import os
           import subprocess
           import requests
-          import json
+          from requests_oauthlib import OAuth1
 
           # コミット情報取得
           commit_message = subprocess.check_output(
@@ -44,9 +47,36 @@ jobs:
           print(f"Commit: {commit_sha}")
           print(f"Message: {commit_message}")
 
-          # GitHub Models APIで要約
+          # GitHub Models APIでX投稿文を生成
           github_token = os.environ.get('GITHUB_TOKEN', '')
           tweet = None
+
+          SYSTEM_PROMPT = """あなたはフリーランスエンジニアのX（Twitter）投稿を代筆するアシスタントです。
+
+          【目的】
+          - 個人開発の活動を発信し、エンジニアとしての技術力をアピールする
+          - フリーランスエンジニアを探している採用担当者・企業の目に留まる投稿にする
+          - 自然体で、技術に対する情熱が伝わるトーンにする
+
+          【ルール】
+          - 日本語で書く
+          - 140文字以内に収める（厳守）
+          - 絵文字は1-2個だけ（使いすぎない）
+          - 「crypto-trader」というプロジェクト名を含める
+          - リポジトリURL https://github.com/kiikun0530/crypto-trader を含める
+          - 技術的な具体性を入れる（AWS Lambda, Terraform, Python, DynamoDB, Step Functions等）
+          - 大げさにしない。等身大で、でも技術力が伝わるように
+          - 煽りや誇張は絶対NG
+
+          【ハッシュタグ（必ず末尾に付ける）】
+          以下から3-4個選んで付ける:
+          #個人開発 #AWS #Python #Terraform #フリーランスエンジニア #エンジニア採用 #サーバーレス #仮想通貨
+
+          【良い例】
+          「crypto-traderにニュース感情分析を追加。CryptoPanic API→Lambda→DynamoDBで30分毎に自動収集する仕組み。全部Terraformで管理してます https://github.com/kiikun0530/crypto-trader #個人開発 #AWS #フリーランスエンジニア」
+
+          【悪い例（避けるべき）】
+          「🚀🔥💪最強のトレーディングボット作りました！！！天才エンジニアです！#拡散希望」"""
 
           try:
               resp = requests.post(
@@ -60,14 +90,14 @@ jobs:
                       'messages': [
                           {
                               'role': 'system',
-                              'content': 'あなたはX投稿を作成するアシスタントです。ルール：日本語で書く、絵文字を適度に使う、140文字以内、最後に「#個人開発 #AWS #仕事ほしい」を必ず入れる、「crypto-trader更新」で始める'
+                              'content': SYSTEM_PROMPT
                           },
                           {
                               'role': 'user',
-                              'content': f'以下のGitコミットをX投稿用に変換:\nコミット: {commit_sha}\nメッセージ: {commit_message}'
+                              'content': f'以下のGitコミットをX投稿に変換してください。\nコミット: {commit_sha}\nメッセージ: {commit_message}'
                           }
                       ],
-                      'max_tokens': 200,
+                      'max_tokens': 250,
                       'temperature': 0.7
                   },
                   timeout=30
@@ -75,77 +105,52 @@ jobs:
               if resp.status_code == 200:
                   data = resp.json()
                   tweet = data['choices'][0]['message']['content'].strip()
+                  # 余分なクォートを除去
+                  if tweet.startswith('"') and tweet.endswith('"'):
+                      tweet = tweet[1:-1]
+                  if tweet.startswith("'") and tweet.endswith("'"):
+                      tweet = tweet[1:-1]
                   print(f"Generated tweet: {tweet}")
+              else:
+                  print(f"GitHub Models failed: {resp.status_code} {resp.text}")
           except Exception as e:
               print(f"GitHub Models failed: {e}")
 
           # フォールバック
           if not tweet:
-              tweet = f"🚀 crypto-trader更新\n{commit_message[:80]}\n\nhttps://github.com/kiikun0530/crypto-trader\n\n#個人開発 #AWS #仕事ほしい"
+              tweet = (
+                  f"crypto-trader更新: {commit_message[:60]}\n"
+                  f"https://github.com/kiikun0530/crypto-trader\n"
+                  f"#個人開発 #AWS #フリーランスエンジニア"
+              )
               print(f"Using fallback: {tweet}")
 
-          # Slack通知
-          slack_url = os.environ.get('SLACK_WEBHOOK_URL', '')
-          if not slack_url:
-              print("SLACK_WEBHOOK_URL not set")
-              print(f"\n📝 X投稿用テキスト:\n{tweet}")
+          # X API投稿
+          api_key = os.environ.get('X_API_KEY', '')
+          api_secret = os.environ.get('X_API_SECRET', '')
+          access_token = os.environ.get('X_ACCESS_TOKEN', '')
+          access_secret = os.environ.get('X_ACCESS_SECRET', '')
+
+          if not all([api_key, api_secret, access_token, access_secret]):
+              print("X API credentials not set, skipping post")
+              print(f"\nGenerated tweet:\n{tweet}")
               exit(0)
 
-          slack_message = {
-              "blocks": [
-                  {
-                      "type": "header",
-                      "text": {
-                          "type": "plain_text",
-                          "text": "📝 X投稿用テキスト生成",
-                          "emoji": True
-                      }
-                  },
-                  {
-                      "type": "section",
-                      "text": {
-                          "type": "mrkdwn",
-                          "text": f"*コミット:* `{commit_sha}`\n*メッセージ:* {commit_message}"
-                      }
-                  },
-                  {
-                      "type": "divider"
-                  },
-                  {
-                      "type": "section",
-                      "text": {
-                          "type": "mrkdwn",
-                          "text": f"*コピペしてXに投稿してね👇*\n```{tweet}```"
-                      }
-                  },
-                  {
-                      "type": "actions",
-                      "elements": [
-                          {
-                              "type": "button",
-                              "text": {
-                                  "type": "plain_text",
-                                  "text": "🐦 Xを開く",
-                                  "emoji": True
-                              },
-                              "url": "https://twitter.com/intent/tweet"
-                          }
-                      ]
-                  }
-              ]
-          }
+          auth = OAuth1(api_key, api_secret, access_token, access_secret)
 
           try:
               resp = requests.post(
-                  slack_url,
-                  json=slack_message,
-                  timeout=10
+                  'https://api.twitter.com/2/tweets',
+                  auth=auth,
+                  json={'text': tweet},
+                  timeout=30
               )
-              print(f"Slack Response: {resp.status_code}")
-              if resp.status_code == 200:
-                  print("Slack notification sent!")
+              print(f"X API Response: {resp.status_code}")
+              print(f"Response body: {resp.text}")
+              if resp.status_code == 201:
+                  print("Tweet posted successfully!")
               else:
-                  print(f"Slack failed: {resp.text}")
+                  print("Failed to post tweet")
           except Exception as e:
-              print(f"Slack error: {e}")
+              print(f"X API error: {e}")
           SCRIPT
