@@ -381,7 +381,13 @@ def execute_sell(pair: str, position: dict, score: float):
 
         # P/L計算
         entry_price = float(position.get('entry_price', 0))
-        exit_price = float(result.get('rate', 0))
+        exit_price = result.get('rate') or 0
+        try:
+            exit_price = float(exit_price)
+        except (TypeError, ValueError):
+            exit_price = 0
+            print(f"WARNING: Invalid exit_price from API result: {result.get('rate')}")
+
         gross_pnl = (exit_price - entry_price) * amount
 
         sell_fee = exit_price * amount * TAKER_FEE_RATE
