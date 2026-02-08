@@ -470,36 +470,175 @@ jobs:
       - name: Commit and push fix
         if: success() && steps.verify.outputs.verify_status == 'success'
         run: |
+          git config user.name "auto-fix-bot"
+          git config user.email "auto-fix-bot@users.noreply.github.com"
+
+      - name: Update docs if needed
+        if: success() && steps.verify.outputs.verify_status == 'success'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python3 << 'DOCS_SCRIPT'
+          import json
+          import os
+          import urllib.request
+          import glob
+
+          function_name = "${{ steps.error.outputs.function_name }}"
+
+          # 差分読み込み
+          try:
+              with open('/tmp/diff.txt', 'r') as f:
+                  diff_text = f.read()
+          except:
+              print("No diff found, skipping docs update")
+              exit(0)
+
+          diff_lines = len(diff_text.strip().split('\n'))
+          if diff_lines < 5:
+              print(f"Small change ({diff_lines} lines), skipping docs update")
+              exit(0)
+
+          # 分析結果読み込み
+          analysis = ""
+          try:
+              with open('/tmp/analysis.txt', 'r') as f:
+                  analysis = f.read()
+          except:
+              pass
+
+          # 修正後のソースコード
+          try:
+              with open('/tmp/fixed_source.py', 'r') as f:
+                  fixed_code = f.read()
+          except:
+              print("No fixed source found, skipping")
+              exit(0)
+
+          # 関連ドキュメントを検索
+          doc_files = {}
+          for doc_path in glob.glob('docs/*.md'):
+              with open(doc_path, 'r') as f:
+                  content = f.read()
+              # 関数名またはサービス名がドキュメントに含まれているか
+              if function_name in content or function_name.replace('-', '_') in content:
+                  doc_files[doc_path] = content
+
+          # README.mdも確認
+          try:
+              with open('README.md', 'r') as f:
+                  readme = f.read()
+              if function_name in readme or function_name.replace('-', '_') in readme:
+                  doc_files['README.md'] = readme
+          except:
+              pass
+
+          if not doc_files:
+              print(f"No docs reference {function_name}, skipping")
+              exit(0)
+
+          print(f"Found {len(doc_files)} related docs: {list(doc_files.keys())}")
+
+          api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+          if not api_key:
+              print("No Anthropic API key, skipping docs update")
+              exit(0)
+
+          # 各ドキュメントについてClaudeに更新が必要か判断させる
+          updated_count = 0
+          for doc_path, doc_content in doc_files.items():
+              prompt = f"""あなたはテクニカルドキュメントの管理者です。
+
+          Lambda関数のソースコードが修正されました。関連するドキュメントに不整合がないか確認し、必要なら修正してください。
+
+          ## 修正されたLambda関数: {function_name}
+
+          ## コード変更の差分
+          ```diff
+          {diff_text[:3000]}
+          ```
+
+          ## 修正の分析
+          {analysis[:1000]}
+
+          ## 修正後のソースコード（参考）
+          ```python
+          {fixed_code[:4000]}
+          ```
+
+          ## 対象ドキュメント: {doc_path}
+          ```markdown
+          {doc_content}
+          ```
+
+          ## 指示
+          - ドキュメントの内容がコード変更と矛盾していないか確認
+          - 矛盾や不整合がある箇所だけを修正し、それ以外は変更しない
+          - 修正が不要な場合は「NO_UPDATE_NEEDED」とだけ出力する
+          - 修正が必要な場合は、修正後のドキュメント全体を以下のマーカーで囲んで出力する
+
+          ---DOC_START---
+          （修正後のMarkdownドキュメント全体）
+          ---DOC_END---
+          """
+
+              request_body = {
+                  "model": "claude-sonnet-4-20250514",
+                  "max_tokens": 8192,
+                  "messages": [{"role": "user", "content": prompt}]
+              }
+              headers = {
+                  "x-api-key": api_key,
+                  "anthropic-version": "2023-06-01",
+                  "content-type": "application/json"
+              }
+
+              try:
+                  req = urllib.request.Request(
+                      "https://api.anthropic.com/v1/messages",
+                      data=json.dumps(request_body).encode('utf-8'),
+                      headers=headers,
+                      method='POST'
+                  )
+                  response = urllib.request.urlopen(req, timeout=120)
+                  result = json.loads(response.read().decode('utf-8'))
+                  content = result['content'][0]['text']
+
+                  if 'NO_UPDATE_NEEDED' in content:
+                      print(f"  {doc_path}: No update needed")
+                  elif '---DOC_START---' in content and '---DOC_END---' in content:
+                      updated_doc = content.split('---DOC_START---')[1].split('---DOC_END---')[0].strip()
+                      # Markdownコードブロックマーカーを除去
+                      if updated_doc.startswith('```markdown'):
+                          updated_doc = updated_doc[len('```markdown'):].strip()
+                      if updated_doc.startswith('```'):
+                          updated_doc = updated_doc[3:].strip()
+                      if updated_doc.endswith('```'):
+                          updated_doc = updated_doc[:-3].strip()
+
+                      with open(doc_path, 'w') as f:
+                          f.write(updated_doc + '\n')
+                      print(f"  {doc_path}: Updated ✅")
+                      updated_count += 1
+                  else:
+                      print(f"  {doc_path}: Could not parse response, skipping")
+
+              except Exception as e:
+                  print(f"  {doc_path}: Claude API error: {e}")
+
+          print(f"\nDocs update complete: {updated_count} files updated")
+          DOCS_SCRIPT
+
+      - name: Push all changes
+        if: success() && steps.verify.outputs.verify_status == 'success'
+        run: |
           FUNCTION_NAME="${{ steps.error.outputs.function_name }}"
 
           # 分析コメント読み込み
           ANALYSIS=$(cat /tmp/analysis.txt 2>/dev/null | head -5 || echo "Auto-fix applied")
 
-          git config user.name "auto-fix-bot"
-          git config user.email "auto-fix-bot@users.noreply.github.com"
           git add -A
           git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "fix(${FUNCTION_NAME}): auto-fix error [bot]" \
+          git commit -m "fix(${FUNCTION_NAME}): auto-fix error + docs update [bot]" \
             -m "${ANALYSIS}"
           git push
-
-      - name: Update docs if needed
-        if: success() && steps.verify.outputs.verify_status == 'success'
-        run: |
-          FUNCTION_NAME="${{ steps.error.outputs.function_name }}"
-          SERVICE_DIR="${{ steps.error.outputs.service_dir }}"
-
-          # 変更が大きい場合のみドキュメント更新チェック
-          DIFF_LINES=$(wc -l < /tmp/diff.txt 2>/dev/null || echo "0")
-
-          if [ "${DIFF_LINES}" -gt 20 ]; then
-            echo "Large change detected (${DIFF_LINES} lines). Checking docs..."
-
-            # docs/ ディレクトリ内の関連ドキュメントを確認
-            RELATED_DOCS=$(grep -rl "${FUNCTION_NAME}" docs/ 2>/dev/null || echo "")
-            if [ -n "${RELATED_DOCS}" ]; then
-              echo "Related docs found: ${RELATED_DOCS}"
-              echo "📝 TODO: ドキュメントの更新が必要な可能性があります"
-              # ここにClaude APIでドキュメント更新ロジックを追加可能
-            fi
-          fi
