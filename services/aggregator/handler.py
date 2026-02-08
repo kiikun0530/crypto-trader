@@ -8,6 +8,7 @@
 - ポジションなし → 最高スコアの通貨がBUY閾値超えで買い
 - ポジションあり → その通貨がSELL閾値以下で売り
 - 1ポジション制約（リスク管理）
+- ボラティリティ適応型閾値（市場状況に応じて動的調整）
 """
 import json
 import os
@@ -35,9 +36,15 @@ TECHNICAL_WEIGHT = float(os.environ.get('TECHNICAL_WEIGHT', '0.45'))
 CHRONOS_WEIGHT = float(os.environ.get('AI_PREDICTION_WEIGHT', '0.40'))
 SENTIMENT_WEIGHT = float(os.environ.get('SENTIMENT_WEIGHT', '0.15'))
 
-# 閾値
-BUY_THRESHOLD = float(os.environ.get('BUY_THRESHOLD', '0.5'))
-SELL_THRESHOLD = float(os.environ.get('SELL_THRESHOLD', '-0.5'))
+# ボラティリティ適応型閾値
+# 基準閾値（平均的なボラティリティ時に使用）
+BASE_BUY_THRESHOLD = float(os.environ.get('BASE_BUY_THRESHOLD', '0.20'))
+BASE_SELL_THRESHOLD = float(os.environ.get('BASE_SELL_THRESHOLD', '-0.20'))
+# BB幅の基準値（暗号通貨の典型的なBB幅 ≈ 3%）
+BASELINE_BB_WIDTH = float(os.environ.get('BASELINE_BB_WIDTH', '0.03'))
+# ボラティリティ補正のクランプ範囲
+VOL_CLAMP_MIN = 0.5
+VOL_CLAMP_MAX = 2.0
 
 
 def handler(event, context):
@@ -57,20 +64,28 @@ def handler(event, context):
             pair = result.get('pair', 'unknown')
             scored = score_pair(pair, result)
             scored_pairs.append(scored)
-            save_signal(scored)
 
-        # 2. スコア順にソート（期待値の高い順）
+        # 2. ボラティリティ適応型閾値を計算
+        buy_threshold, sell_threshold = calculate_dynamic_thresholds(scored_pairs)
+
+        # 3. シグナル保存（動的閾値を使用）
+        for scored in scored_pairs:
+            save_signal(scored, buy_threshold, sell_threshold)
+
+        # 4. スコア順にソート（期待値の高い順）
         scored_pairs.sort(key=lambda x: x['total_score'], reverse=True)
 
-        # 3. 現在のポジション確認
+        # 5. 現在のポジション確認
         active_position = find_active_position()
 
-        # 4. 売買判定（全通貨比較）
-        signal, target_pair, target_score = decide_action(scored_pairs, active_position)
+        # 6. 売買判定（動的閾値で判定）
+        signal, target_pair, target_score = decide_action(
+            scored_pairs, active_position, buy_threshold, sell_threshold
+        )
 
         has_signal = signal in ['BUY', 'SELL']
 
-        # 5. 注文送信
+        # 7. 注文送信
         if has_signal and ORDER_QUEUE_URL:
             send_order_message(target_pair, signal, target_score, int(time.time()))
 
@@ -88,11 +103,13 @@ def handler(event, context):
                 for s in scored_pairs
             ],
             'active_position': active_position.get('pair') if active_position else None,
+            'buy_threshold': round(buy_threshold, 4),
+            'sell_threshold': round(sell_threshold, 4),
             'timestamp': int(time.time())
         }
 
-        # 6. Slack通知（ランキング付き）
-        notify_slack(result, scored_pairs, active_position)
+        # 8. Slack通知（ランキング付き + 動的閾値表示）
+        notify_slack(result, scored_pairs, active_position, buy_threshold, sell_threshold)
 
         return result
 
@@ -129,6 +146,9 @@ def score_pair(pair: str, result: dict) -> dict:
         sentiment_normalized * SENTIMENT_WEIGHT
     )
 
+    # ボラティリティ情報を抽出（BB幅 = (上限-下限)/中央値）
+    bb_width = extract_bb_width(technical_result)
+
     return {
         'pair': pair,
         'total_score': total_score,
@@ -137,13 +157,66 @@ def score_pair(pair: str, result: dict) -> dict:
             'chronos': round(chronos_normalized, 3),
             'sentiment': round(sentiment_normalized, 3)
         },
-        'current_price': result.get('technical', {}).get('current_price', 0)
+        'current_price': result.get('technical', {}).get('current_price', 0),
+        'bb_width': bb_width
     }
 
 
-def decide_action(scored_pairs: list, active_position: dict) -> tuple:
+def extract_bb_width(technical_result: dict) -> float:
+    """テクニカル結果からBB幅（ボラティリティ指標）を抽出"""
+    try:
+        indicators = {}
+        if isinstance(technical_result, dict):
+            if 'body' in technical_result:
+                body = json.loads(technical_result['body']) if isinstance(technical_result['body'], str) else technical_result['body']
+                indicators = body.get('indicators', {})
+            else:
+                indicators = technical_result.get('indicators', {})
+
+        bb_upper = float(indicators.get('bb_upper', 0))
+        bb_lower = float(indicators.get('bb_lower', 0))
+        current_price = float(indicators.get('current_price', 0))
+
+        if current_price > 0 and bb_upper > bb_lower:
+            return (bb_upper - bb_lower) / current_price
+    except Exception as e:
+        print(f"BB width extraction error: {e}")
+
+    return BASELINE_BB_WIDTH  # デフォルト
+
+
+def calculate_dynamic_thresholds(scored_pairs: list) -> tuple:
     """
-    全通貨のスコアから最適なアクションを決定
+    ボラティリティ適応型閾値を計算
+
+    ロジック:
+    - 全通貨の平均BB幅（ボラティリティ指標）を算出
+    - 基準BB幅(3%)と比較して補正係数を計算
+    - 高ボラ時: 閾値を厳しく（ノイズに反応しない）
+    - 低ボラ時: 閾値を緩く（小さな確実なシグナルを拾う）
+    """
+    if not scored_pairs:
+        return BASE_BUY_THRESHOLD, BASE_SELL_THRESHOLD
+
+    bb_widths = [s.get('bb_width', BASELINE_BB_WIDTH) for s in scored_pairs]
+    avg_bb_width = sum(bb_widths) / len(bb_widths)
+
+    vol_ratio = avg_bb_width / BASELINE_BB_WIDTH
+    vol_ratio = max(VOL_CLAMP_MIN, min(VOL_CLAMP_MAX, vol_ratio))
+
+    buy_threshold = BASE_BUY_THRESHOLD * vol_ratio
+    sell_threshold = BASE_SELL_THRESHOLD * vol_ratio
+
+    print(f"Dynamic thresholds: BUY={buy_threshold:+.3f} SELL={sell_threshold:+.3f} "
+          f"(avg_bb_width={avg_bb_width:.4f}, vol_ratio={vol_ratio:.2f})")
+
+    return buy_threshold, sell_threshold
+
+
+def decide_action(scored_pairs: list, active_position: dict,
+                   buy_threshold: float, sell_threshold: float) -> tuple:
+    """
+    全通貨のスコアから最適なアクションを決定（動的閾値対応）
 
     ルール:
     1. ポジションなし → 最高スコアの通貨がBUY閾値以上なら買い
@@ -168,8 +241,9 @@ def decide_action(scored_pairs: list, active_position: dict) -> tuple:
 
         if analysis_pair:
             pair_data = next((s for s in scored_pairs if s['pair'] == analysis_pair), None)
-            if pair_data and pair_data['total_score'] <= SELL_THRESHOLD:
-                print(f"SELL signal for {position_pair}: score={pair_data['total_score']:.4f}")
+            if pair_data and pair_data['total_score'] <= sell_threshold:
+                print(f"SELL signal for {position_pair}: score={pair_data['total_score']:.4f} "
+                      f"(threshold: {sell_threshold:.3f})")
                 return 'SELL', position_pair, pair_data['total_score']
 
         print(f"HOLD: active position in {position_pair}")
@@ -178,12 +252,13 @@ def decide_action(scored_pairs: list, active_position: dict) -> tuple:
     else:
         # ポジションなし → 最高スコアの通貨をチェック
         best = scored_pairs[0]
-        if best['total_score'] >= BUY_THRESHOLD:
+        if best['total_score'] >= buy_threshold:
             coincheck_pair = TRADING_PAIRS.get(best['pair'], {}).get('coincheck', best['pair'])
-            print(f"BUY signal for {best['pair']} ({coincheck_pair}): score={best['total_score']:.4f}")
+            print(f"BUY signal for {best['pair']} ({coincheck_pair}): score={best['total_score']:.4f} "
+                  f"(threshold: {buy_threshold:.3f})")
             return 'BUY', coincheck_pair, best['total_score']
 
-        print(f"HOLD: best score is {best['total_score']:.4f} (threshold: {BUY_THRESHOLD})")
+        print(f"HOLD: best score is {best['total_score']:.4f} (threshold: {buy_threshold:.3f})")
         return 'HOLD', None, None
 
 
@@ -222,15 +297,15 @@ def extract_score(result: dict, key: str, default: float) -> float:
     return default
 
 
-def save_signal(scored: dict):
-    """全通貨のシグナルを保存（分析履歴）"""
+def save_signal(scored: dict, buy_threshold: float, sell_threshold: float):
+    """全通貨のシグナルを保存（分析履歴・動的閾値対応）"""
     table = dynamodb.Table(SIGNALS_TABLE)
     timestamp = int(time.time())
 
     signal = 'HOLD'
-    if scored['total_score'] >= BUY_THRESHOLD:
+    if scored['total_score'] >= buy_threshold:
         signal = 'BUY'
-    elif scored['total_score'] <= SELL_THRESHOLD:
+    elif scored['total_score'] <= sell_threshold:
         signal = 'SELL'
 
     table.put_item(Item={
@@ -241,6 +316,9 @@ def save_signal(scored: dict):
         'technical_score': Decimal(str(round(scored['components']['technical'], 4))),
         'chronos_score': Decimal(str(round(scored['components']['chronos'], 4))),
         'sentiment_score': Decimal(str(round(scored['components']['sentiment'], 4))),
+        'buy_threshold': Decimal(str(round(buy_threshold, 4))),
+        'sell_threshold': Decimal(str(round(sell_threshold, 4))),
+        'bb_width': Decimal(str(round(scored.get('bb_width', BASELINE_BB_WIDTH), 6))),
         'ttl': timestamp + 7776000  # 90日後に削除
     })
 
@@ -258,8 +336,11 @@ def send_order_message(pair: str, signal: str, score: float, timestamp: int):
     )
 
 
-def notify_slack(result: dict, scored_pairs: list, active_position: dict):
-    """Slackに分析結果を通知（通貨ランキング表示）"""
+def notify_slack(result: dict, scored_pairs: list, active_position: dict,
+                 buy_threshold: float = None, sell_threshold: float = None):
+    """Slackに分析結果を通知（通貨ランキング + 動的閾値表示）"""
+    buy_threshold = buy_threshold or BASE_BUY_THRESHOLD
+    sell_threshold = sell_threshold or BASE_SELL_THRESHOLD
     if not SLACK_WEBHOOK_URL:
         return
 
@@ -322,7 +403,7 @@ def notify_slack(result: dict, scored_pairs: list, active_position: dict):
                 {
                     "type": "context",
                     "elements": [
-                        {"type": "mrkdwn", "text": f"📍 ポジション: {position_text} | BUY閾値: {BUY_THRESHOLD} / SELL閾値: {SELL_THRESHOLD}"}
+                        {"type": "mrkdwn", "text": f"📍 ポジション: {position_text} | BUY閾値: {buy_threshold:+.3f} / SELL閾値: {sell_threshold:+.3f}"}
                     ]
                 }
             ]

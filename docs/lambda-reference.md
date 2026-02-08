@@ -280,14 +280,18 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
 ### 処理フロー
 
 1. 各通貨の加重平均スコアを計算
-2. 全通貨をスコア降順でランキング
-3. ポジションの有無を確認（全通貨を横断チェック）
-4. 売買判定:
-   - ポジションなし & 最高スコア >= BUY閾値 → BUY
-   - ポジションあり & 保有通貨 <= SELL閾値 → SELL
+2. BB幅（ボリンジャーバンド幅）からボラティリティ適応型閾値を計算
+   - `vol_ratio = avg_bb_width / baseline(0.03)` → クランプ 0.5〜2.0
+   - `buy_threshold = 0.20 × vol_ratio`, `sell_threshold = -0.20 × vol_ratio`
+3. 全通貨のシグナルを DynamoDB に保存（動的閾値・BB幅も記録）
+4. 全通貨をスコア降順でランキング
+5. ポジションの有無を確認（全通貨を横断チェック）
+6. 売買判定（動的閾値で判定）:
+   - ポジションなし & 最高スコア >= buy_threshold → BUY
+   - ポジションあり & 保有通貨 <= sell_threshold → SELL
    - それ以外 → HOLD
-5. シグナルがあれば SQS に注文メッセージ送信
-6. Slack にランキング付き分析結果を通知
+7. シグナルがあれば SQS に注文メッセージ送信
+8. Slack にランキング + 動的閾値付き分析結果を通知
 
 ### 出力
 
@@ -302,7 +306,9 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
     {"pair": "btc_usdt", "name": "Bitcoin", "score": 0.4521},
     ...
   ],
-  "active_position": null
+  "active_position": null,
+  "buy_threshold": 0.2000,
+  "sell_threshold": -0.2000
 }
 ```
 
