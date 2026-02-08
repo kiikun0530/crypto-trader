@@ -34,9 +34,13 @@ jobs:
           import requests
           from requests_oauthlib import OAuth1
 
-          # コミット情報取得
-          commit_message = subprocess.check_output(
+          # コミット情報取得（件名 + 本文）
+          commit_subject = subprocess.check_output(
               ['git', 'log', '-1', '--pretty=format:%s'],
+              text=True
+          ).strip()
+          commit_body = subprocess.check_output(
+              ['git', 'log', '-1', '--pretty=format:%b'],
               text=True
           ).strip()
           commit_sha = subprocess.check_output(
@@ -44,39 +48,86 @@ jobs:
               text=True
           ).strip()
 
+          # 差分情報（変更ファイル・行数）
+          try:
+              diff_stat = subprocess.check_output(
+                  ['git', 'diff', '--stat', 'HEAD~1', 'HEAD'],
+                  text=True
+              ).strip()
+          except Exception:
+              diff_stat = "(diff not available)"
+
+          # 変更ファイル名一覧
+          try:
+              changed_files = subprocess.check_output(
+                  ['git', 'diff', '--name-only', 'HEAD~1', 'HEAD'],
+                  text=True
+              ).strip()
+          except Exception:
+              changed_files = ""
+
           print(f"Commit: {commit_sha}")
-          print(f"Message: {commit_message}")
+          print(f"Subject: {commit_subject}")
+          print(f"Body: {commit_body[:200]}")
+          print(f"Changed files: {changed_files[:300]}")
 
           # GitHub Models APIでX投稿文を生成
           github_token = os.environ.get('GITHUB_TOKEN', '')
           tweet = None
 
-          SYSTEM_PROMPT = """あなたはフリーランスエンジニアのX（Twitter）投稿を代筆するアシスタントです。
+          SYSTEM_PROMPT = """あなたはフリーランスエンジニアの個人開発日記をX（Twitter）に投稿する代筆者です。
 
-          【目的】
-          - 個人開発の活動を発信し、エンジニアとしての技術力をアピールする
-          - フリーランスエンジニアを探している採用担当者・企業の目に留まる投稿にする
-          - 自然体で、技術に対する情熱が伝わるトーンにする
+          【あなたの役割】
+          コミットログと差分情報を読み取って、「開発者本人が書いたかのような」自然なX投稿を生成する。
+          単なる更新報告ではなく、開発の裏側にあるストーリーを伝える。
 
-          【ルール】
+          【投稿で伝えるべきこと（以下から1-2個選ぶ）】
+          - なぜこの変更をしたのか（背景・動機）
+          - どんな技術的チャレンジがあったか（苦労話）
+          - 何を学んだか・発見したか
+          - どんなアーキテクチャ判断をしたか（トレードオフ）
+          - 数字で語れる成果（コスト削減額、パフォーマンス改善等）
+
+          【トーンとスタイル】
           - 日本語で書く
-          - 140文字以内に収める（厳守）
-          - 絵文字は1-2個だけ（使いすぎない）
-          - 「crypto-trader」というプロジェクト名を含める
-          - リポジトリURL https://github.com/kiikun0530/crypto-trader を含める
-          - 技術的な具体性を入れる（AWS Lambda, Terraform, Python, DynamoDB, Step Functions等）
-          - 大げさにしない。等身大で、でも技術力が伝わるように
-          - 煽りや誇張は絶対NG
+          - 280文字以内（厳守）
+          - 一人称は使わないか「自分」。「私」は使わない
+          - 等身大で素直。技術への真剣さが伝わるトーン
+          - 絵文字は0-2個（なくてもいい）
+          - 技術用語は正確に使う（採用担当よりエンジニアに刺さる内容を優先）
+          - 大げさ・煽り・自画自賛は絶対NG
+          - 「〜しました！」の羅列にしない
 
-          【ハッシュタグ（必ず末尾に付ける）】
-          以下から3-4個選んで付ける:
-          #個人開発 #AWS #Python #Terraform #フリーランスエンジニア #エンジニア採用 #サーバーレス #仮想通貨
+          【必須要素】
+          - リポジトリURL: https://github.com/kiikun0530/crypto-trader
+          - ハッシュタグ 2-3個（末尾に）: #個人開発 #AWS #Python #Terraform #フリーランスエンジニア #サーバーレス から選択
 
-          【良い例】
-          「crypto-traderにニュース感情分析を追加。CryptoPanic API→Lambda→DynamoDBで30分毎に自動収集する仕組み。全部Terraformで管理してます https://github.com/kiikun0530/crypto-trader #個人開発 #AWS #フリーランスエンジニア」
+          【良い投稿例】
+          「SageMakerのクォータ承認が数日かかりそうだったので、Chronos-T5-TinyをONNXに変換してLambda直接実行に切り替えた。結果的にSageMaker不要でコスト$8/月削減。制約が良い設計を生むこともある https://github.com/kiikun0530/crypto-trader #個人開発 #AWS」
+
+          「6通貨同時分析するとLambda 18並列になるけど、DynamoDBのオンデマンドなら全然耐えられる。月$0.30。サーバーレスのコスト感覚がだいぶ掴めてきた https://github.com/kiikun0530/crypto-trader #個人開発 #サーバーレス」
+
+          「価格変動の検知窓を±60秒→±300秒に広げただけで、5分足のキャンドル境界問題が解決。地味だけどこういうバグが一番つらい https://github.com/kiikun0530/crypto-trader #個人開発 #Python」
 
           【悪い例（避けるべき）】
-          「🚀🔥💪最強のトレーディングボット作りました！！！天才エンジニアです！#拡散希望」"""
+          - 「crypto-trader更新: XXXを追加しました #個人開発」← 更新報告でしかない
+          - 「🚀🔥すごいの作った！！」← 煽り
+          - 「feat: add ONNX support」← コミットログそのまま"""
+
+          # LLMに渡すユーザーメッセージ（リッチなコンテキスト）
+          user_message = f"""以下のコミット情報からX投稿を生成してください。
+コミットログだけでなく、変更ファイルや差分から「何をなぜやったか」を読み取って、開発者の視点で語ってください。
+
+## コミット
+件名: {commit_subject}
+本文:
+{commit_body if commit_body else '(なし)'}
+
+## 変更ファイル
+{changed_files}
+
+## 差分サマリ
+{diff_stat}"""
 
           try:
               resp = requests.post(
@@ -94,10 +145,10 @@ jobs:
                           },
                           {
                               'role': 'user',
-                              'content': f'以下のGitコミットをX投稿に変換してください。\nコミット: {commit_sha}\nメッセージ: {commit_message}'
+                              'content': user_message
                           }
                       ],
-                      'max_tokens': 250,
+                      'max_tokens': 350,
                       'temperature': 0.7
                   },
                   timeout=30
@@ -118,8 +169,10 @@ jobs:
 
           # フォールバック
           if not tweet:
+              # コミット本文があれば使う、なければ件名を使う
+              detail = commit_body.split('\n')[0][:80] if commit_body else commit_subject[:80]
               tweet = (
-                  f"crypto-trader更新: {commit_message[:60]}\n"
+                  f"{detail}\n"
                   f"https://github.com/kiikun0530/crypto-trader\n"
                   f"#個人開発 #AWS #フリーランスエンジニア"
               )
