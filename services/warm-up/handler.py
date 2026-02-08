@@ -1,7 +1,7 @@
 """
 ウォームアップ Lambda
 初回デプロイ時に過去データをBinanceから取得してDynamoDBに投入
-手動で1回実行する
+手動で1回実行する（全通貨対応）
 """
 import json
 import os
@@ -12,78 +12,96 @@ from decimal import Decimal
 dynamodb = boto3.resource('dynamodb')
 PRICES_TABLE = os.environ.get('PRICES_TABLE', 'eth-trading-prices')
 
-# Binance API設定
-BINANCE_SYMBOL = 'ETHUSDT'
+# 通貨ペア設定
+DEFAULT_PAIRS = {
+    "eth_usdt": {"binance": "ETHUSDT", "coincheck": "eth_jpy", "news": "ETH", "name": "Ethereum"}
+}
+TRADING_PAIRS = json.loads(os.environ.get('TRADING_PAIRS_CONFIG', json.dumps(DEFAULT_PAIRS)))
+
 BINANCE_INTERVAL = '5m'
 BINANCE_LIMIT = 1000  # 最大1000件 = 約3.5日分
 
-def handler(event, context):
-    """過去データをBinanceから取得してDynamoDB投入"""
-    pair = 'eth_usdt'
-    
-    try:
-        # 1. Binance APIから過去データ取得
-        print(f"Fetching {BINANCE_LIMIT} candles from Binance...")
-        candles = fetch_historical_data()
-        print(f"Fetched {len(candles)} candles")
-        
-        # 2. DynamoDBにバッチ投入
-        inserted_count = batch_write_prices(pair, candles)
-        
-        result = {
-            'pair': pair,
-            'fetched': len(candles),
-            'inserted': inserted_count,
-            'oldest_timestamp': candles[0]['timestamp'] if candles else None,
-            'newest_timestamp': candles[-1]['timestamp'] if candles else None
-        }
-        
-        print(f"Warm-up complete: {result}")
-        
-        return {
-            'statusCode': 200,
-            'body': json.dumps(result)
-        }
-        
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'error': str(e)})
-        }
 
-def fetch_historical_data() -> list:
+def handler(event, context):
+    """過去データをBinanceから取得してDynamoDB投入（全通貨）"""
+
+    # 特定通貨のみ指定可能
+    target_pair = event.get('pair', None)
+
+    if target_pair:
+        pairs_to_warmup = {target_pair: TRADING_PAIRS[target_pair]}
+    else:
+        pairs_to_warmup = TRADING_PAIRS
+
+    results = {}
+
+    for pair, config in pairs_to_warmup.items():
+        try:
+            binance_symbol = config['binance']
+            print(f"Warming up {config['name']} ({binance_symbol})...")
+
+            # 1. Binance APIから過去データ取得
+            candles = fetch_historical_data(binance_symbol)
+            print(f"  Fetched {len(candles)} candles")
+
+            # 2. DynamoDBにバッチ投入
+            inserted_count = batch_write_prices(pair, candles)
+
+            results[pair] = {
+                'name': config['name'],
+                'fetched': len(candles),
+                'inserted': inserted_count,
+                'oldest': candles[0]['timestamp'] if candles else None,
+                'newest': candles[-1]['timestamp'] if candles else None
+            }
+            print(f"  Inserted {inserted_count} records")
+
+        except Exception as e:
+            print(f"Error warming up {pair}: {e}")
+            results[pair] = {'error': str(e)}
+
+    print(f"Warm-up complete: {len(results)} pairs processed")
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps(results)
+    }
+
+
+def fetch_historical_data(binance_symbol: str) -> list:
     """Binance APIから過去の5分足データを取得"""
-    url = f"https://api.binance.com/api/v3/klines?symbol={BINANCE_SYMBOL}&interval={BINANCE_INTERVAL}&limit={BINANCE_LIMIT}"
+    url = (
+        f"https://api.binance.com/api/v3/klines"
+        f"?symbol={binance_symbol}&interval={BINANCE_INTERVAL}&limit={BINANCE_LIMIT}"
+    )
     req = urllib.request.Request(url)
-    
+
     with urllib.request.urlopen(req, timeout=30) as response:
         data = json.loads(response.read().decode())
-    
-    # [openTime, open, high, low, close, volume, closeTime, ...]
+
     candles = []
     for candle in data:
         candles.append({
-            'timestamp': int(candle[0] / 1000),  # ミリ秒→秒
+            'timestamp': int(candle[0] / 1000),
             'open': float(candle[1]),
             'high': float(candle[2]),
             'low': float(candle[3]),
             'close': float(candle[4]),
             'volume': float(candle[5])
         })
-    
+
     return candles
+
 
 def batch_write_prices(pair: str, candles: list) -> int:
     """DynamoDBにバッチ投入"""
     table = dynamodb.Table(PRICES_TABLE)
     inserted = 0
-    
-    # DynamoDBのBatchWriteは最大25件
+
     batch_size = 25
     for i in range(0, len(candles), batch_size):
         batch = candles[i:i + batch_size]
-        
+
         with table.batch_writer() as writer:
             for candle in batch:
                 writer.put_item(Item={
@@ -97,5 +115,5 @@ def batch_write_prices(pair: str, candles: list) -> int:
                     'ttl': candle['timestamp'] + 1209600  # 14日後に削除
                 })
                 inserted += 1
-    
+
     return inserted

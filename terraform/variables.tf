@@ -75,6 +75,17 @@ variable "signals_ttl_days" {
 }
 
 # ============================================
+# Multi-Currency Settings
+# ============================================
+variable "trading_pairs_config" {
+  description = "JSON config for trading pairs (Binance analysis -> Coincheck trading)"
+  type        = string
+  default     = <<-EOT
+{"eth_usdt":{"binance":"ETHUSDT","coincheck":"eth_jpy","news":"ETH","name":"Ethereum"},"btc_usdt":{"binance":"BTCUSDT","coincheck":"btc_jpy","news":"BTC","name":"Bitcoin"},"xrp_usdt":{"binance":"XRPUSDT","coincheck":"xrp_jpy","news":"XRP","name":"XRP"},"dot_usdt":{"binance":"DOTUSDT","coincheck":"dot_jpy","news":"DOT","name":"Polkadot"},"link_usdt":{"binance":"LINKUSDT","coincheck":"link_jpy","news":"LINK","name":"Chainlink"},"avax_usdt":{"binance":"AVAXUSDT","coincheck":"avax_jpy","news":"AVAX","name":"Avalanche"}}
+EOT
+}
+
+# ============================================
 # External API Keys
 # ============================================
 variable "cryptopanic_api_key" {

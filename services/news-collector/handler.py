@@ -1,11 +1,16 @@
 """
 ニュース収集 Lambda
-30分間隔でCryptoPanicからリアルタイムニュースを取得し、センチメント分析
-Growth Plan: 3,000 req/mo, Real-time, 1 month history
+30分間隔でCryptoPanicから全通貨のニュースを一括取得し、通貨別センチメント分析
+
+API最適化:
+- 全通貨を1リクエストで取得（currencies=ETH,BTC,XRP,...）
+- 全体市場ニュースを1リクエストで取得
+- 合計2 API calls/実行 × 1,440回/月 = 2,880/mo（Growth Plan 3,000内）
 
 改善点:
-- ETH単独ではなくBTC・全体ニュースも取得（相関性を考慮）
-- 投票数の信頼性閾値を導入（少数投票を過信しない）
+- 各通貨ごとにセンチメントスコアを個別保存
+- BTC相関・全体市場の影響を加味
+- 投票数の信頼性閾値を維持
 """
 import json
 import os
@@ -18,77 +23,102 @@ dynamodb = boto3.resource('dynamodb')
 SENTIMENT_TABLE = os.environ.get('SENTIMENT_TABLE', 'eth-trading-sentiment')
 CRYPTOPANIC_API_KEY = os.environ.get('CRYPTOPANIC_API_KEY', '')
 
-# Growth Plan: 50件/リクエスト、1時間以内のニュースをフィルタ
-NEWS_LIMIT = 50
-NEWS_FRESHNESS_HOURS = 1  # 直近1時間のニュースを重視
-
-# マルチ通貨ニュース: ETHだけでなくBTC・全体の影響も考慮
-# BTC暴落→ETH連動、SEC規制→全体に影響 等
-CURRENCY_WEIGHTS = {
-    'ETH': 1.0,    # ETH直接ニュースは最重要
-    'BTC': 0.6,    # BTC相関（相関係数0.8+だが直接影響は割引）
-    'ALL': 0.3,    # 全体市場ニュース（規制、マクロ等）
+# 通貨ペア設定
+DEFAULT_PAIRS = {
+    "eth_usdt": {"binance": "ETHUSDT", "coincheck": "eth_jpy", "news": "ETH", "name": "Ethereum"}
 }
+TRADING_PAIRS = json.loads(os.environ.get('TRADING_PAIRS_CONFIG', json.dumps(DEFAULT_PAIRS)))
+
+NEWS_LIMIT = 50
+NEWS_FRESHNESS_HOURS = 1
 
 # 投票信頼性の閾値
-# CryptoPanicの投票数は記事により0〜数百と分散が大きい
-# 少数投票（1-2票）では統計的に無意味なためsentimentフィールドを優先
-MIN_RELIABLE_VOTES = 5   # この数以上で投票結果を信頼
-VOTE_CONFIDENCE_CAP = 20 # この数以上で信頼度100%
+MIN_RELIABLE_VOTES = 5
+VOTE_CONFIDENCE_CAP = 20
+
+# BTC相関の重み（BTC以外の通貨に適用）
+BTC_CORRELATION_WEIGHT = 0.5
+
+# 全体市場ニュースの重み
+MARKET_NEWS_WEIGHT = 0.3
+
 
 def handler(event, context):
-    """ニュース収集 + センチメント分析"""
-    pair = 'eth_usdt'  # Binance統一
-    
+    """全通貨のニュース収集 + 通貨別センチメント分析"""
+    timestamp = int(time.time())
+
     try:
-        # 1. マルチ通貨ニュース取得（ETH + BTC + 全体）
-        all_news = []
-        for currency, weight in CURRENCY_WEIGHTS.items():
-            if currency == 'ALL':
-                # 全体ニュース（通貨指定なし）
-                news = fetch_news(currency=None, limit=20)
-            else:
-                news = fetch_news(currency=currency, limit=NEWS_LIMIT)
-            
-            # 通貨重みを各記事に付与
-            for article in news:
-                article['_currency_weight'] = weight
-                article['_source_currency'] = currency
-            all_news.extend(news)
-            print(f"  {currency}: {len(news)} articles (weight: {weight})")
-        
-        if not all_news:
-            return {
-                'statusCode': 200,
-                'body': json.dumps({
-                    'message': 'No news found',
-                    'sentiment_score': 0.5
-                })
+        # 1. 対象通貨のニュースを一括取得（1 API call）
+        target_currencies = list(set([c['news'] for c in TRADING_PAIRS.values()]))
+        currency_news = fetch_news(currencies=','.join(target_currencies), limit=NEWS_LIMIT)
+        print(f"Fetched {len(currency_news)} articles for {','.join(target_currencies)}")
+
+        # 2. 全体市場ニュース取得（1 API call）
+        market_news = fetch_news(currencies=None, limit=20)
+        print(f"Fetched {len(market_news)} market-wide articles")
+
+        # 3. 通貨別にセンチメント計算・保存
+        results = {}
+        for pair, config in TRADING_PAIRS.items():
+            currency = config['news']
+
+            # この通貨に直接関連するニュース
+            direct_news = [a for a in currency_news if is_about_currency(a, currency)]
+
+            # BTC相関ニュース（BTC以外の通貨）
+            btc_news = []
+            if currency != 'BTC':
+                btc_news = [a for a in currency_news if is_about_currency(a, 'BTC')]
+
+            # 重み付けして結合
+            weighted_articles = []
+            seen_ids = set()
+
+            for article in direct_news:
+                a = dict(article)
+                a['_currency_weight'] = 1.0
+                a['_source_currency'] = currency
+                weighted_articles.append(a)
+                seen_ids.add(article.get('id'))
+
+            for article in btc_news:
+                if article.get('id') not in seen_ids:
+                    a = dict(article)
+                    a['_currency_weight'] = BTC_CORRELATION_WEIGHT
+                    a['_source_currency'] = 'BTC'
+                    weighted_articles.append(a)
+                    seen_ids.add(article.get('id'))
+
+            for article in market_news:
+                a = dict(article)
+                a['_currency_weight'] = MARKET_NEWS_WEIGHT
+                a['_source_currency'] = 'ALL'
+                weighted_articles.append(a)
+
+            # センチメント分析
+            score, fresh_count, stats = analyze_sentiment_weighted(weighted_articles)
+            save_sentiment(pair, timestamp, score, len(weighted_articles), fresh_count)
+
+            results[pair] = {
+                'score': round(score, 3),
+                'direct': len(direct_news),
+                'btc_context': len(btc_news),
+                'market': len(market_news),
+                'total': len(weighted_articles)
             }
-        
-        # 2. 時間加重センチメント分析（投票信頼性考慮）
-        sentiment_score, fresh_count, stats = analyze_sentiment_weighted(all_news)
-        
-        # 3. DynamoDBに保存
-        timestamp = int(time.time())
-        save_sentiment(pair, timestamp, sentiment_score, len(all_news), fresh_count)
-        
-        print(f"Sentiment: {sentiment_score:.3f} | "
-              f"News: {len(all_news)} (fresh: {fresh_count}) | "
-              f"Vote stats: {stats}")
-        
+            print(f"  {config['name']} ({pair}): score={score:.3f} "
+                  f"(direct={len(direct_news)}, btc={len(btc_news)}, market={len(market_news)})")
+
         return {
             'statusCode': 200,
             'body': json.dumps({
-                'pair': pair,
-                'news_count': len(all_news),
-                'fresh_news_count': fresh_count,
-                'sentiment_score': round(sentiment_score, 3),
-                'breakdown': stats,
+                'pairs_analyzed': len(results),
+                'results': results,
+                'api_calls': 2,
                 'timestamp': timestamp
             })
         }
-        
+
     except Exception as e:
         print(f"Error: {str(e)}")
         return {
@@ -96,101 +126,95 @@ def handler(event, context):
             'body': json.dumps({'error': str(e)})
         }
 
-def fetch_news(currency: str = None, limit: int = 50) -> list:
-    """CryptoPanic APIからリアルタイムニュース取得（Growth Plan対応）"""
-    base_url = 'https://cryptopanic.com/api/growth/v2/posts/'
-    params = f'?auth_token={CRYPTOPANIC_API_KEY}&kind=news&public=true'
-    
-    if currency:
-        params += f'&currencies={currency}'
-    
+
+def is_about_currency(article: dict, currency: str) -> bool:
+    """記事が特定の通貨に関連するかチェック"""
+    currencies = article.get('currencies', [])
+    if isinstance(currencies, list):
+        for c in currencies:
+            if isinstance(c, dict) and c.get('code', '').upper() == currency.upper():
+                return True
+            elif isinstance(c, str) and c.upper() == currency.upper():
+                return True
+    return False
+
+
+def fetch_news(currencies: str = None, limit: int = 50) -> list:
+    """CryptoPanic APIからニュース取得"""
     if not CRYPTOPANIC_API_KEY:
         print("No CryptoPanic API key, using neutral sentiment")
         return []
-    
+
+    base_url = 'https://cryptopanic.com/api/growth/v2/posts/'
+    params = f'?auth_token={CRYPTOPANIC_API_KEY}&kind=news&public=true'
+
+    if currencies:
+        params += f'&currencies={currencies}'
+
     try:
         url = base_url + params
-        label = currency or 'ALL'
-        print(f"Fetching {label} news from CryptoPanic")
+        label = currencies or 'ALL'
         req = urllib.request.Request(url)
         req.add_header('User-Agent', 'CryptoTrader-Bot/1.0')
-        
+
         with urllib.request.urlopen(req, timeout=30) as response:
             data = json.loads(response.read().decode())
             results = data.get('results', [])[:limit]
-            print(f"Fetched {len(results)} {label} articles")
             return results
     except Exception as e:
-        print(f"Error fetching {currency or 'ALL'} news: {str(e)}")
+        print(f"Error fetching news ({currencies or 'ALL'}): {str(e)}")
         return []
 
+
 def analyze_sentiment_weighted(news: list) -> tuple:
-    """
-    時間加重センチメント分析（投票信頼性考慮）
-    
-    改善点:
-    - 通貨別の重み付け（ETH > BTC > 全体）
-    - 投票数の信頼性閾値を導入
-      - MIN_RELIABLE_VOTES未満: sentimentフィールドとタイトルに依存
-      - MIN_RELIABLE_VOTES以上: 投票結果を信頼して活用
-    - 投票数が少ない場合は中立寄りに補正
-    """
+    """時間加重センチメント分析（投票信頼性考慮）"""
     if not news:
         return 0.5, 0, {}
-    
+
     current_time = time.time()
     total_weighted_score = 0
     total_weight = 0
     fresh_count = 0
-    
-    # 統計情報
-    vote_reliable_count = 0   # 投票が信頼できる記事数
-    vote_unreliable_count = 0 # 投票が不十分な記事数
-    sentiment_field_count = 0 # sentimentフィールドがある記事数
-    
+
+    vote_reliable_count = 0
+    vote_unreliable_count = 0
+    sentiment_field_count = 0
+
     for article in news:
-        # 記事の新鮮さを計算
+        # 記事の新鮮さ
         published = article.get('published_at', '')
         article_age_hours = get_article_age_hours(published)
-        
+
         if article_age_hours <= NEWS_FRESHNESS_HOURS:
             fresh_count += 1
-        
+
         # 時間減衰: 新しいほど重み大（1時間以内=1.0、24時間=0.1）
         time_weight = max(0.1, 1.0 - (article_age_hours / 24))
-        
-        # 通貨別重み（ETH直接 > BTC > 全体）
+
+        # 通貨別重み
         currency_weight = article.get('_currency_weight', 1.0)
-        
-        # CryptoPanicの投票データ
+
+        # 投票データ
         votes = article.get('votes', {})
         positive = votes.get('positive', 0) + votes.get('important', 0) * 1.5
         negative = votes.get('negative', 0) + votes.get('toxic', 0) * 1.5
         liked = votes.get('liked', 0)
         disliked = votes.get('disliked', 0)
         total_votes = positive + negative + liked + disliked
-        
-        # === 投票信頼性の判定 ===
+
         if total_votes >= MIN_RELIABLE_VOTES:
-            # 十分な投票数: 投票結果を信頼
             vote_reliable_count += 1
             article_score = (positive + liked) / total_votes
-            
-            # 信頼度: MIN_RELIABLE_VOTES〜VOTE_CONFIDENCE_CAPで線形に上昇
             vote_confidence = min(
                 (total_votes - MIN_RELIABLE_VOTES) / (VOTE_CONFIDENCE_CAP - MIN_RELIABLE_VOTES),
                 1.0
             )
-            # 投票スコアと中立(0.5)のブレンド
-            # 信頼度が低いほど中立寄り
             article_score = 0.5 + (article_score - 0.5) * vote_confidence
         else:
-            # 投票不十分: sentimentフィールドがあればそれを使う、なければ中立
             vote_unreliable_count += 1
-            article_score = 0.5  # 基本は中立
-        
-        # CryptoPanicのsentimentフィールド（APIが提供する場合）
-        # 投票数に関わらず参考にできる（CryptoPanic独自のアルゴリズム）
+            article_score = 0.5
+
+        # CryptoPanicのsentimentフィールド
         sentiment = article.get('sentiment', '')
         if sentiment:
             sentiment_field_count += 1
@@ -198,33 +222,32 @@ def analyze_sentiment_weighted(news: list) -> tuple:
                 article_score = min(article_score + 0.15, 1.0)
             elif sentiment == 'bearish':
                 article_score = max(article_score - 0.15, 0.0)
-        
-        # 総合重み = 時間 × 通貨関連性
+
         weight = time_weight * currency_weight
         total_weighted_score += article_score * weight
         total_weight += weight
-    
+
     if total_weight == 0:
         return 0.5, fresh_count, {}
-    
+
     final_score = total_weighted_score / total_weight
-    
+
     stats = {
         'total_articles': len(news),
         'vote_reliable': vote_reliable_count,
         'vote_unreliable': vote_unreliable_count,
         'has_sentiment_field': sentiment_field_count
     }
-    
+
     return final_score, fresh_count, stats
 
+
 def get_article_age_hours(published_at: str) -> float:
-    """記事の経過時間を計算（時間単位）"""
+    """記事の経過時間（時間単位）"""
     if not published_at:
-        return 24  # 不明な場合は24時間扱い
-    
+        return 24
+
     try:
-        # ISO 8601 形式: 2026-02-08T01:30:00Z
         from datetime import datetime
         published = datetime.fromisoformat(published_at.replace('Z', '+00:00'))
         now = datetime.now(published.tzinfo)
@@ -232,6 +255,7 @@ def get_article_age_hours(published_at: str) -> float:
         return max(0, age_seconds / 3600)
     except:
         return 24
+
 
 def save_sentiment(pair: str, timestamp: int, score: float, news_count: int, fresh_count: int):
     """センチメント保存"""

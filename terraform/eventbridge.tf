@@ -5,7 +5,7 @@
 # 価格収集ルール (5分間隔)
 resource "aws_cloudwatch_event_rule" "price_collection" {
   name                = "${local.name_prefix}-price-collection"
-  description         = "Collect ETH price every 5 minutes"
+  description         = "Collect all crypto prices every 5 minutes"
   schedule_expression = "rate(5 minutes)"
   state               = "ENABLED"
 
@@ -31,7 +31,7 @@ resource "aws_lambda_permission" "price_collection" {
 # ポジション監視ルール (5分間隔)
 resource "aws_cloudwatch_event_rule" "position_monitor" {
   name                = "${local.name_prefix}-position-monitor"
-  description         = "Monitor open positions every 5 minutes"
+  description         = "Monitor all open positions every 5 minutes"
   schedule_expression = "rate(5 minutes)"
   state               = "ENABLED"
 

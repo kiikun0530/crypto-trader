@@ -7,75 +7,94 @@ resource "aws_sfn_state_machine" "analysis_workflow" {
   role_arn = aws_iam_role.step_functions_execution.arn
 
   definition = jsonencode({
-    Comment = "ETH Trading Analysis Orchestration Workflow"
-    StartAt = "ParallelAnalysis"
+    Comment = "Multi-Currency Trading Analysis Workflow"
+    StartAt = "AnalyzeAllPairs"
     States = {
-      ParallelAnalysis = {
-        Type = "Parallel"
-        Branches = [
-          {
-            StartAt = "TechnicalAnalysis"
-            States = {
-              TechnicalAnalysis = {
-                Type     = "Task"
-                Resource = "arn:aws:states:::lambda:invoke"
-                Parameters = {
-                  FunctionName = aws_lambda_function.functions["technical"].arn
-                  "Payload.$"  = "$"
+      # Map: 全通貨ペアを並列分析
+      AnalyzeAllPairs = {
+        Type      = "Map"
+        ItemsPath = "$.pairs"
+        ItemSelector = {
+          "pair.$"      = "$$.Map.Item.Value"
+          "timestamp.$" = "$.timestamp"
+        }
+        ItemProcessor = {
+          ProcessorConfig = {
+            Mode = "INLINE"
+          }
+          StartAt = "ParallelAnalysis"
+          States = {
+            ParallelAnalysis = {
+              Type = "Parallel"
+              Branches = [
+                {
+                  StartAt = "TechnicalAnalysis"
+                  States = {
+                    TechnicalAnalysis = {
+                      Type     = "Task"
+                      Resource = "arn:aws:states:::lambda:invoke"
+                      Parameters = {
+                        FunctionName = aws_lambda_function.functions["technical"].arn
+                        "Payload.$"  = "$"
+                      }
+                      OutputPath = "$.Payload"
+                      End        = true
+                    }
+                  }
+                },
+                {
+                  StartAt = "ChronosPrediction"
+                  States = {
+                    ChronosPrediction = {
+                      Type     = "Task"
+                      Resource = "arn:aws:states:::lambda:invoke"
+                      Parameters = {
+                        FunctionName = aws_lambda_function.functions["chronos-caller"].arn
+                        "Payload.$"  = "$"
+                      }
+                      OutputPath = "$.Payload"
+                      End        = true
+                    }
+                  }
+                },
+                {
+                  StartAt = "SentimentGetter"
+                  States = {
+                    SentimentGetter = {
+                      Type     = "Task"
+                      Resource = "arn:aws:states:::lambda:invoke"
+                      Parameters = {
+                        FunctionName = aws_lambda_function.functions["sentiment-getter"].arn
+                        "Payload.$"  = "$"
+                      }
+                      OutputPath = "$.Payload"
+                      End        = true
+                    }
+                  }
                 }
-                OutputPath = "$.Payload"
-                End        = true
-              }
+              ]
+              ResultPath = "$.analysisResults"
+              Next       = "MergePairResults"
             }
-          },
-          {
-            StartAt = "ChronosPrediction"
-            States = {
-              ChronosPrediction = {
-                Type     = "Task"
-                Resource = "arn:aws:states:::lambda:invoke"
-                Parameters = {
-                  FunctionName = aws_lambda_function.functions["chronos-caller"].arn
-                  "Payload.$"  = "$"
-                }
-                OutputPath = "$.Payload"
-                End        = true
+
+            MergePairResults = {
+              Type = "Pass"
+              Parameters = {
+                "pair.$"      = "$.pair"
+                "timestamp.$" = "$.timestamp"
+                "technical.$"  = "$.analysisResults[0]"
+                "chronos.$"    = "$.analysisResults[1]"
+                "sentiment.$"  = "$.analysisResults[2]"
               }
-            }
-          },
-          {
-            StartAt = "SentimentGetter"
-            States = {
-              SentimentGetter = {
-                Type     = "Task"
-                Resource = "arn:aws:states:::lambda:invoke"
-                Parameters = {
-                  FunctionName = aws_lambda_function.functions["sentiment-getter"].arn
-                  "Payload.$"  = "$"
-                }
-                OutputPath = "$.Payload"
-                End        = true
-              }
+              End = true
             }
           }
-        ]
-        ResultPath = "$.analysisResults"
-        Next       = "MergeResults"
-      }
-
-      MergeResults = {
-        Type = "Pass"
-        Parameters = {
-          "pair.$"          = "$.pair"
-          "timestamp.$"     = "$.timestamp"
-          "current_price.$" = "$.analysisResults[0].current_price"
-          "technical.$"     = "$.analysisResults[0]"
-          "chronos.$"       = "$.analysisResults[1]"
-          "sentiment.$"     = "$.analysisResults[2]"
         }
-        Next = "Aggregator"
+        ResultPath = "$.analysis_results"
+        Next       = "Aggregator"
       }
 
+      # 全通貨のスコア比較 + 最適通貨選定
       Aggregator = {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke"
@@ -84,40 +103,12 @@ resource "aws_sfn_state_machine" "analysis_workflow" {
           "Payload.$"  = "$"
         }
         OutputPath = "$.Payload"
-        Next       = "CheckSignal"
-      }
-
-      CheckSignal = {
-        Type = "Choice"
-        Choices = [
-          {
-            Variable      = "$.has_signal"
-            BooleanEquals = true
-            Next          = "SendToOrderQueue"
-          }
-        ]
-        Default = "NoSignal"
-      }
-
-      SendToOrderQueue = {
-        Type     = "Task"
-        Resource = "arn:aws:states:::sqs:sendMessage"
-        Parameters = {
-          QueueUrl     = aws_sqs_queue.order_queue.url
-          "MessageBody.$" = "States.JsonToString($)"
-        }
-        Next = "AnalysisComplete"
-      }
-
-      NoSignal = {
-        Type   = "Pass"
-        Result = { message = "No trading signal generated" }
-        End    = true
+        Next       = "AnalysisComplete"
       }
 
       AnalysisComplete = {
         Type   = "Pass"
-        Result = { message = "Signal sent to order queue" }
+        Result = { message = "Multi-currency analysis complete" }
         End    = true
       }
     }

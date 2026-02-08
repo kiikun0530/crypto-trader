@@ -50,8 +50,8 @@ resource "aws_lambda_layer_version" "common" {
 locals {
   lambda_functions = {
     price-collector = {
-      description = "価格データ収集"
-      timeout     = 30
+      description = "価格データ収集（全通貨）"
+      timeout     = 60
       memory      = 256
       handler     = "handler.handler"
     }
@@ -74,9 +74,9 @@ locals {
       handler     = "handler.handler"
     }
     aggregator = {
-      description = "分析結果集約"
-      timeout     = 60
-      memory      = 256
+      description = "分析結果集約（全通貨比較）"
+      timeout     = 120
+      memory      = 512
       handler     = "handler.handler"
     }
     order-executor = {
@@ -86,8 +86,8 @@ locals {
       handler     = "handler.handler"
     }
     position-monitor = {
-      description = "ポジション監視"
-      timeout     = 30
+      description = "ポジション監視（全通貨）"
+      timeout     = 60
       memory      = 256
       handler     = "handler.handler"
     }
@@ -119,6 +119,7 @@ locals {
     STEP_FUNCTION_ARN    = "arn:aws:states:${var.aws_region}:${local.account_id}:stateMachine:${local.name_prefix}-analysis-workflow"
     ORDER_QUEUE_URL      = "https://sqs.${var.aws_region}.amazonaws.com/${local.account_id}/${local.name_prefix}-order-queue"
     SLACK_WEBHOOK_URL    = var.slack_webhook_url
+    TRADING_PAIRS_CONFIG = trimspace(var.trading_pairs_config)
   }
 }
 
