@@ -5,9 +5,8 @@
 
 マルチ通貨ロジック:
 - 全通貨をスコアリングしてランキング
-- ポジションなし → 最高スコアの通貨がBUY閾値超えで買い
-- ポジションあり → その通貨がSELL閾値以下で売り
-- 1ポジション制約（リスク管理）
+- SELL優先: 保有ポジションでSELL閾値以下があれば売り
+- BUY: 未保有通貨でBUY閾値超えがあれば買い（複数同時保有OK）
 - ボラティリティ適応型閾値（市場状況に応じて動的調整）
 """
 import json
@@ -222,22 +221,28 @@ def decide_action(scored_pairs: list, active_positions: list,
     全通貨のスコアから最適なアクションを決定（動的閾値対応・複数ポジション対応）
 
     ルール:
-    1. ポジションなし → 最高スコアの通貨がBUY閾値以上なら買い
-    2. ポジションあり → 各ポジションをチェック、SELL閾値以下の最悪スコアを売り
+    1. SELL判定: 保有中ポジションでSELL閾値以下のものがあれば売り（最悪スコア優先）
+    2. BUY判定: 未保有の通貨でBUY閾値以上のものがあれば買い（最高スコア優先）
     3. それ以外 → HOLD
+
+    複数ポジション同時保有可。SELLがBUYより優先される。
 
     Returns: (signal, target_pair, target_score)
     """
     if not scored_pairs:
         return 'HOLD', None, None
 
+    # 保有中のペアをセット化（BUY判定で使用）
+    held_coincheck_pairs = set()
     if active_positions:
-        # ポジションあり → 各ポジションのスコアをチェック
+        held_coincheck_pairs = {p['pair'] for p in active_positions}
+
+    # --- SELL判定（優先） ---
+    if active_positions:
         sell_candidates = []
         for position in active_positions:
-            position_pair = position['pair']  # Coincheck pair (e.g., eth_jpy)
+            position_pair = position['pair']
 
-            # Coincheck pair → analysis pair の逆引き
             analysis_pair = None
             for pair, config in TRADING_PAIRS.items():
                 if config['coincheck'] == position_pair:
@@ -250,28 +255,27 @@ def decide_action(scored_pairs: list, active_positions: list,
                     sell_candidates.append((position_pair, pair_data['total_score']))
 
         if sell_candidates:
-            # 最もスコアが低い（最も売りシグナルが強い）ものを売る
             sell_candidates.sort(key=lambda x: x[1])
             target_pair, target_score = sell_candidates[0]
             print(f"SELL signal for {target_pair}: score={target_score:.4f} "
                   f"(threshold: {sell_threshold:.3f})")
             return 'SELL', target_pair, target_score
 
-        pos_pairs = ', '.join(p['pair'] for p in active_positions)
-        print(f"HOLD: active positions in {pos_pairs}")
-        return 'HOLD', None, None
+    # --- BUY判定（未保有の通貨から最高スコアを選定） ---
+    for candidate in scored_pairs:
+        coincheck_pair = TRADING_PAIRS.get(candidate['pair'], {}).get('coincheck', candidate['pair'])
+        if coincheck_pair in held_coincheck_pairs:
+            continue  # 既に保有中 → スキップ
+        if candidate['total_score'] >= buy_threshold:
+            print(f"BUY signal for {candidate['pair']} ({coincheck_pair}): "
+                  f"score={candidate['total_score']:.4f} (threshold: {buy_threshold:.3f})")
+            return 'BUY', coincheck_pair, candidate['total_score']
+        else:
+            break  # スコア降順なので、閾値未満なら以降も未満
 
-    else:
-        # ポジションなし → 最高スコアの通貨をチェック
-        best = scored_pairs[0]
-        if best['total_score'] >= buy_threshold:
-            coincheck_pair = TRADING_PAIRS.get(best['pair'], {}).get('coincheck', best['pair'])
-            print(f"BUY signal for {best['pair']} ({coincheck_pair}): score={best['total_score']:.4f} "
-                  f"(threshold: {buy_threshold:.3f})")
-            return 'BUY', coincheck_pair, best['total_score']
-
-        print(f"HOLD: best score is {best['total_score']:.4f} (threshold: {buy_threshold:.3f})")
-        return 'HOLD', None, None
+    held_text = ', '.join(held_coincheck_pairs) if held_coincheck_pairs else 'none'
+    print(f"HOLD: no actionable signals (held: {held_text})")
+    return 'HOLD', None, None
 
 
 def find_all_active_positions() -> list:

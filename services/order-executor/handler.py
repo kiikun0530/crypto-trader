@@ -5,7 +5,7 @@ SQSからシグナルを受信し、Coincheck APIで注文実行
 マルチ通貨対応:
 - pair（eth_jpy, btc_jpy等）から通貨シンボルを動的に判定
 - 任意の通貨ペアで買い・売りが可能
-- 1ポジション制約（他通貨にポジションがある場合は買わない）
+- 複数通貨同時保有OK（同じ通貨の重複購入のみブロック）
 - スコアに応じた投資金額調整（期待値連動）
 
 ⚠️ Coincheck成行注文の重要な仕様:
@@ -139,19 +139,6 @@ def process_order(order: dict):
     if signal == 'BUY':
         if current_position and current_position.get('side') == 'long':
             print(f"Already have long position for {pair}")
-            return
-
-        # 他通貨にポジションがないかチェック（1ポジション制約）
-        other_position = check_any_other_position(pair)
-        if other_position:
-            other_pair = other_position.get('pair', '?')
-            print(f"Already have position in {other_pair}, skipping buy for {pair}")
-            send_notification(
-                name,
-                f"⚠️ {name}の買いをスキップ\n"
-                f"理由: {other_pair}にポジションあり\n"
-                f"スコア: {score:.3f}"
-            )
             return
 
         # 買い注文
