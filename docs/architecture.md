@@ -9,7 +9,7 @@ Crypto Trader のシステム構成と技術選定を説明するドキュメン
 
 ## システム構成図
 
-> **推定コスト**: AWS 約$5-7/月 + CryptoPanic Growth $199/月（オプション）
+> **推定コスト**: AWS 約$9-14/月 + CryptoPanic Growth $199/月（オプション）
 > Lambda VPC外実行により NAT Gateway ($45/月) を削減
 
 ```mermaid
@@ -60,6 +60,10 @@ flowchart LR
         DB_STATE[("analysis_state<br/>pair=PK")]
     end
 
+    subgraph SageMaker["SageMaker Serverless"]
+        SM_CHRONOS["Chronos-T5-Tiny<br/>AI価格予測エンドポイント"]
+    end
+
     subgraph Monitoring["Monitoring"]
         CW_LOGS["CloudWatch Logs"]
         CW_ALARM["CloudWatch Alarm<br/>DLQ監視"]
@@ -88,6 +92,7 @@ flowchart LR
     %% DynamoDB連携
     L_TECH -->|"R"| DB_PRICES
     L_CHRONOS -->|"R"| DB_PRICES
+    L_CHRONOS -->|"InvokeEndpoint"| SM_CHRONOS
     L_SENTIMENT -->|"R"| DB_SENTIMENT
     L_NEWS -->|"W"| DB_SENTIMENT
     L_PRICE -->|"R/W"| DB_STATE
@@ -182,6 +187,31 @@ DynamoDB は全テーブルが `pair` を Partition Key にしており、通貨
 
 - 各処理は数秒～数十秒で完了するため、15分制限は問題なし
 - コールドスタートは許容範囲（数百ms、取引に影響なし）
+
+### AI価格予測 (Chronos) のインフラ選定
+
+スコアリング全体の **40%のウェイト** を占める AI 価格予測コンポーネントについて、以下の選択肢を比較検討した。
+
+| 選択肢 | 方式 | 月額 | 推論時間 | 精度 | 運用負荷 |
+|---|---|---|---|---|---|
+| モメンタム代替 | Lambda 内計算 | $0 | <1秒 | ❌ 予測ではない | なし |
+| **SageMaker Serverless** | **Chronos-Tiny (8M)** | **~$3-8** | **5-15秒** | **⭕** | **なし** |
+| SageMaker Real-time | Chronos-Small (46M) | ~$50-80 | 1-3秒 | ◎ | 低 |
+| ECS Fargate Spot | Chronos-Small コンテナ | ~$15-25 | 2-5秒 | ◎ | 中 |
+| Lambda + ONNX | Chronos-Tiny ONNX変換 | ~$1-3 | 3-10秒 | ⭕ | 高（実装複雑） |
+| EC2 Spot GPU | Chronos-Large (710M) | ~$25-60 | <1秒 | ◎◎ | 高 |
+
+**選定: SageMaker Serverless Inference（Chronos-T5-Tiny）**
+
+スモールスタートの観点から採用:
+- **マネージド**: インフラ管理ゼロ（ECS/EC2不要）、Lambda同様に運用負荷なし
+- **従量課金**: リクエスト時のみ課金（5分×6通貨=1日1,728回 → ~$3-8/月）
+- **現行コストへの影響が最小**: $6/月 → ~$9-14/月（+50-130%だが絶対額は小さい）
+- **段階的アップグレード可能**: Tiny → Small → Large へモデル変更だけでスケール
+- **Serverless自動スケール**: トラフィックに応じてインスタンスを自動起動/停止
+- **フォールバック**: SageMaker障害時はモメンタムベースの代替スコアに自動切替
+
+Lambda + ONNX は最もコスト効率が良いが、モデル変換・Layer サイズ制限の技術的障壁が高い。ECS/EC2 は常時課金が発生し、現行の「完全サーバーレス」設計思想に反する。
 
 ### VPC外実行
 
@@ -293,11 +323,12 @@ IAM ロールは最小権限原則で設計。各 Lambda は必要な DynamoDB �
 |---|---|---|
 | Lambda | ~$5.00 | 6通貨分析で旧ETHのみの約1.5倍 |
 | DynamoDB | ~$0.30 | 6テーブル×6通貨分のR/W |
+| SageMaker Serverless | ~$3-8 | Chronos-T5-Tiny AI価格予測 |
 | Step Functions | ~$0.10 | Map State で遷移数増加 |
 | CloudWatch | ~$0.05 | ログ保存14日 |
 | Secrets Manager | ~$0.50 | 1シークレット |
 | SQS/SNS/EventBridge | ~$0.05 | 軽微 |
-| **AWS合計** | **~$6/月** | |
+| **AWS合計** | **~$9-14/月** | |
 
 ### 外部API費用
 
@@ -311,8 +342,8 @@ IAM ロールは最小権限原則で設計。各 Lambda は必要な DynamoDB �
 
 | 構成 | 月額 |
 |---|---|
-| 無料プラン | **~$6/月** |
-| Growth Plan | **~$205/月** |
+| 無料プラン | **~$9-14/月** |
+| Growth Plan | **~$208-213/月** |
 
 ---
 

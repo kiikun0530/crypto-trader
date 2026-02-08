@@ -86,6 +86,15 @@ EOT
 }
 
 # ============================================
+# SageMaker Settings
+# ============================================
+variable "sagemaker_hf_image_uri" {
+  description = "HuggingFace PyTorch Inference DLC image URI for SageMaker"
+  type        = string
+  default     = "763104351884.dkr.ecr.ap-northeast-1.amazonaws.com/huggingface-pytorch-inference:2.1.0-transformers4.37.0-cpu-py310-ubuntu22.04"
+}
+
+# ============================================
 # External API Keys
 # ============================================
 variable "cryptopanic_api_key" {

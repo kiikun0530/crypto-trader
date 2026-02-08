@@ -116,6 +116,16 @@ resource "aws_iam_role_policy" "lambda_custom" {
         Resource = [
           "arn:aws:states:${var.aws_region}:${local.account_id}:stateMachine:${local.name_prefix}-*"
         ]
+      },
+      # SageMaker Endpoint 呼び出し (Chronos AI価格予測)
+      {
+        Effect = "Allow"
+        Action = [
+          "sagemaker:InvokeEndpoint"
+        ]
+        Resource = [
+          "arn:aws:sagemaker:${var.aws_region}:${local.account_id}:endpoint/${local.name_prefix}-*"
+        ]
       }
     ]
   })

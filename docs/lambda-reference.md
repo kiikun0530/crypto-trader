@@ -149,7 +149,7 @@ DynamoDB から価格履歴を読み取り、テクニカル指標を計算し�
 
 ## chronos-caller
 
-AI価格予測を実行。ECS未デプロイ時はモメンタムベースの代替スコアを計算。
+SageMaker Serverless Endpoint 上の Amazon Chronos-T5-Tiny を呼び出して AI 価格予測を実行。SageMaker 未デプロイ時はモメンタムベースの代替スコアにフォールバック。
 
 | 項目 | 値 |
 |---|---|
@@ -157,13 +157,20 @@ AI価格予測を実行。ECS未デプロイ時はモメンタムベースの代
 | メモリ | 1024MB |
 | タイムアウト | 120秒 |
 | DynamoDB | prices (R) |
+| SageMaker | Chronos-T5-Tiny Serverless Endpoint |
 
 ### 動作モード
 
-| `CHRONOS_API_URL` | 動作 |
+| `CHRONOS_ENDPOINT_NAME` | 動作 |
 |---|---|
-| 設定あり | ECS上のChronos APIを呼び出して予測価格を取得 |
-| 未設定 | モメンタムベーススコア（短期60% + 中期40%） |
+| 設定あり | SageMaker Serverless Endpoint で AI 価格予測（12ステップ先） |
+| 未設定 | モメンタムベーススコア（短期60% + 中期40%）にフォールバック |
+
+### 予測 → スコア変換
+
+予測系列の加重平均（遠い将来ほど重みが大きい）と現在価格の変化率から算出:
+- `change_percent = (weighted_avg - current_price) / current_price × 100`
+- ±3% の変動予測で ±1.0 にスケール
 
 ### 出力
 
@@ -171,7 +178,7 @@ AI価格予測を実行。ECS未デプロイ時はモメンタムベースの代
 {
   "pair": "eth_usdt",
   "chronos_score": 0.312,
-  "prediction": null,
+  "prediction": [2355.2, 2361.8, 2358.5, ...],
   "current_price": 2350.50
 }
 ```

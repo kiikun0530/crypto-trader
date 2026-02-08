@@ -118,8 +118,9 @@ locals {
     CRYPTOPANIC_API_KEY  = var.cryptopanic_api_key
     STEP_FUNCTION_ARN    = "arn:aws:states:${var.aws_region}:${local.account_id}:stateMachine:${local.name_prefix}-analysis-workflow"
     ORDER_QUEUE_URL      = "https://sqs.${var.aws_region}.amazonaws.com/${local.account_id}/${local.name_prefix}-order-queue"
-    SLACK_WEBHOOK_URL    = var.slack_webhook_url
-    TRADING_PAIRS_CONFIG = trimspace(var.trading_pairs_config)
+    SLACK_WEBHOOK_URL      = var.slack_webhook_url
+    TRADING_PAIRS_CONFIG   = trimspace(var.trading_pairs_config)
+    CHRONOS_ENDPOINT_NAME  = "${local.name_prefix}-chronos-tiny"
   }
 }
 

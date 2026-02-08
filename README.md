@@ -11,7 +11,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 - **取引執行**: Coincheck API（各通貨/JPY）
 - **テクニカル分析**: SMA20/200、RSI、MACD、ボリンジャーバンド
 - **ニュースセンチメント**: CryptoPanic API（全通貨一括取得 + BTC相関分析）
-- **時系列予測**: Amazon Chronos（ECS未デプロイ時はモメンタム代替）
+- **時系列予測**: Amazon Chronos-T5-Tiny（SageMaker Serverless Inference）
 - **ポジション管理**: 1通貨のみ保有（他通貨排他制御）
 - **通知**: Slack Webhook（全通貨ランキング付き）
 
@@ -41,7 +41,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 |--------|------|----------|
 | price-collector | 全6通貨の価格取得・変動検知 | 5分 |
 | technical | テクニカル指標計算（RSI, MACD, SMA, BB） | Step Functions (×6) |
-| chronos-caller | AI時系列予測 / モメンタム代替 | Step Functions (×6) |
+| chronos-caller | AI時系列予測 (SageMaker Chronos-T5-Tiny) | Step Functions (×6) |
 | sentiment-getter | 通貨別センチメントスコア取得 | Step Functions (×6) |
 | aggregator | 全通貨スコアリング・ランキング・売買判定 | Step Functions |
 | order-executor | Coincheckで成行注文実行（1ポジション制御） | SQSトリガー |
@@ -67,11 +67,12 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | 項目 | 月額 |
 |------|------|
 | Lambda | ~$5.00 |
+| SageMaker Serverless | ~$3-8 |
 | DynamoDB | ~$0.25 |
 | Step Functions | ~$0.10 |
 | CloudWatch | ~$0.10 |
 | Secrets Manager | ~$0.50 |
-| **合計** | **~$6** |
+| **合計** | **~$9-14** |
 
 > 詳細な計算式は [docs/architecture.md](docs/architecture.md) を参照
 
@@ -83,7 +84,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | CryptoPanic | 無料 or $199/月 | Growth Planでリアルタイムニュース取得 |
 | Coincheck | 0% | 取引所取引は手数料無料 |
 
-> **総コスト目安**: 無料構成 ~$6/月、Growth Plan ~$205/月
+> **総コスト目安**: 無料構成 ~$9-14/月、Growth Plan ~$208-213/月
 
 ## 前提条件
 
