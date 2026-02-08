@@ -1,0 +1,507 @@
+name: Auto-Fix Lambda Errors
+
+on:
+  repository_dispatch:
+    types: [lambda-error]
+
+permissions:
+  contents: write
+  models: read
+
+env:
+  AWS_REGION: ap-northeast-1
+
+jobs:
+  auto-fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_AUTO_FIX_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Extract error context
+        id: error
+        run: |
+          cat << 'PAYLOAD_EOF' > /tmp/error_payload.json
+          ${{ toJson(github.event.client_payload) }}
+          PAYLOAD_EOF
+
+          FUNCTION_NAME=$(jq -r '.function_name' /tmp/error_payload.json)
+          ERROR_SUMMARY=$(jq -r '.error_summary' /tmp/error_payload.json)
+          SERVICE_DIR=$(jq -r '.service_dir' /tmp/error_payload.json)
+          LOG_GROUP=$(jq -r '.log_group' /tmp/error_payload.json)
+
+          echo "function_name=${FUNCTION_NAME}" >> $GITHUB_OUTPUT
+          echo "service_dir=${SERVICE_DIR}" >> $GITHUB_OUTPUT
+          echo "log_group=${LOG_GROUP}" >> $GITHUB_OUTPUT
+
+          # エラーサマリーをファイルに保存（改行保持）
+          echo "${ERROR_SUMMARY}" > /tmp/error_summary.txt
+
+          echo "=== Error Context ==="
+          echo "Function: ${FUNCTION_NAME}"
+          echo "Service dir: ${SERVICE_DIR}"
+          head -20 /tmp/error_summary.txt
+
+      - name: Fetch extended error logs from CloudWatch
+        id: logs
+        run: |
+          # 直近30分のエラーログを取得
+          START_TIME=$(( $(date +%s) * 1000 - 1800000 ))
+          LOG_GROUP="${{ steps.error.outputs.log_group }}"
+
+          aws logs filter-log-events \
+            --log-group-name "${LOG_GROUP}" \
+            --start-time ${START_TIME} \
+            --filter-pattern "?ERROR ?Traceback ?Exception" \
+            --limit 50 \
+            --query "events[*].message" \
+            --output text > /tmp/cloudwatch_errors.txt 2>/dev/null || true
+
+          echo "=== CloudWatch Error Logs ==="
+          head -50 /tmp/cloudwatch_errors.txt
+
+      - name: Read source code
+        id: source
+        run: |
+          SERVICE_DIR="${{ steps.error.outputs.service_dir }}"
+          FUNCTION_NAME="${{ steps.error.outputs.function_name }}"
+
+          if [ -f "${SERVICE_DIR}" ]; then
+            echo "Reading: ${SERVICE_DIR}"
+            cp "${SERVICE_DIR}" /tmp/original_source.py
+          else
+            echo "Service file not found: ${SERVICE_DIR}"
+            echo "Searching for handler..."
+            FOUND=$(find services/ -path "*${FUNCTION_NAME}*" -name "handler.py" | head -1)
+            if [ -n "${FOUND}" ]; then
+              echo "Found: ${FOUND}"
+              echo "service_dir=${FOUND}" >> $GITHUB_OUTPUT
+              cp "${FOUND}" /tmp/original_source.py
+            else
+              echo "No handler found for ${FUNCTION_NAME}"
+              exit 1
+            fi
+          fi
+
+          echo "=== Source Code (first 30 lines) ==="
+          head -30 /tmp/original_source.py
+
+      - name: Analyze and fix with Claude
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 << 'CLAUDE_SCRIPT'
+          import json
+          import os
+          import urllib.request
+
+          function_name = "${{ steps.error.outputs.function_name }}"
+          service_dir = "${{ steps.error.outputs.service_dir }}"
+
+          # ソースコード読み込み
+          with open('/tmp/original_source.py', 'r') as f:
+              source_code = f.read()
+
+          # エラーメッセージ読み込み
+          with open('/tmp/error_summary.txt', 'r') as f:
+              error_summary = f.read()
+
+          # CloudWatchログ読み込み
+          cw_logs = ""
+          try:
+              with open('/tmp/cloudwatch_errors.txt', 'r') as f:
+                  cw_logs = f.read()[:3000]
+          except:
+              pass
+
+          # Claude API呼び出し
+          api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+
+          if api_key:
+              # Anthropic API
+              api_url = "https://api.anthropic.com/v1/messages"
+              headers = {
+                  "x-api-key": api_key,
+                  "anthropic-version": "2023-06-01",
+                  "content-type": "application/json"
+              }
+              model = "claude-sonnet-4-20250514"
+          else:
+              # GitHub Models API (fallback)
+              token = os.environ.get('GITHUB_TOKEN', '')
+              api_url = "https://models.inference.ai.azure.com/chat/completions"
+              headers = {
+                  "Authorization": f"Bearer {token}",
+                  "Content-Type": "application/json"
+              }
+              model = "gpt-4o-mini"
+
+          prompt = f"""あなたはAWS Lambdaのエラーを自動修復するエキスパートエンジニアです。
+
+          以下のLambda関数でエラーが発生しました。エラーを分析し、修正したコードを出力してください。
+
+          ## エラーが発生したLambda関数
+          - 関数名: eth-trading-{function_name}
+          - ファイル: {service_dir}
+
+          ## エラーログ
+          ```
+          {error_summary[:2000]}
+          ```
+
+          ## CloudWatch詳細ログ
+          ```
+          {cw_logs[:2000]}
+          ```
+
+          ## 現在のソースコード
+          ```python
+          {source_code}
+          ```
+
+          ## 指示
+          1. エラーの根本原因を分析してください
+          2. 修正したソースコード全体を出力してください
+          3. 何を修正したか簡潔に説明してください
+
+          ## 出力フォーマット（厳密に従ってください）
+          まず分析と修正内容の説明を書き、次に修正後のコード全体を以下のマーカーで囲んで出力してください:
+
+          ---ANALYSIS_START---
+          （分析と修正内容の説明）
+          ---ANALYSIS_END---
+
+          ---CODE_START---
+          （修正後のPythonコード全体）
+          ---CODE_END---
+
+          注意:
+          - コードは完全なファイル内容を出力すること（差分ではなく）
+          - インデントやフォーマットを正確に保つこと
+          - import文を忘れないこと
+          - 環境変数やAWSリソース名は変更しないこと
+          - エラーに無関係な変更は加えないこと
+          """
+
+          if api_key:
+              # Anthropic API format
+              request_body = {
+                  "model": model,
+                  "max_tokens": 8192,
+                  "messages": [{"role": "user", "content": prompt}]
+              }
+          else:
+              # OpenAI-compatible format
+              request_body = {
+                  "model": model,
+                  "max_tokens": 8192,
+                  "messages": [
+                      {"role": "system", "content": "You are an expert AWS Lambda error fixer."},
+                      {"role": "user", "content": prompt}
+                  ]
+              }
+
+          req = urllib.request.Request(
+              api_url,
+              data=json.dumps(request_body).encode('utf-8'),
+              headers=headers,
+              method='POST'
+          )
+
+          try:
+              response = urllib.request.urlopen(req, timeout=120)
+              result = json.loads(response.read().decode('utf-8'))
+
+              if api_key:
+                  # Anthropic response
+                  content = result['content'][0]['text']
+              else:
+                  # OpenAI response
+                  content = result['choices'][0]['message']['content']
+
+              print("=== Claude Response (first 500 chars) ===")
+              print(content[:500])
+
+              # 分析部分を抽出
+              analysis = ""
+              if '---ANALYSIS_START---' in content and '---ANALYSIS_END---' in content:
+                  analysis = content.split('---ANALYSIS_START---')[1].split('---ANALYSIS_END---')[0].strip()
+
+              # コード部分を抽出
+              if '---CODE_START---' in content and '---CODE_END---' in content:
+                  fixed_code = content.split('---CODE_START---')[1].split('---CODE_END---')[0].strip()
+
+                  # Pythonコードブロックのマーカーを除去
+                  if fixed_code.startswith('```python'):
+                      fixed_code = fixed_code[len('```python'):].strip()
+                  if fixed_code.startswith('```'):
+                      fixed_code = fixed_code[3:].strip()
+                  if fixed_code.endswith('```'):
+                      fixed_code = fixed_code[:-3].strip()
+
+                  with open('/tmp/fixed_source.py', 'w') as f:
+                      f.write(fixed_code + '\n')
+
+                  with open('/tmp/analysis.txt', 'w') as f:
+                      f.write(analysis)
+
+                  print("\n=== Analysis ===")
+                  print(analysis[:500])
+                  print("\n=== Fixed code written successfully ===")
+
+                  # 差分生成
+                  import subprocess
+                  diff_result = subprocess.run(
+                      ['diff', '-u', '/tmp/original_source.py', '/tmp/fixed_source.py'],
+                      capture_output=True, text=True
+                  )
+                  with open('/tmp/diff.txt', 'w') as f:
+                      f.write(diff_result.stdout)
+
+                  print("\n=== Diff ===")
+                  print(diff_result.stdout[:1000])
+
+              else:
+                  print("ERROR: Could not extract fixed code from Claude response")
+                  print("Full response:")
+                  print(content)
+                  with open('/tmp/analysis.txt', 'w') as f:
+                      f.write(f"コード抽出失敗。Claude応答:\n{content[:2000]}")
+                  exit(1)
+
+          except Exception as e:
+              print(f"Claude API call failed: {e}")
+              with open('/tmp/analysis.txt', 'w') as f:
+                  f.write(f"Claude API呼び出し失敗: {str(e)}")
+              exit(1)
+
+          CLAUDE_SCRIPT
+
+      - name: Validate fixed code (syntax check)
+        id: validate
+        run: |
+          echo "=== Syntax Check ==="
+          python3 -c "
+          import py_compile
+          try:
+              py_compile.compile('/tmp/fixed_source.py', doraise=True)
+              print('Syntax OK')
+          except py_compile.PyCompileError as e:
+              print(f'Syntax Error: {e}')
+              exit(1)
+          "
+
+      - name: Apply fix
+        run: |
+          SERVICE_DIR="${{ steps.error.outputs.service_dir }}"
+          cp /tmp/fixed_source.py "${SERVICE_DIR}"
+          echo "Fixed code applied to ${SERVICE_DIR}"
+
+      - name: Deploy to AWS Lambda
+        id: deploy
+        run: |
+          FUNCTION_NAME="${{ steps.error.outputs.function_name }}"
+          LAMBDA_NAME="eth-trading-${FUNCTION_NAME}"
+          SERVICE_DIR="services/${FUNCTION_NAME}"
+
+          echo "Packaging ${SERVICE_DIR}..."
+          cd "${SERVICE_DIR}"
+          zip -r /tmp/lambda_deploy.zip .
+          cd -
+
+          echo "Deploying to ${LAMBDA_NAME}..."
+          aws lambda update-function-code \
+            --function-name "${LAMBDA_NAME}" \
+            --zip-file fileb:///tmp/lambda_deploy.zip \
+            --output json > /tmp/deploy_result.json
+
+          echo "Deploy complete"
+          jq '.LastModified, .CodeSha256' /tmp/deploy_result.json
+
+      - name: Verify deployment
+        id: verify
+        run: |
+          FUNCTION_NAME="${{ steps.error.outputs.function_name }}"
+          LAMBDA_NAME="eth-trading-${FUNCTION_NAME}"
+
+          echo "Waiting 10 seconds for deployment to stabilize..."
+          sleep 10
+
+          # Lambda関数のステータス確認
+          STATE=$(aws lambda get-function-configuration \
+            --function-name "${LAMBDA_NAME}" \
+            --query "State" --output text)
+          echo "Lambda state: ${STATE}"
+
+          if [ "${STATE}" != "Active" ]; then
+            echo "Lambda is not Active, waiting..."
+            aws lambda wait function-active --function-name "${LAMBDA_NAME}"
+          fi
+
+          # 直近のエラーを確認（デプロイ後2分以内）
+          sleep 30
+          DEPLOY_TIME=$(( $(date +%s) * 1000 - 30000 ))
+          LOG_GROUP="/aws/lambda/${LAMBDA_NAME}"
+
+          ERRORS=$(aws logs filter-log-events \
+            --log-group-name "${LOG_GROUP}" \
+            --start-time ${DEPLOY_TIME} \
+            --filter-pattern "?ERROR ?Traceback ?Exception" \
+            --query "events[*].message" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "${ERRORS}" ] && [ "${ERRORS}" != "None" ]; then
+            echo "⚠️ Post-deploy errors detected:"
+            echo "${ERRORS}" | head -10
+            echo "verify_status=warning" >> $GITHUB_OUTPUT
+          else
+            echo "✅ No errors detected after deployment"
+            echo "verify_status=success" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Notify Slack (result)
+        if: always()
+        run: |
+          python3 << 'SLACK_SCRIPT'
+          import json
+          import urllib.request
+          import os
+
+          webhook_url = "${{ secrets.SLACK_WEBHOOK_URL }}"
+          if not webhook_url:
+              print("No Slack webhook URL")
+              exit(0)
+
+          function_name = "${{ steps.error.outputs.function_name }}"
+          verify_status = "${{ steps.verify.outputs.verify_status }}"
+          job_status = "${{ job.status }}"
+
+          # 分析結果読み込み
+          analysis = "（分析情報なし）"
+          try:
+              with open('/tmp/analysis.txt', 'r') as f:
+                  analysis = f.read()[:1000]
+          except:
+              pass
+
+          # 差分読み込み
+          diff_text = "（差分なし）"
+          try:
+              with open('/tmp/diff.txt', 'r') as f:
+                  diff_text = f.read()[:1500]
+          except:
+              pass
+
+          if job_status == "success" and verify_status == "success":
+              emoji = "✅"
+              status_text = "自動修復成功"
+              color = "#36a64f"
+          elif job_status == "success" and verify_status == "warning":
+              emoji = "⚠️"
+              status_text = "修復済み（デプロイ後にエラー検出あり）"
+              color = "#ff9900"
+          else:
+              emoji = "❌"
+              status_text = "自動修復失敗 - 手動対応が必要"
+              color = "#ff0000"
+
+          payload = {
+              "blocks": [
+                  {
+                      "type": "header",
+                      "text": {
+                          "type": "plain_text",
+                          "text": f"{emoji} Auto-Fix: {function_name}"
+                      }
+                  },
+                  {
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": f"*ステータス:* {status_text}\n*関数:* `eth-trading-{function_name}`"
+                      }
+                  },
+                  {
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": f"*🔍 分析:*\n{analysis[:800]}"
+                      }
+                  },
+                  {
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": f"*📝 変更差分:*\n```{diff_text[:1200]}```"
+                      }
+                  }
+              ]
+          }
+
+          req = urllib.request.Request(
+              webhook_url,
+              data=json.dumps(payload).encode('utf-8'),
+              headers={'Content-Type': 'application/json'}
+          )
+          try:
+              response = urllib.request.urlopen(req, timeout=10)
+              print(f"Slack notification sent: {response.status}")
+          except Exception as e:
+              print(f"Slack notification failed: {e}")
+
+          SLACK_SCRIPT
+
+      - name: Commit and push fix
+        if: success() && steps.verify.outputs.verify_status == 'success'
+        run: |
+          FUNCTION_NAME="${{ steps.error.outputs.function_name }}"
+
+          # 分析コメント読み込み
+          ANALYSIS=$(cat /tmp/analysis.txt 2>/dev/null | head -5 || echo "Auto-fix applied")
+
+          git config user.name "auto-fix-bot"
+          git config user.email "auto-fix-bot@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "fix(${FUNCTION_NAME}): auto-fix error [bot]" \
+            -m "${ANALYSIS}"
+          git push
+
+      - name: Update docs if needed
+        if: success() && steps.verify.outputs.verify_status == 'success'
+        run: |
+          FUNCTION_NAME="${{ steps.error.outputs.function_name }}"
+          SERVICE_DIR="${{ steps.error.outputs.service_dir }}"
+
+          # 変更が大きい場合のみドキュメント更新チェック
+          DIFF_LINES=$(wc -l < /tmp/diff.txt 2>/dev/null || echo "0")
+
+          if [ "${DIFF_LINES}" -gt 20 ]; then
+            echo "Large change detected (${DIFF_LINES} lines). Checking docs..."
+
+            # docs/ ディレクトリ内の関連ドキュメントを確認
+            RELATED_DOCS=$(grep -rl "${FUNCTION_NAME}" docs/ 2>/dev/null || echo "")
+            if [ -n "${RELATED_DOCS}" ]; then
+              echo "Related docs found: ${RELATED_DOCS}"
+              echo "📝 TODO: ドキュメントの更新が必要な可能性があります"
+              # ここにClaude APIでドキュメント更新ロジックを追加可能
+            fi
+          fi

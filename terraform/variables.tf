@@ -88,6 +88,15 @@ EOT
 # (SageMaker設定は削除 — ONNX Runtime Lambda移行済み)
 
 # ============================================
+# GitHub Repository (Auto-Fix用)
+# ============================================
+variable "github_repo" {
+  description = "GitHub repository (owner/repo format) for auto-fix workflow"
+  type        = string
+  default     = ""
+}
+
+# ============================================
 # External API Keys
 # ============================================
 variable "cryptopanic_api_key" {

@@ -81,7 +81,8 @@ resource "aws_iam_role_policy" "lambda_custom" {
           "secretsmanager:GetSecretValue"
         ]
         Resource = [
-          "arn:aws:secretsmanager:${var.aws_region}:${local.account_id}:secret:coincheck/*"
+          "arn:aws:secretsmanager:${var.aws_region}:${local.account_id}:secret:coincheck/*",
+          "arn:aws:secretsmanager:${var.aws_region}:${local.account_id}:secret:github/*"
         ]
       },
       # SQSアクセス
