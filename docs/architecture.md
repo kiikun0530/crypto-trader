@@ -143,6 +143,11 @@ flowchart LR
 - 10通貨以上にすると CryptoPanic API レスポンスが肥大化し、Lambda実行時間が増加
 - `TRADING_PAIRS_CONFIG` 環境変数で通貨の追加・削除が可能（コード変更不要）
 
+**参考 (Coincheck)**:
+- [取引所手数料](https://coincheck.com/ja/exchange/fee) — 通貨別 Maker/Taker 手数料率
+- [取引所 API](https://coincheck.com/ja/documents/exchange/api) — 利用可能な通貨ペア一覧、注文 API 仕様
+- [取引注文ルール](https://faq.coincheck.com/s/article/40218?language=ja) — 最小注文数量・小数点以下桁数
+
 ---
 
 ## 設計原則

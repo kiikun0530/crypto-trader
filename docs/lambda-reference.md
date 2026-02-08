@@ -340,6 +340,21 @@ BTC保有中にETHのBUYシグナル → BTC保有中のためスキップ（Sla
 
 認証: HMAC-SHA256 署名（Secrets Manager からキー取得）
 
+### 通貨別注文ルール
+
+Coincheck 取引所の通貨別最小注文数量・小数点以下桁数に基づき、売り注文時にバリデーションを実施。
+
+| 通貨 | 最小注文数量 | 小数点桁数 |
+|---|---|---|
+| BTC | 0.001 | 8桁 |
+| ETH | 0.001 | 8桁 |
+| XRP | 1.0 | 6桁 |
+| SOL | 0.01 | 8桁 |
+| DOGE | 1.0 | 2桁 |
+| AVAX | 0.01 | 8桁 |
+
+参考: [取引注文ルール](https://faq.coincheck.com/s/article/40218?language=ja) / [取引所手数料](https://coincheck.com/ja/exchange/fee) / [取引所 API](https://coincheck.com/ja/documents/exchange/api)
+
 ---
 
 ## position-monitor
