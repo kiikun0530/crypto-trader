@@ -416,12 +416,14 @@ flowchart TD
 
     subgraph DynamoDB
         PC -->|"W"| DB_P["prices"]
+        PC -->|"R/W"| DB_ST["analysis_state"]
         NC -->|"W"| DB_S["sentiment"]
         TECH -->|"R"| DB_P
+        CHRON -->|"R"| DB_P
         SENT -->|"R"| DB_S
         AGG -->|"W"| DB_SIG["signals"]
         AGG -->|"R"| DB_POS["positions"]
-        OE -->|"W"| DB_POS
+        OE -->|"R/W"| DB_POS
         OE -->|"W"| DB_T["trades"]
         PM -->|"R"| DB_POS
     end

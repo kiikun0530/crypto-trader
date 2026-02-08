@@ -86,11 +86,16 @@ flowchart LR
     SF_AGG --> L_AGG
 
     %% DynamoDB連携
-    L_TECH --> DB_PRICES
-    L_SENTIMENT --> DB_SENTIMENT
-    L_NEWS --> DB_SENTIMENT
-    L_AGG --> DB_SIGNALS
-    L_ORDER --> DB_TRADES
+    L_TECH -->|"R"| DB_PRICES
+    L_CHRONOS -->|"R"| DB_PRICES
+    L_SENTIMENT -->|"R"| DB_SENTIMENT
+    L_NEWS -->|"W"| DB_SENTIMENT
+    L_PRICE -->|"R/W"| DB_STATE
+    L_AGG -->|"R"| DB_POSITIONS
+    L_AGG -->|"W"| DB_SIGNALS
+    L_ORDER -->|"R/W"| DB_POSITIONS
+    L_ORDER -->|"W"| DB_TRADES
+    L_POSITION -->|"R"| DB_POSITIONS
 
     %% 注文
     L_AGG -->|"最高スコア通貨"| SQS_ORDER
