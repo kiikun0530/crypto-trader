@@ -128,3 +128,84 @@
 | 2025-02-09 | #7 レジーム検知 | - | ADX判定、ウェイト動的変更 |
 | 2025-02-09 | #8 指標拡充 | - | ADX/ATR/ATR%/レジーム追加 |
 | 2025-02-09 | #10 サーキットブレーカー | - | 日次損失/連敗制御、デフォルトOFF |
+
+---
+
+## 🔮 Phase 2 改善候補 (検討中)
+
+> Phase 1 (#1-#10) 完了後の次のステップ。優先度順に整理。
+
+### 【A. AI分析の精度に直結する問題（優先度高）】
+
+#### 11. OHLCデータの保存・活用
+- **現状**: Binance から取得する5分足の close だけを保存・分析に使用
+- **問題**: ATR・ADX は本来 OHLC（高値/安値/始値/終値）が必要なのに、close のみで近似計算。精度が大幅に劣化
+- **改善**: price-collector で Binance の OHLC を DynamoDB に保存し、technical Lambda で使用
+- **工数**: 中（price-collector のデータ保存形式変更 + technical の計算修正）
+- **影響範囲**: `services/price-collector/handler.py`, `services/technical/handler.py`
+
+#### 12. MACDスコアリングのグラデーション化
+- **現状**: MACD > signal なら `+weight`、そうでなければ `-weight`。バイナリ判定
+- **問題**: MACD ヒストグラムの傾き・大きさ・クロスオーバーの鮮度を無視。「ギリギリ上」と「大きく上」が同じスコア
+- **改善**: ヒストグラムの大きさと勾配を反映したグラデーションスコアに変更
+- **工数**: 小
+- **影響範囲**: `services/technical/handler.py`
+
+#### 13. RSI計算のWilder's方式への修正
+- **現状**: 直近N期間の上昇/下降の単純平均で計算
+- **問題**: 標準的な Wilder の指数移動平均（EMA）ではないため、値が不安定になりやすい
+- **改善**: Wilder's smoothed moving average に修正
+- **工数**: 小
+- **影響範囲**: `services/technical/handler.py`
+
+#### 14. 出来高（Volume）データの活用
+- **現状**: warm-up Lambda では volume を取得・保存しているが、分析には一切使われていない
+- **問題**: ブレイクアウトの信頼性確認や、トレンドの強度判定に volume は重要指標
+- **改善**: Volume-weighted 確認シグナルを technical に追加（例: 出来高急増時にスコアを増幅）
+- **工数**: 中（price-collector で volume 保存 + technical で参照）
+- **影響範囲**: `services/price-collector/handler.py`, `services/technical/handler.py`
+
+### 【B. モデル・インフラの改善（優先度中）】
+
+#### 15. Chronos-T5-Tiny のウェイト調整 / モデル拡大
+- **現状**: 8M パラメータ（最小モデル）に 40% のウェイト
+- **問題**: 5分足の暗号通貨予測には小さすぎる可能性。精度が低いのに最大級のウェイトを与えている
+- **改善案**:
+  - **短期**: Chronos の weight を 30% に下げ、technical を 55% に（データに基づく指標を重視）
+  - **中期**: Chronos-T5-Small（46M パラメータ）に切替（Lambda memory 2048MB+ 必要）
+  - **長期**: Chronos のスコアと実際の価格変動の相関を測定し、ウェイトをデータドリブンで決定
+- **工数**: 小（ウェイト変更のみ）〜 中（モデル切替）
+- **影響範囲**: `services/aggregator/handler.py`, `services/chronos-caller/handler.py`
+
+#### 16. decoder_with_past (KVキャッシュ) の活用
+- **現状**: ONNX モデルを S3 から読み込んでいるが `decoder_with_past_model.onnx` は使われていない
+- **問題**: 自己回帰デコードで毎ステップ全トークンを再処理 → 推論が不必要に遅い
+- **改善**: KV キャッシュを使った高速デコードに変更。chronos-caller の所要時間が半分程度に
+- **工数**: 中（デコードロジック書き換え）
+- **影響範囲**: `services/chronos-caller/handler.py`
+
+#### 17. センチメント分析のNLPモデル化
+- **現状**: CryptoPanic の投票比率 + 60個のキーワードマッチ（bullish/bearish各30語）
+- **問題**: 本格的な NLP モデルではなく、微妙なニュアンスを捉えられない
+- **改善案**:
+  - FinBERT 等の軽量モデルを Lambda で動かす
+  - or 外部API（OpenAI等）でニュース要約＋スコアリング
+- **工数**: 大（モデルデプロイ or API統合）
+- **影響範囲**: `services/news-collector/handler.py`, `services/sentiment-getter/handler.py`
+
+### 【C. 運用・安全性の改善（優先度中〜低）】
+
+#### 18. トレード記録への分析コンテキスト保存
+- **現状**: trades テーブルには価格・数量のみ
+- **問題**: 「なぜこのトレードを行ったか」の事後分析ができない
+- **改善**: エントリー時の各指標スコア（Technical/Chronos/Sentiment）・市場レジーム・ADX値・スコア内訳なども trades テーブルに保存
+- **工数**: 小
+- **影響範囲**: `services/order-executor/handler.py`
+
+### Phase 2 推奨実装順序
+
+```
+12(MACDグラデーション) → 13(RSI Wilder's) → 15(Chronosウェイト調整)
+→ 18(トレード記録拡充) → 11(OHLC保存) → 14(Volume活用)
+→ 16(KVキャッシュ) → 17(NLPセンチメント)
+```
