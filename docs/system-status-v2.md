@@ -349,7 +349,7 @@ Compress-Archive -Path "services/chronos-caller/*" -DestinationPath "chronos.zip
 ## 📝 コミット履歴（全件）
 
 ```
-XXXXXXX feat: add self-improving pipeline (daily-reporter + auto-improve) Phase 4
+5f0ba34 feat: add self-improving pipeline (daily-reporter + auto-improve) Phase 4
 1647fe9 docs: update Phase 3 documentation
 8b5f2a4 feat: adjust thresholds for 4-component scoring (BUY 0.30→0.28, SELL -0.20→-0.15)
 72cf12f feat: add market-context 4th pillar (F&G + Funding + BTC Dom) (#20)

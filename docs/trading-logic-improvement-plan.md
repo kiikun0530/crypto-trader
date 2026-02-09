@@ -269,4 +269,4 @@
 | 2026-02-10 | #20 Market Context | `72cf12f` | 第4の柱: F&G + Funding + BTC Dom, Tech=0.45/Chronos=0.25/Sent=0.15/Mkt=0.15 |
 | 2026-02-10 | #20a 閾値調整 | `8b5f2a4` | BUY 0.30→0.28, SELL -0.20→-0.15, 4成分圧縮補正 |
 | 2026-02-10 | docs Phase 3 | `1647fe9` | ドキュメント更新 |
-| 2026-02-10 | #21-23 Phase 4 | `pending` | daily-reporter + auto-improve + trades TTL |
+| 2026-02-10 | #21-23 Phase 4 | `5f0ba34` | daily-reporter + auto-improve + trades TTL |
