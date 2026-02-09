@@ -69,6 +69,7 @@
 | BUY基準閾値 | `BASE_BUY_THRESHOLD` | **0.30** | 0.20 | #9 発火率削減 |
 | SELL基準閾値 | `BASE_SELL_THRESHOLD` | -0.20 | -0.20 | 変更なし |
 | BB幅基準 | `BASELINE_BB_WIDTH` | 0.03 | 0.03 | 変更なし |
+| ボラ補正下限 | `VOL_CLAMP_MIN` | **0.67** | 0.50 | #19 最低BUY閾値0.15→0.20 |
 | 最低保有時間 | `MIN_HOLD_SECONDS` | **1800** (30分) | なし | #2 即売り防止 |
 | 通貨最大同時保有 | `MAX_POSITIONS_PER_PAIR` | **1** | 制限なし | #6 分散 |
 

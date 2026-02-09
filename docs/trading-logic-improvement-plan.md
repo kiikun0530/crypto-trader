@@ -195,6 +195,15 @@
 - **データフロー**: aggregator → SQS (analysis_context付き) → order-executor → DynamoDB trades テーブル
 - **影響範囲**: `services/aggregator/handler.py`, `services/order-executor/handler.py`
 
+### 【Phase 3: 運用データフィードバック】
+
+#### 19. VOL_CLAMP_MIN 引き上げ（最低BUY閾値の底上げ） ✅ 実装済
+- **問題**: Phase 2 初日の3トレード全てが `BUY閾値=0.15`（クランプ下限）で発火。BTC(0.159)/AVAX(0.165)は閾値をわずか0.009/0.015超えただけの限界的シグナル
+- **根本原因**: `VOL_CLAMP_MIN=0.5` → `BASE_BUY_THRESHOLD(0.30) × 0.5 = 0.15` が低すぎる。Tech単独の強い反発が他2コンポーネント(AI/Sent)の反対意見を無視してBUY発動
+- **修正**: `VOL_CLAMP_MIN` を 0.5 → **0.67** に引き上げ（最低BUY閾値 0.15→**0.20**、最低SELL閾値 -0.10→**-0.134**）
+- **効果**: BTC/AVAXの限界的トレード(計¥313損失)を阻止。XRP(0.222>0.20)は閾値超えで正当なシグナルとして引き続き発動可能
+- **影響範囲**: `services/aggregator/handler.py`
+
 ### Phase 2 実装ログ
 
 | 日付 | 項目 | コミット | 備考 |
@@ -208,3 +217,4 @@
 | 2026-02-09 | #16 KV キャッシュ | `8211ac1` | decoder_with_past 高速デコード |
 | 2026-02-09 | #17 NLP センチメント | `8211ac1` | 3段階強度+否定語+バイグラム |
 | 2026-02-09 | Typical Price | `90684dc` | Chronos入力を(H+L+C)/3に変更 |
+| 2026-02-09 | #19 VOL_CLAMP_MIN | - | 0.5→0.67, 最低BUY閾値 0.15→0.20 |

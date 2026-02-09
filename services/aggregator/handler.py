@@ -47,7 +47,8 @@ BASE_SELL_THRESHOLD = float(os.environ.get('BASE_SELL_THRESHOLD', '-0.20'))
 # BB幅の基準値（暗号通貨の典型的なBB幅 ≈ 3%）
 BASELINE_BB_WIDTH = float(os.environ.get('BASELINE_BB_WIDTH', '0.03'))
 # ボラティリティ補正のクランプ範囲
-VOL_CLAMP_MIN = 0.5
+# MIN=0.67: 最低BUY閾値 0.30×0.67=0.20（限界的シグナルでの誤エントリー防止）
+VOL_CLAMP_MIN = 0.67
 VOL_CLAMP_MAX = 2.0
 
 # 最低保有時間（秒）: BUYから一定時間はシグナルSELLを無視（SL/TPは有効）
