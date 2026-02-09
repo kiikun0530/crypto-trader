@@ -15,6 +15,7 @@ resource "aws_cloudwatch_log_group" "lambda" {
     "order-executor",
     "position-monitor",
     "news-collector",
+    "market-context",
     "warm-up"
   ])
 
@@ -97,6 +98,12 @@ locals {
       memory      = 256
       handler     = "handler.handler"
     }
+    market-context = {
+      description = "マーケットコンテキスト収集 (F&G, Funding, BTC Dom)"
+      timeout     = 60
+      memory      = 256
+      handler     = "handler.handler"
+    }
     warm-up = {
       description = "初回データ投入（手動実行）"
       timeout     = 300
@@ -112,6 +119,7 @@ locals {
     TRADES_TABLE         = aws_dynamodb_table.trades.name
     SIGNALS_TABLE        = aws_dynamodb_table.signals.name
     ANALYSIS_STATE_TABLE = aws_dynamodb_table.analysis_state.name
+    MARKET_CONTEXT_TABLE = aws_dynamodb_table.market_context.name
     COINCHECK_SECRET_ARN = "arn:aws:secretsmanager:${var.aws_region}:${local.account_id}:secret:coincheck/api-credentials"
     VOLATILITY_THRESHOLD = tostring(var.volatility_threshold)
     MAX_POSITION_JPY     = tostring(var.max_position_jpy)

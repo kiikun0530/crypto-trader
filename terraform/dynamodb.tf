@@ -142,3 +142,31 @@ resource "aws_dynamodb_table" "analysis_state" {
     Name = "${local.name_prefix}-analysis-state"
   }
 }
+
+# マーケットコンテキストテーブル (TTL: 14日)
+# Fear & Greed Index, ファンディングレート, BTC Dominance
+resource "aws_dynamodb_table" "market_context" {
+  name         = "${local.name_prefix}-market-context"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "context_type"
+  range_key    = "timestamp"
+
+  attribute {
+    name = "context_type"
+    type = "S"
+  }
+
+  attribute {
+    name = "timestamp"
+    type = "N"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = {
+    Name = "${local.name_prefix}-market-context"
+  }
+}

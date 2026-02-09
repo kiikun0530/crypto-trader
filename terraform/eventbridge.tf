@@ -80,6 +80,32 @@ resource "aws_lambda_permission" "news_collection" {
   source_arn    = aws_cloudwatch_event_rule.news_collection.arn
 }
 
+# マーケットコンテキスト収集ルール (30分間隔 - F&G, Funding Rate, BTC Dominance)
+resource "aws_cloudwatch_event_rule" "market_context" {
+  name                = "${local.name_prefix}-market-context"
+  description         = "Collect market context (Fear&Greed, Funding, BTC Dominance) every 30 minutes"
+  schedule_expression = "rate(30 minutes)"
+  state               = "ENABLED"
+
+  tags = {
+    Name = "${local.name_prefix}-market-context"
+  }
+}
+
+resource "aws_cloudwatch_event_target" "market_context" {
+  rule      = aws_cloudwatch_event_rule.market_context.name
+  target_id = "MarketContextLambda"
+  arn       = aws_lambda_function.functions["market-context"].arn
+}
+
+resource "aws_lambda_permission" "market_context" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.functions["market-context"].function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.market_context.arn
+}
+
 # 分析トリガールール (価格収集Lambdaからのイベント)
 resource "aws_cloudwatch_event_rule" "analysis_trigger" {
   name        = "${local.name_prefix}-analysis-trigger"

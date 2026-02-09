@@ -23,6 +23,7 @@ sqs = boto3.client('sqs')
 
 SIGNALS_TABLE = os.environ.get('SIGNALS_TABLE', 'eth-trading-signals')
 POSITIONS_TABLE = os.environ.get('POSITIONS_TABLE', 'eth-trading-positions')
+MARKET_CONTEXT_TABLE = os.environ.get('MARKET_CONTEXT_TABLE', 'eth-trading-market-context')
 ORDER_QUEUE_URL = os.environ.get('ORDER_QUEUE_URL', '')
 SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL', '')
 
@@ -32,13 +33,13 @@ DEFAULT_PAIRS = {
 }
 TRADING_PAIRS = json.loads(os.environ.get('TRADING_PAIRS_CONFIG', json.dumps(DEFAULT_PAIRS)))
 
-# 重み設定 (データドリブン: signals 810件の分散比例 + Chronos near-zero 52%)
-# 分析結果: Tech std=0.435, Chronos std=0.264, Sent std=0.063
-# 分散比例: Tech=0.57, Chronos=0.35, Sent=0.08
-# Chronos が50%以上ほぼ0 & SELL寄与ほぼなし → ウェイト30%に削減
-TECHNICAL_WEIGHT = float(os.environ.get('TECHNICAL_WEIGHT', '0.55'))
-CHRONOS_WEIGHT = float(os.environ.get('AI_PREDICTION_WEIGHT', '0.30'))
+# 重み設定 (4コンポーネント: Tech + Chronos + Sentiment + MarketContext)
+# Phase 2: Tech dominant (0.55) → Phase 3: 4成分分散
+# MarketContext = Fear&Greed + FundingRate + BTC Dominance (市場マクロ環境)
+TECHNICAL_WEIGHT = float(os.environ.get('TECHNICAL_WEIGHT', '0.45'))
+CHRONOS_WEIGHT = float(os.environ.get('AI_PREDICTION_WEIGHT', '0.25'))
 SENTIMENT_WEIGHT = float(os.environ.get('SENTIMENT_WEIGHT', '0.15'))
+MARKET_CONTEXT_WEIGHT = float(os.environ.get('MARKET_CONTEXT_WEIGHT', '0.15'))
 
 # ボラティリティ適応型閾値
 # 基準閾値（平均的なボラティリティ時に使用）
@@ -70,11 +71,14 @@ def handler(event, context):
         pairs_results = [event]
 
     try:
+        # 0. マーケットコンテキスト取得（全通貨共通のマクロ情報）
+        market_context = fetch_market_context()
+
         # 1. 全通貨のスコア計算
         scored_pairs = []
         for result in pairs_results:
             pair = result.get('pair', 'unknown')
-            scored = score_pair(pair, result)
+            scored = score_pair(pair, result, market_context)
             scored_pairs.append(scored)
 
         # 2. ボラティリティ適応型閾値を計算
@@ -117,7 +121,8 @@ def handler(event, context):
             analysis_context['weights'] = {
                 'technical': TECHNICAL_WEIGHT,
                 'chronos': CHRONOS_WEIGHT,
-                'sentiment': SENTIMENT_WEIGHT
+                'sentiment': SENTIMENT_WEIGHT,
+                'market_context': MARKET_CONTEXT_WEIGHT
             }
             send_order_message(target_pair, signal, target_score,
                              int(time.time()), analysis_context)
@@ -157,8 +162,8 @@ def handler(event, context):
         }
 
 
-def score_pair(pair: str, result: dict) -> dict:
-    """通貨ペアのスコアを計算"""
+def score_pair(pair: str, result: dict, market_context: dict = None) -> dict:
+    """通貨ペアのスコアを計算（4コンポーネント）"""
     technical_result = result.get('technical', {})
     chronos_result = result.get('chronos', {})
     sentiment_result = result.get('sentiment', {})
@@ -172,11 +177,39 @@ def score_pair(pair: str, result: dict) -> dict:
     chronos_normalized = chronos_score  # 既に-1〜1
     sentiment_normalized = (sentiment_score - 0.5) * 2  # 0〜1 → -1〜1
 
-    # 加重平均
+    # マーケットコンテキストスコア（DynamoDB直接読み取り）
+    market_context_normalized = 0.0  # デフォルト中立
+    market_context_detail = {}
+    if market_context:
+        market_context_normalized = float(market_context.get('market_score', 0))
+        market_context_detail = {
+            'fng_value': market_context.get('fng_value', 50),
+            'fng_classification': market_context.get('fng_classification', 'N/A'),
+            'fng_score': float(market_context.get('fng_score', 0)),
+            'funding_score': float(market_context.get('funding_score', 0)),
+            'dominance_score': float(market_context.get('dominance_score', 0)),
+            'btc_dominance': float(market_context.get('btc_dominance', 50)),
+        }
+
+    # BTC Dominanceによるアルトコイン追加補正
+    # BTC自体はDominance上昇で有利、アルト（ETH, XRP, SOL, DOGE, AVAX）は不利
+    alt_dominance_adjustment = 0.0
+    if market_context and pair != 'btc_usdt':
+        btc_dom = float(market_context.get('btc_dominance', 50))
+        # BTC Dominance 60%超 → アルトに追加ペナルティ (-0.05)
+        # BTC Dominance 40%未満 → アルトにボーナス (+0.05)
+        if btc_dom > 60:
+            alt_dominance_adjustment = -0.05
+        elif btc_dom < 40:
+            alt_dominance_adjustment = 0.05
+
+    # 4成分加重平均
     total_score = (
         technical_normalized * TECHNICAL_WEIGHT +
         chronos_normalized * CHRONOS_WEIGHT +
-        sentiment_normalized * SENTIMENT_WEIGHT
+        sentiment_normalized * SENTIMENT_WEIGHT +
+        market_context_normalized * MARKET_CONTEXT_WEIGHT +
+        alt_dominance_adjustment
     )
 
     # ボラティリティ情報を抽出（BB幅 = (上限-下限)/中央値）
@@ -188,8 +221,10 @@ def score_pair(pair: str, result: dict) -> dict:
         'components': {
             'technical': round(technical_normalized, 3),
             'chronos': round(chronos_normalized, 3),
-            'sentiment': round(sentiment_normalized, 3)
+            'sentiment': round(sentiment_normalized, 3),
+            'market_context': round(market_context_normalized, 3)
         },
+        'market_context_detail': market_context_detail,
         # ⚠️ この価格はBinance USDT建て（例: ETH ~$2,100）
         # Coincheck JPY建てのポジション価格と比較してはいけない
         # P/L計算にはget_current_price()でJPY価格を別途取得すること
@@ -219,6 +254,42 @@ def extract_bb_width(technical_result: dict) -> float:
         print(f"BB width extraction error: {e}")
 
     return BASELINE_BB_WIDTH  # デフォルト
+
+
+def fetch_market_context() -> dict:
+    """
+    DynamoDBからマーケットコンテキストの最新データを取得
+    market-context Lambda が30分間隔で書き込む
+
+    Returns: {'market_score': float, 'fng_value': int, 'fng_score': float, ...}
+             エラー/データなし時は空dict
+    """
+    try:
+        table = dynamodb.Table(MARKET_CONTEXT_TABLE)
+        response = table.query(
+            KeyConditionExpression='context_type = :ct',
+            ExpressionAttributeValues={':ct': 'global'},
+            ScanIndexForward=False,  # 最新から
+            Limit=1
+        )
+        items = response.get('Items', [])
+        if items:
+            item = items[0]
+            age_seconds = int(time.time()) - int(item.get('timestamp', 0))
+            # 2時間以上前のデータは古すぎる → 中立扱い
+            if age_seconds > 7200:
+                print(f"Market context data too old ({age_seconds}s ago), using neutral")
+                return {}
+            print(f"Market context: score={float(item.get('market_score', 0)):+.4f}, "
+                  f"F&G={item.get('fng_value', '?')}/{item.get('fng_classification', '?')}, "
+                  f"age={age_seconds}s")
+            return item
+        else:
+            print("No market context data found in DynamoDB")
+            return {}
+    except Exception as e:
+        print(f"Error fetching market context: {e}")
+        return {}
 
 
 def calculate_dynamic_thresholds(scored_pairs: list) -> tuple:
@@ -403,6 +474,7 @@ def save_signal(scored: dict, buy_threshold: float, sell_threshold: float):
         'technical_score': Decimal(str(round(scored['components']['technical'], 4))),
         'chronos_score': Decimal(str(round(scored['components']['chronos'], 4))),
         'sentiment_score': Decimal(str(round(scored['components']['sentiment'], 4))),
+        'market_context_score': Decimal(str(round(scored['components'].get('market_context', 0), 4))),
         'buy_threshold': Decimal(str(round(buy_threshold, 4))),
         'sell_threshold': Decimal(str(round(sell_threshold, 4))),
         'bb_width': Decimal(str(round(scored.get('bb_width', BASELINE_BB_WIDTH), 6))),
@@ -457,7 +529,8 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
                 f"{medal} *{name}*: `{s['total_score']:+.4f}` {score_bar(s['total_score'])}\n"
                 f"    Tech: `{s['components']['technical']:+.3f}` | "
                 f"AI: `{s['components']['chronos']:+.3f}` | "
-                f"Sent: `{s['components']['sentiment']:+.3f}`\n"
+                f"Sent: `{s['components']['sentiment']:+.3f}` | "
+                f"Mkt: `{s['components'].get('market_context', 0):+.3f}`\n"
             )
 
         # ポジション情報（複数対応 + 含み損益表示）
@@ -517,6 +590,22 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
         else:
             position_text = "なし"
 
+        # マーケットコンテキスト情報
+        mkt_detail = scored_pairs[0].get('market_context_detail', {}) if scored_pairs else {}
+        if mkt_detail:
+            fng_val = mkt_detail.get('fng_value', '?')
+            fng_cls = mkt_detail.get('fng_classification', '?')
+            btc_dom = mkt_detail.get('btc_dominance', 0)
+            mkt_text = (
+                f"F&G: `{fng_val}` ({fng_cls}) | "
+                f"BTC Dom: `{btc_dom:.1f}%` | "
+                f"Scores: F&G=`{mkt_detail.get('fng_score', 0):+.3f}` "
+                f"Fund=`{mkt_detail.get('funding_score', 0):+.3f}` "
+                f"Dom=`{mkt_detail.get('dominance_score', 0):+.3f}`"
+            )
+        else:
+            mkt_text = "データなし（中立扱い）"
+
         blocks = [
             {
                 "type": "header",
@@ -537,6 +626,13 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
+                    "text": f"*🌍 市場環境*\n{mkt_text}"
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
                     "text": f"*📊 通貨ランキング（期待値順）*\n{ranking_text}"
                 }
             },
@@ -550,7 +646,8 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
             {
                 "type": "context",
                 "elements": [
-                    {"type": "mrkdwn", "text": f"BUY閾値: `{buy_threshold:+.3f}` / SELL閾値: `{sell_threshold:+.3f}`"}
+                    {"type": "mrkdwn", "text": f"BUY閾値: `{buy_threshold:+.3f}` / SELL閾値: `{sell_threshold:+.3f}` | "
+                                                f"重み: Tech={TECHNICAL_WEIGHT} AI={CHRONOS_WEIGHT} Sent={SENTIMENT_WEIGHT} Mkt={MARKET_CONTEXT_WEIGHT}"}
                 ]
             }
         ]
