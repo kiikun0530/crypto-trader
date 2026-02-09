@@ -67,13 +67,15 @@ resource "aws_iam_role_policy" "lambda_custom" {
           aws_dynamodb_table.signals.arn,
           aws_dynamodb_table.analysis_state.arn,
           aws_dynamodb_table.market_context.arn,
+          aws_dynamodb_table.improvements.arn,
           "${aws_dynamodb_table.prices.arn}/index/*",
           "${aws_dynamodb_table.sentiment.arn}/index/*",
           "${aws_dynamodb_table.positions.arn}/index/*",
           "${aws_dynamodb_table.trades.arn}/index/*",
           "${aws_dynamodb_table.signals.arn}/index/*",
           "${aws_dynamodb_table.analysis_state.arn}/index/*",
-          "${aws_dynamodb_table.market_context.arn}/index/*"
+          "${aws_dynamodb_table.market_context.arn}/index/*",
+          "${aws_dynamodb_table.improvements.arn}/index/*"
         ]
       },
       # Secrets Managerアクセス
@@ -130,6 +132,18 @@ resource "aws_iam_role_policy" "lambda_custom" {
         Resource = [
           "arn:aws:s3:::${local.name_prefix}-sagemaker-models-${local.account_id}",
           "arn:aws:s3:::${local.name_prefix}-sagemaker-models-${local.account_id}/*"
+        ]
+      },
+      # S3: 日次レポート保存 (Daily Reporter)
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:GetObject"
+        ]
+        Resource = [
+          "arn:aws:s3:::${local.name_prefix}-daily-reports-${local.account_id}",
+          "arn:aws:s3:::${local.name_prefix}-daily-reports-${local.account_id}/*"
         ]
       }
     ]

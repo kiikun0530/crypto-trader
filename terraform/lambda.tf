@@ -16,7 +16,8 @@ resource "aws_cloudwatch_log_group" "lambda" {
     "position-monitor",
     "news-collector",
     "market-context",
-    "warm-up"
+    "warm-up",
+    "daily-reporter"
   ])
 
   name              = "/aws/lambda/${local.name_prefix}-${each.key}"
@@ -110,6 +111,12 @@ locals {
       memory      = 512
       handler     = "handler.handler"
     }
+    daily-reporter = {
+      description = "日次レポート生成 + 自動改善トリガー (23:00 JST)"
+      timeout     = 120
+      memory      = 512
+      handler     = "handler.handler"
+    }
   }
 
   lambda_environment = {
@@ -130,6 +137,10 @@ locals {
     TRADING_PAIRS_CONFIG   = trimspace(var.trading_pairs_config)
     MODEL_BUCKET           = "${local.name_prefix}-sagemaker-models-${local.account_id}"
     MODEL_PREFIX           = "chronos-onnx"
+    IMPROVEMENTS_TABLE     = aws_dynamodb_table.improvements.name
+    REPORT_BUCKET          = "${local.name_prefix}-daily-reports-${local.account_id}"
+    GITHUB_TOKEN_SECRET_ARN = "arn:aws:secretsmanager:${var.aws_region}:${local.account_id}:secret:github/auto-fix-token"
+    GITHUB_REPO            = var.github_repo
   }
 }
 

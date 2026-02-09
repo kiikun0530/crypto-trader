@@ -256,6 +256,7 @@ SELL_threshold = BASE_SELL_THRESHOLD(-0.15) × vol_ratio
 | `eth-trading-position-monitor` | SL/TP/トレーリング (5分間隔) | 2026-02-09 | - |
 | `eth-trading-market-context` | F&G/Funding/BTC Dom収集 (30分間隔) | 2026-02-10 | ~300 |
 | `eth-trading-error-remediator` | エラー検知→Slack→自動修復 | - | - |
+| `eth-trading-daily-reporter` | 日次レポート→自動改善トリガー (23:00 JST) | 2026-02-10 | ~660 |
 
 ### AWS環境
 
@@ -333,7 +334,8 @@ Compress-Archive -Path "services/chronos-caller/*" -DestinationPath "chronos.zip
 
 | アイデア | 優先度 | 前提条件 |
 |----------|--------|---------|
-| Market Context第4の柱 | 中 | Phase 3効果検証 |
+| ~~Market Context第4の柱~~ | ~~中~~ | ✅ Phase 3で実装済 |
+| ~~自動改善パイプライン~~ | ~~高~~ | ✅ Phase 4で実装済 |
 | VOL_CLAMP_MIN 微調整 (0.67→?) | 中 | 修正後データ蓄積 |
 | サーキットブレーカー ON | 中 | 連敗パターン分析 |
 | トレーリングストップ段階追加 | 中 | 利確パターン分析 |
@@ -347,6 +349,8 @@ Compress-Archive -Path "services/chronos-caller/*" -DestinationPath "chronos.zip
 ## 📝 コミット履歴（全件）
 
 ```
+XXXXXXX feat: add self-improving pipeline (daily-reporter + auto-improve) Phase 4
+1647fe9 docs: update Phase 3 documentation
 8b5f2a4 feat: adjust thresholds for 4-component scoring (BUY 0.30→0.28, SELL -0.20→-0.15)
 72cf12f feat: add market-context 4th pillar (F&G + Funding + BTC Dom) (#20)
 aa138cf fix: NLP buy-the-dip context recognition

@@ -876,7 +876,8 @@ def save_trade(pair: str, timestamp: int, action: str, result: dict,
         'amount': Decimal(str(amount)),
         'rate': Decimal(str(rate)),
         'order_id': str(result.get('id', '')),
-        'fee_rate': Decimal(str(TAKER_FEE_RATE))
+        'fee_rate': Decimal(str(TAKER_FEE_RATE)),
+        'ttl': timestamp + (90 * 86400)  # 90日後に自動削除
     }
 
     # 分析コンテキストを保存（事後分析用）

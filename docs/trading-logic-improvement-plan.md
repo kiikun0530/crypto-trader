@@ -1,7 +1,7 @@
 # 取引ロジック改善企画書
 
 **作成日**: 2025-02-09
-**ステータス**: Phase 1 完了 → Phase 2 完了 → Phase 3 完了
+**ステータス**: Phase 1 完了 → Phase 2 完了 → Phase 3 完了 → Phase 4 完了
 
 ---
 
@@ -226,6 +226,31 @@
 - **修正**: バイグラム/フレーズマッチングを個別キーワードより先に処理し、使用済み単語をスキップ
 - **影響範囲**: `services/news-collector/handler.py`
 
+### 【Phase 4: Self-Improving Pipeline】
+
+#### 21. Daily Reporter Lambda ✅ 実装済
+- **目的**: 日次トレードデータの自動集計とパフォーマンスレポート生成
+- **実装**: EventBridge (23:00 JST) → daily-reporter Lambda
+  - 全通貨の24h/7d/30d取引履歴を集計
+  - シグナル統計（コンポーネント別near_zero率含む）
+  - S3にJSON保存 (90日ライフサイクル) + Slack通知
+- **影響範囲**: `services/daily-reporter/handler.py`(新規), Terraform (dynamodb, lambda, eventbridge, iam, s3)
+
+#### 22. Self-Improving Pipeline (Auto-Improve) ✅ 実装済
+- **目的**: AIが日次データを分析し、アルゴリズムを自動改善
+- **実装**: daily-reporter → `repository_dispatch` → `auto-improve.yml` GitHub Actions
+  - Claude Sonnet がレポート + ソースコードを分析
+  - NO_ACTION / PARAM_TUNE / CODE_CHANGE を判定
+  - PARAM_TUNE/CODE_CHANGE: search/replace でコード変更 → 構文チェック → デプロイ → docs更新 → git push
+  - DynamoDB `improvements` テーブルに改善記録 (TTL: 180日)
+- **安全ルール**: ウェイト±0.05/回、閾値±0.03/回、2週間以内の変更は効果測定のため抑止
+- **影響範囲**: `.github/workflows/auto-improve.yml`(新規), Terraform
+
+#### 23. Trades テーブル TTL 追加 ✅ 実装済
+- **目的**: 取引履歴の自動クリーンアップ
+- **修正**: trades テーブルに TTL (90日) を追加。order-executor の save_trade に `ttl` フィールド追加
+- **影響範囲**: `services/order-executor/handler.py`, `terraform/dynamodb.tf`
+
 ### Phase 2 実装ログ
 
 | 日付 | 項目 | コミット | 備考 |
@@ -243,3 +268,5 @@
 | 2026-02-10 | #17a NLP buy the dip | `aa138cf` | コンテキスト認識、使用済み単語スキップ |
 | 2026-02-10 | #20 Market Context | `72cf12f` | 第4の柱: F&G + Funding + BTC Dom, Tech=0.45/Chronos=0.25/Sent=0.15/Mkt=0.15 |
 | 2026-02-10 | #20a 閾値調整 | `8b5f2a4` | BUY 0.30→0.28, SELL -0.20→-0.15, 4成分圧縮補正 |
+| 2026-02-10 | docs Phase 3 | `1647fe9` | ドキュメント更新 |
+| 2026-02-10 | #21-23 Phase 4 | `pending` | daily-reporter + auto-improve + trades TTL |

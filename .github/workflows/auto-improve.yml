@@ -1,0 +1,703 @@
+name: Auto-Improve Trading Algorithm
+
+on:
+  repository_dispatch:
+    types: [daily-improvement]
+
+permissions:
+  contents: write
+  models: read
+
+env:
+  AWS_REGION: ap-northeast-1
+
+jobs:
+  auto-improve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_AUTO_FIX_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Extract report
+        id: report
+        run: |
+          cat << 'PAYLOAD_EOF' > /tmp/daily_report.json
+          ${{ toJson(github.event.client_payload.report) }}
+          PAYLOAD_EOF
+
+          REPORT_DATE=$(jq -r '.date' /tmp/daily_report.json)
+          TRADES_COUNT=$(jq -r '.trades.total' /tmp/daily_report.json)
+          WIN_RATE=$(jq -r '.trades.win_rate' /tmp/daily_report.json)
+          PNL=$(jq -r '.trades.total_pnl_jpy' /tmp/daily_report.json)
+
+          echo "report_date=${REPORT_DATE}" >> $GITHUB_OUTPUT
+          echo "=== Daily Report: ${REPORT_DATE} ==="
+          echo "Trades: ${TRADES_COUNT}, Win Rate: ${WIN_RATE}, PnL: ¥${PNL}"
+
+      - name: Read source code for analysis
+        run: |
+          # 分析に必要なソースコードを収集
+          echo "=== Collecting source files ==="
+
+          # aggregator (閾値・ウェイト)
+          cat services/aggregator/handler.py > /tmp/aggregator.py
+          echo "aggregator.py: $(wc -l < services/aggregator/handler.py) lines"
+
+          # technical (テクニカル指標)
+          cat services/technical/handler.py > /tmp/technical.py
+          echo "technical.py: $(wc -l < services/technical/handler.py) lines"
+
+          # chronos-caller (AI予測)
+          cat services/chronos-caller/handler.py > /tmp/chronos.py
+          echo "chronos.py: $(wc -l < services/chronos-caller/handler.py) lines"
+
+          # news-collector (センチメント)
+          cat services/news-collector/handler.py > /tmp/news.py
+          echo "news.py: $(wc -l < services/news-collector/handler.py) lines"
+
+          # market-context
+          cat services/market-context/handler.py > /tmp/market_ctx.py
+          echo "market_ctx.py: $(wc -l < services/market-context/handler.py) lines"
+
+          # position-monitor (SL/TP)
+          cat services/position-monitor/handler.py > /tmp/position.py
+          echo "position.py: $(wc -l < services/position-monitor/handler.py) lines"
+
+          # order-executor (注文・サーキットブレーカー)
+          cat services/order-executor/handler.py > /tmp/order.py
+          echo "order.py: $(wc -l < services/order-executor/handler.py) lines"
+
+          # ドキュメント
+          for doc in docs/*.md; do
+            cp "$doc" /tmp/doc_$(basename "$doc")
+          done
+          echo "Docs copied: $(ls /tmp/doc_*.md | wc -l) files"
+
+      - name: Analyze with Claude and decide
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python3 << 'CLAUDE_SCRIPT'
+          import json
+          import os
+          import urllib.request
+          import glob
+
+          # === レポート読み込み ===
+          with open('/tmp/daily_report.json', 'r') as f:
+              report = json.load(f)
+
+          # === ソースコード読み込み（主要部分のみ） ===
+          source_files = {}
+          for name in ['aggregator', 'technical', 'chronos', 'news', 'market_ctx',
+                       'position', 'order']:
+              path = f'/tmp/{name}.py'
+              if os.path.exists(path):
+                  with open(path, 'r') as f:
+                      content = f.read()
+                  # 4000文字に制限（Claude コンテキストを節約）
+                  source_files[name] = content[:8000]
+
+          # === ドキュメント読み込み ===
+          doc_files = {}
+          for path in sorted(glob.glob('/tmp/doc_*.md')):
+              name = os.path.basename(path).replace('doc_', '')
+              with open(path, 'r') as f:
+                  doc_files[name] = f.read()[:3000]
+
+          # === プロンプト構築 ===
+          report_json = json.dumps(report, indent=2, ensure_ascii=False)
+
+          source_summary = ""
+          for name, code in source_files.items():
+              source_summary += f"\n### {name}.py\n```python\n{code}\n```\n"
+
+          prompt = f"""あなたは暗号通貨トレーディングアルゴリズムの分析官兼エンジニアです。
+日次レポートを分析し、アルゴリズムの改善が必要かどうかを判断してください。
+
+## 日次レポート
+```json
+{report_json}
+```
+
+## 現在のソースコード（主要ファイル）
+{source_summary}
+
+## 判断基準
+
+### NO_ACTION（変更不要）の条件:
+- 市場全体が一方向に動いた日（全通貨下落時に損失は正常）
+- 日次トレード3件未満（統計的に無意味）
+- 7日ローリング勝率が25-55%の範囲（正常動作）
+- 個別損失の原因が市場急変（F&G急変動、突発ニュース）
+- 直近2週間以内に改善が適用されている場合は、効果測定のため変更を控える
+
+### PARAM_TUNE（パラメータ微調整）の条件:
+- 特定コンポーネントのnear_zero率が60%超（ウェイト削減候補）
+- 閾値近辺 (±0.02) のトレードが系統的に負ける
+- 7日ローリング勝率が20%未満で10件以上のサンプルがある
+- 30日ローリングで一貫したパターン（特定通貨ペアが常に負ける等）
+
+### CODE_CHANGE（ロジック変更）の条件:
+- 同一パターンの損失が3日以上連続（recent_improvements で確認）
+- 特定指標が一貫して逆方向を示す（ロジックバグの疑い）
+- 新たな市場パターンへの未対応が明確
+
+## 安全ルール（厳守）:
+1. ウェイト変更は1回あたり ±0.05 まで、4成分の合計が必ず1.0
+2. 閾値変更は1回あたり ±0.03 まで
+3. VOL_CLAMP_MIN は 0.50〜1.00 の範囲
+4. 既存の安全機構（最低保有時間、通貨分散制限、サーキットブレーカー）は削除禁止
+5. データが不十分な場合は必ず NO_ACTION
+6. import文の追加・削除は慎重に（Lambda環境では標準ライブラリのみ使用可能、boto3, jsonは可）
+7. 過去の改善で入れたロジックを安易に消さない
+
+## 出力フォーマット（厳密にJSON形式で）:
+
+---DECISION_START---
+{{
+  "decision": "NO_ACTION" | "PARAM_TUNE" | "CODE_CHANGE",
+  "confidence": 0.0-1.0,
+  "reasoning": "判断の根拠（日本語、200文字以内）",
+  "statistical_evidence": {{
+    "key_metric": "根拠となる主要指標",
+    "value": "指標の値",
+    "threshold": "判断基準の閾値"
+  }},
+  "proposed_changes": [
+    {{
+      "file": "services/aggregator/handler.py",
+      "description": "変更の説明",
+      "search": "変更前のコード（正確に一致する部分）",
+      "replace": "変更後のコード"
+    }}
+  ],
+  "doc_updates_needed": true | false,
+  "lambdas_to_deploy": ["aggregator"],
+  "commit_message": "improve: 変更の説明",
+  "slack_summary": "Slackに投稿する改善サマリー（日本語、100文字以内）",
+  "rollback_criteria": "3日以内に勝率がX%未満に低下した場合ロールバック",
+  "improvement_record": {{
+    "summary": "改善の要約",
+    "changes_applied": ["変更1", "変更2"]
+  }}
+}}
+---DECISION_END---
+
+NO_ACTION の場合は proposed_changes を空配列 []、lambdas_to_deploy を空配列 [] にしてください。
+"""
+
+          # === Claude API 呼び出し ===
+          api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+          if not api_key:
+              print("ERROR: No Anthropic API key")
+              # NO_ACTION をデフォルトとして書き出し
+              decision = {"decision": "NO_ACTION", "confidence": 0, "reasoning": "API key missing"}
+              with open('/tmp/decision.json', 'w') as f:
+                  json.dump(decision, f)
+              exit(0)
+
+          request_body = {
+              "model": "claude-sonnet-4-20250514",
+              "max_tokens": 8192,
+              "messages": [{"role": "user", "content": prompt}]
+          }
+          headers = {
+              "x-api-key": api_key,
+              "anthropic-version": "2023-06-01",
+              "content-type": "application/json"
+          }
+
+          req = urllib.request.Request(
+              "https://api.anthropic.com/v1/messages",
+              data=json.dumps(request_body).encode('utf-8'),
+              headers=headers,
+              method='POST'
+          )
+
+          try:
+              response = urllib.request.urlopen(req, timeout=300)
+              result = json.loads(response.read().decode('utf-8'))
+              content = result['content'][0]['text']
+              print("=== Claude Response ===")
+              print(content[:1000])
+
+              # Decision JSON 抽出
+              if '---DECISION_START---' in content and '---DECISION_END---' in content:
+                  decision_str = content.split('---DECISION_START---')[1].split('---DECISION_END---')[0].strip()
+                  # JSONブロック内のコードフェンスを除去
+                  if decision_str.startswith('```json'):
+                      decision_str = decision_str[7:]
+                  if decision_str.startswith('```'):
+                      decision_str = decision_str[3:]
+                  if decision_str.endswith('```'):
+                      decision_str = decision_str[:-3]
+                  decision_str = decision_str.strip()
+
+                  decision = json.loads(decision_str)
+                  with open('/tmp/decision.json', 'w') as f:
+                      json.dump(decision, f, indent=2, ensure_ascii=False)
+                  print(f"\nDecision: {decision['decision']}")
+                  print(f"Confidence: {decision.get('confidence', 0)}")
+                  print(f"Reasoning: {decision.get('reasoning', '')}")
+              else:
+                  print("ERROR: Could not extract decision from Claude response")
+                  decision = {"decision": "NO_ACTION", "confidence": 0,
+                              "reasoning": "Claude応答からDecisionを抽出できなかった"}
+                  with open('/tmp/decision.json', 'w') as f:
+                      json.dump(decision, f)
+
+          except Exception as e:
+              print(f"Claude API error: {e}")
+              decision = {"decision": "NO_ACTION", "confidence": 0,
+                          "reasoning": f"Claude API error: {str(e)[:200]}"}
+              with open('/tmp/decision.json', 'w') as f:
+                  json.dump(decision, f)
+
+          CLAUDE_SCRIPT
+
+      - name: Parse decision
+        id: decision
+        run: |
+          DECISION=$(jq -r '.decision' /tmp/decision.json)
+          CONFIDENCE=$(jq -r '.confidence' /tmp/decision.json)
+          REASONING=$(jq -r '.reasoning' /tmp/decision.json)
+          SLACK_SUMMARY=$(jq -r '.slack_summary // "N/A"' /tmp/decision.json)
+          COMMIT_MSG=$(jq -r '.commit_message // "improve: auto-improvement"' /tmp/decision.json)
+          DEPLOY_COUNT=$(jq '.lambdas_to_deploy | length' /tmp/decision.json)
+
+          echo "decision=${DECISION}" >> $GITHUB_OUTPUT
+          echo "confidence=${CONFIDENCE}" >> $GITHUB_OUTPUT
+          echo "deploy_count=${DEPLOY_COUNT}" >> $GITHUB_OUTPUT
+
+          echo "=== Decision ==="
+          echo "Decision: ${DECISION}"
+          echo "Confidence: ${CONFIDENCE}"
+          echo "Reasoning: ${REASONING}"
+          echo "Lambdas to deploy: ${DEPLOY_COUNT}"
+
+      - name: Apply code changes
+        if: steps.decision.outputs.decision != 'NO_ACTION' && steps.decision.outputs.deploy_count != '0'
+        run: |
+          python3 << 'APPLY_SCRIPT'
+          import json
+
+          with open('/tmp/decision.json', 'r') as f:
+              decision = json.load(f)
+
+          changes = decision.get('proposed_changes', [])
+          if not changes:
+              print("No changes to apply")
+              exit(0)
+
+          applied = 0
+          failed = 0
+
+          for change in changes:
+              filepath = change.get('file', '')
+              search = change.get('search', '')
+              replace = change.get('replace', '')
+              description = change.get('description', '')
+
+              if not filepath or not search:
+                  print(f"Skipping invalid change: {description}")
+                  failed += 1
+                  continue
+
+              try:
+                  with open(filepath, 'r') as f:
+                      content = f.read()
+
+                  if search not in content:
+                      print(f"WARNING: Search string not found in {filepath}")
+                      print(f"  Search: {search[:100]}...")
+                      failed += 1
+                      continue
+
+                  # 正確に1箇所だけ置換
+                  count = content.count(search)
+                  if count != 1:
+                      print(f"WARNING: Search string found {count} times in {filepath}, expected 1")
+                      failed += 1
+                      continue
+
+                  new_content = content.replace(search, replace, 1)
+                  with open(filepath, 'w') as f:
+                      f.write(new_content)
+
+                  print(f"✅ Applied: {filepath} - {description}")
+                  applied += 1
+
+              except Exception as e:
+                  print(f"❌ Failed: {filepath} - {e}")
+                  failed += 1
+
+          print(f"\nApplied: {applied}, Failed: {failed}")
+
+          if applied == 0 and len(changes) > 0:
+              print("ERROR: No changes were applied")
+              exit(1)
+
+          APPLY_SCRIPT
+
+      - name: Syntax check
+        if: steps.decision.outputs.decision != 'NO_ACTION' && steps.decision.outputs.deploy_count != '0'
+        run: |
+          python3 << 'SYNTAX_SCRIPT'
+          import json
+          import py_compile
+
+          with open('/tmp/decision.json', 'r') as f:
+              decision = json.load(f)
+
+          files = set()
+          for change in decision.get('proposed_changes', []):
+              f = change.get('file', '')
+              if f and f.endswith('.py'):
+                  files.add(f)
+
+          all_ok = True
+          for filepath in files:
+              try:
+                  py_compile.compile(filepath, doraise=True)
+                  print(f"✅ Syntax OK: {filepath}")
+              except py_compile.PyCompileError as e:
+                  print(f"❌ Syntax Error: {filepath} - {e}")
+                  all_ok = False
+
+          if not all_ok:
+              print("Syntax errors detected, aborting")
+              exit(1)
+
+          SYNTAX_SCRIPT
+
+      - name: Deploy Lambdas
+        if: steps.decision.outputs.decision != 'NO_ACTION' && steps.decision.outputs.deploy_count != '0'
+        run: |
+          python3 << 'DEPLOY_SCRIPT'
+          import json
+          import subprocess
+
+          with open('/tmp/decision.json', 'r') as f:
+              decision = json.load(f)
+
+          lambdas = decision.get('lambdas_to_deploy', [])
+          if not lambdas:
+              print("No lambdas to deploy")
+              exit(0)
+
+          deployed = 0
+          for name in lambdas:
+              service_dir = f"services/{name}"
+              lambda_name = f"eth-trading-{name}"
+              zip_path = f"/tmp/{name}.zip"
+
+              print(f"\n=== Deploying {lambda_name} ===")
+
+              # ZIP作成
+              result = subprocess.run(
+                  ['zip', '-r', '-j', zip_path, service_dir],
+                  capture_output=True, text=True
+              )
+              if result.returncode != 0:
+                  print(f"ZIP failed: {result.stderr}")
+                  continue
+
+              # デプロイ
+              result = subprocess.run(
+                  ['aws', 'lambda', 'update-function-code',
+                   '--function-name', lambda_name,
+                   '--zip-file', f'fileb://{zip_path}',
+                   '--output', 'json'],
+                  capture_output=True, text=True
+              )
+              if result.returncode != 0:
+                  print(f"Deploy failed: {result.stderr}")
+                  continue
+
+              print(f"✅ Deployed {lambda_name}")
+              deployed += 1
+
+          print(f"\nDeployed: {deployed}/{len(lambdas)}")
+          if deployed == 0 and len(lambdas) > 0:
+              exit(1)
+
+          DEPLOY_SCRIPT
+
+      - name: Update docs with Claude
+        if: steps.decision.outputs.decision != 'NO_ACTION' && steps.decision.outputs.deploy_count != '0'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python3 << 'DOCS_SCRIPT'
+          import json
+          import os
+          import urllib.request
+          import glob
+
+          with open('/tmp/decision.json', 'r') as f:
+              decision = json.load(f)
+
+          if not decision.get('doc_updates_needed', False):
+              print("No doc updates needed")
+              exit(0)
+
+          # 変更内容を収集
+          changes_desc = []
+          for c in decision.get('proposed_changes', []):
+              changes_desc.append(f"- {c.get('file', '')}: {c.get('description', '')}")
+          changes_text = '\n'.join(changes_desc)
+
+          commit_msg = decision.get('commit_message', '')
+          improvement = decision.get('improvement_record', {})
+
+          api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+          if not api_key:
+              print("No API key, skipping docs")
+              exit(0)
+
+          # 関連ドキュメントを特定
+          doc_paths = glob.glob('docs/*.md')
+          updated = 0
+
+          for doc_path in doc_paths:
+              with open(doc_path, 'r') as f:
+                  doc_content = f.read()
+
+              # 変更されたファイルに関連するドキュメントのみ更新
+              changed_files = [c.get('file', '') for c in decision.get('proposed_changes', [])]
+              relevant = False
+              for cf in changed_files:
+                  service_name = cf.split('/')[1] if '/' in cf else ''
+                  if service_name and (service_name in doc_content or
+                                        service_name.replace('-', '_') in doc_content):
+                      relevant = True
+                      break
+
+              if not relevant:
+                  continue
+
+              prompt = f"""以下のドキュメントを、コード変更に合わせて更新してください。
+
+## 変更内容
+{changes_text}
+
+## コミットメッセージ
+{commit_msg}
+
+## 改善の要約
+{json.dumps(improvement, ensure_ascii=False)}
+
+## 対象ドキュメント: {doc_path}
+```markdown
+{doc_content}
+```
+
+指示:
+- 変更に直接関係する箇所のみ修正
+- 修正が不要なら「NO_UPDATE_NEEDED」とだけ出力
+- 修正が必要な場合は修正後のドキュメント全体を以下のマーカーで囲んで出力:
+
+---DOC_START---
+（修正後のMarkdown全体）
+---DOC_END---
+"""
+
+              request_body = {
+                  "model": "claude-sonnet-4-20250514",
+                  "max_tokens": 16384,
+                  "messages": [{"role": "user", "content": prompt}]
+              }
+              headers = {
+                  "x-api-key": api_key,
+                  "anthropic-version": "2023-06-01",
+                  "content-type": "application/json"
+              }
+
+              try:
+                  req = urllib.request.Request(
+                      "https://api.anthropic.com/v1/messages",
+                      data=json.dumps(request_body).encode('utf-8'),
+                      headers=headers,
+                      method='POST'
+                  )
+                  response = urllib.request.urlopen(req, timeout=240)
+                  result = json.loads(response.read().decode('utf-8'))
+                  content = result['content'][0]['text']
+
+                  if 'NO_UPDATE_NEEDED' in content:
+                      print(f"  {doc_path}: No update needed")
+                  elif '---DOC_START---' in content and '---DOC_END---' in content:
+                      updated_doc = content.split('---DOC_START---')[1].split('---DOC_END---')[0].strip()
+                      if updated_doc.startswith('```markdown'):
+                          updated_doc = updated_doc[len('```markdown'):].strip()
+                      if updated_doc.startswith('```'):
+                          updated_doc = updated_doc[3:].strip()
+                      if updated_doc.endswith('```'):
+                          updated_doc = updated_doc[:-3].strip()
+
+                      with open(doc_path, 'w') as f:
+                          f.write(updated_doc + '\n')
+                      print(f"  ✅ {doc_path}: Updated")
+                      updated += 1
+                  else:
+                      print(f"  {doc_path}: Could not parse response")
+
+              except Exception as e:
+                  print(f"  {doc_path}: Error: {e}")
+
+          print(f"\nDocs updated: {updated}")
+          DOCS_SCRIPT
+
+      - name: Record improvement in DynamoDB
+        if: steps.decision.outputs.decision != 'NO_ACTION'
+        run: |
+          python3 << 'RECORD_SCRIPT'
+          import json
+          import boto3
+          import time
+
+          with open('/tmp/decision.json', 'r') as f:
+              decision = json.load(f)
+
+          dynamodb = boto3.resource('dynamodb', region_name='ap-northeast-1')
+          table = dynamodb.Table('eth-trading-improvements')
+
+          now = int(time.time())
+          ttl = now + (180 * 86400)  # 180日
+
+          improvement = decision.get('improvement_record', {})
+
+          item = {
+              'improvement_id': f"auto-{decision.get('decision', 'unknown').lower()}-{now}",
+              'timestamp': now,
+              'date': "${{ steps.report.outputs.report_date }}",
+              'decision': decision.get('decision', ''),
+              'confidence': str(decision.get('confidence', 0)),
+              'reasoning': decision.get('reasoning', ''),
+              'summary': improvement.get('summary', ''),
+              'changes_applied': improvement.get('changes_applied', []),
+              'lambdas_deployed': decision.get('lambdas_to_deploy', []),
+              'rollback_criteria': decision.get('rollback_criteria', ''),
+              'proposed_changes': json.dumps(decision.get('proposed_changes', []), ensure_ascii=False)[:2000],
+              'ttl': ttl
+          }
+
+          table.put_item(Item=item)
+          print(f"Improvement recorded: {item['improvement_id']}")
+          RECORD_SCRIPT
+
+      - name: Commit and push
+        if: steps.decision.outputs.decision != 'NO_ACTION' && steps.decision.outputs.deploy_count != '0'
+        run: |
+          COMMIT_MSG=$(jq -r '.commit_message // "improve: auto-improvement"' /tmp/decision.json)
+          REASONING=$(jq -r '.reasoning // ""' /tmp/decision.json)
+
+          git config user.name "auto-improve-bot"
+          git config user.email "auto-improve-bot@users.noreply.github.com"
+
+          git add -A
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+
+          git commit -m "${COMMIT_MSG} [bot]" -m "${REASONING}"
+          git push
+
+          echo "Changes pushed to main"
+
+      - name: Notify Slack (result)
+        if: always()
+        run: |
+          python3 << 'SLACK_SCRIPT'
+          import json
+          import urllib.request
+          import os
+
+          webhook_url = "${{ secrets.SLACK_WEBHOOK_URL }}"
+          if not webhook_url:
+              exit(0)
+
+          report_date = "${{ steps.report.outputs.report_date }}"
+          job_status = "${{ job.status }}"
+
+          try:
+              with open('/tmp/decision.json', 'r') as f:
+                  decision = json.load(f)
+          except:
+              decision = {"decision": "ERROR", "reasoning": "Decision file not found"}
+
+          d = decision.get('decision', 'ERROR')
+          confidence = decision.get('confidence', 0)
+          reasoning = decision.get('reasoning', 'N/A')
+          slack_summary = decision.get('slack_summary', 'N/A')
+          changes = decision.get('proposed_changes', [])
+          lambdas = decision.get('lambdas_to_deploy', [])
+          rollback = decision.get('rollback_criteria', 'N/A')
+
+          if d == 'NO_ACTION':
+              emoji = '🟢'
+              status = '変更不要'
+              color = '#36a64f'
+          elif d in ('PARAM_TUNE', 'CODE_CHANGE'):
+              if job_status == 'success':
+                  emoji = '🔧'
+                  status = f'{d} 適用完了'
+                  color = '#2196f3'
+              else:
+                  emoji = '❌'
+                  status = f'{d} 適用失敗'
+                  color = '#ff0000'
+          else:
+              emoji = '⚠️'
+              status = f'分析エラー ({job_status})'
+              color = '#ff9900'
+
+          changes_text = ""
+          if changes:
+              for c in changes[:3]:
+                  changes_text += f"\n  • {c.get('file','')}: {c.get('description','')}"
+
+          lambdas_text = ', '.join(lambdas) if lambdas else 'なし'
+
+          text = f"""{emoji} *Auto-Improve: {report_date}*
+
+*判定:* {status} (信頼度: {confidence:.0%})
+*根拠:* {reasoning}
+*要約:* {slack_summary}
+*変更:* {changes_text if changes_text else 'なし'}
+*デプロイ:* {lambdas_text}
+*ロールバック基準:* {rollback}"""
+
+          payload = {
+              "blocks": [
+                  {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+              ]
+          }
+
+          try:
+              req = urllib.request.Request(
+                  webhook_url,
+                  data=json.dumps(payload).encode('utf-8'),
+                  headers={'Content-Type': 'application/json'}
+              )
+              urllib.request.urlopen(req, timeout=10)
+          except Exception as e:
+              print(f"Slack failed: {e}")
+
+          SLACK_SCRIPT

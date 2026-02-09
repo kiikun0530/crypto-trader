@@ -29,6 +29,7 @@ flowchart LR
         EB_POSITION["5分間隔<br/>position-monitor"]
         EB_NEWS["30分間隔<br/>news-collection"]
         EB_MKTCTX["30分間隔<br/>market-context"]
+        EB_DAILY["毎日23:00 JST<br/>daily-reporter"]
     end
 
     subgraph Lambda["Lambda Functions (VPC外)"]
@@ -42,6 +43,7 @@ flowchart LR
         L_NEWS["news-collector<br/>ニュース収集"]
         L_MKTCTX["market-context<br/>市場環境収集"]
         L_REMEDIATE["error-remediator<br/>エラー自動修復"]
+        L_DAILY["daily-reporter<br/>日次レポート+自動改善"]
     end
 
     subgraph StepFunctions["Step Functions (Map State)"]
@@ -296,10 +298,29 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
                                                         └→ コード修正 → デプロイ → 検証
 ```
 
-- **CloudWatch Alarms (20個)**: 全10 Lambda × (Errors + Duration) で異常検知
-- **Subscription Filters (9個)**: warm-up以外の全Lambdaのエラーログを検知
+- **CloudWatch Alarms (24個)**: 全12 Lambda × (Errors + Duration) で異常検知
+- **Subscription Filters (11個)**: warm-up以外の全Lambdaのエラーログを検知
 - **error-remediator Lambda**: エラー検知 → Slack通知 + GitHub Actions トリガー（30分クールダウン付き）
-- **GitHub Actions**: Claude Sonnet によるエラー分析 → コード修正 → Terraform デプロイ → 検証 → 自動push
+- **GitHub Actions (auto-fix-errors.yml)**: Claude Sonnet によるエラー分析 → コード修正 → デプロイ → 自動push
+
+### 自動改善パイプライン (Phase 4)
+
+```
+EventBridge (23:00 JST) → daily-reporter Lambda
+                              ├→ S3にJSON日次レポート保存 (90日保持)
+                              ├→ Slackに日次サマリー通知
+                              └→ GitHub Actions (repository_dispatch)
+                                    └→ auto-improve.yml
+                                          └→ Claude AI がデータ分析
+                                                ├→ NO_ACTION: 変更不要
+                                                ├→ PARAM_TUNE: パラメータ微調整
+                                                └→ CODE_CHANGE: ロジック変更
+                                                      → 自動デプロイ → docs更新 → git push
+                                                      → DynamoDB improvements テーブルに記録
+```
+
+- **安全制約**: ウェイト±0.05/回、閾値±0.03/回、2週間以内の再変更抑止
+- **コスト**: ~$0.01/日 (Claude API + Lambda)
 
 ### DynamoDB
 
@@ -362,8 +383,8 @@ IAM ロールは最小権限原則で設計。各 Lambda は必要な DynamoDB �
 
 | 項目 | 月額 | 備考 |
 |---|---|---|
-| Lambda | ~$5.00 | 6通貨分析 + ONNX推論 + error-remediator含む |
-| DynamoDB | ~$0.35 | 7テーブル×6通貨分のR/W + クールダウン |
+| Lambda | ~$5.00 | 6通貨分析 + ONNX推論 + error-remediator + daily-reporter含む |
+| DynamoDB | ~$0.35 | 8テーブル×6通貨分のR/W + クールダウン + improvements |
 | Step Functions | ~$0.10 | Map State で遷移数増加 |
 | CloudWatch | ~$0.55 | ログ保存14日 + Metric Alarms 20個 + Subscription Filters |
 | Secrets Manager | ~$0.50 | Coincheck + GitHub PAT |

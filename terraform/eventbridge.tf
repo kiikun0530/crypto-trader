@@ -128,3 +128,29 @@ resource "aws_cloudwatch_event_target" "analysis_trigger" {
   arn       = aws_sfn_state_machine.analysis_workflow.arn
   role_arn  = aws_iam_role.eventbridge_execution.arn
 }
+
+# 日次レポート (毎日 23:00 JST = 14:00 UTC)
+resource "aws_cloudwatch_event_rule" "daily_reporter" {
+  name                = "${local.name_prefix}-daily-reporter"
+  description         = "Generate daily trading report at 23:00 JST"
+  schedule_expression = "cron(0 14 * * ? *)"
+  state               = "ENABLED"
+
+  tags = {
+    Name = "${local.name_prefix}-daily-reporter"
+  }
+}
+
+resource "aws_cloudwatch_event_target" "daily_reporter" {
+  rule      = aws_cloudwatch_event_rule.daily_reporter.name
+  target_id = "DailyReporterLambda"
+  arn       = aws_lambda_function.functions["daily-reporter"].arn
+}
+
+resource "aws_lambda_permission" "daily_reporter" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.functions["daily-reporter"].function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.daily_reporter.arn
+}

@@ -78,7 +78,7 @@ resource "aws_dynamodb_table" "positions" {
   }
 }
 
-# 取引履歴テーブル (TTLなし)
+# 取引履歴テーブル (TTL: 90日)
 resource "aws_dynamodb_table" "trades" {
   name         = "${local.name_prefix}-trades"
   billing_mode = "PAY_PER_REQUEST"
@@ -93,6 +93,11 @@ resource "aws_dynamodb_table" "trades" {
   attribute {
     name = "timestamp"
     type = "N"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
   }
 
   tags = {
@@ -168,5 +173,33 @@ resource "aws_dynamodb_table" "market_context" {
 
   tags = {
     Name = "${local.name_prefix}-market-context"
+  }
+}
+
+# 自動改善履歴テーブル (TTL: 180日)
+# Auto-Improveパイプラインの改善記録、ロールバック用
+resource "aws_dynamodb_table" "improvements" {
+  name         = "${local.name_prefix}-improvements"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "improvement_id"
+  range_key    = "timestamp"
+
+  attribute {
+    name = "improvement_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "timestamp"
+    type = "N"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = {
+    Name = "${local.name_prefix}-improvements"
   }
 }
