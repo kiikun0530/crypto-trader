@@ -66,4 +66,6 @@ terraform/*-output.json
 
 # Lambda deployment zips
 *.zip
-*.zip
+
+# Data analysis (local dumps & ad-hoc scripts)
+data/
