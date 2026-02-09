@@ -206,13 +206,13 @@ jobs:
           if use_anthropic:
               request_body = {
                   "model": model,
-                  "max_tokens": 8192,
+                  "max_tokens": 16384,
                   "messages": [{"role": "user", "content": prompt}]
               }
           else:
               request_body = {
                   "model": model,
-                  "max_tokens": 8192,
+                  "max_tokens": 16384,
                   "messages": [
                       {"role": "system", "content": "You are an expert AWS Lambda error fixer."},
                       {"role": "user", "content": prompt}
@@ -227,7 +227,7 @@ jobs:
           )
 
           try:
-              response = urllib.request.urlopen(req, timeout=120)
+              response = urllib.request.urlopen(req, timeout=240)
               result = json.loads(response.read().decode('utf-8'))
 
               if use_anthropic:
@@ -584,7 +584,7 @@ jobs:
 
               request_body = {
                   "model": "claude-sonnet-4-20250514",
-                  "max_tokens": 8192,
+                  "max_tokens": 16384,
                   "messages": [{"role": "user", "content": prompt}]
               }
               headers = {
@@ -600,7 +600,7 @@ jobs:
                       headers=headers,
                       method='POST'
                   )
-                  response = urllib.request.urlopen(req, timeout=120)
+                  response = urllib.request.urlopen(req, timeout=240)
                   result = json.loads(response.read().decode('utf-8'))
                   content = result['content'][0]['text']
 

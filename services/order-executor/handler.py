@@ -141,6 +141,7 @@ def process_order(order: dict):
     pair = order['pair']
     signal = order['signal']
     score = order['score']
+    analysis_context = order.get('analysis_context', {})
     currency = get_currency_from_pair(pair)
     name = get_currency_name(pair)
 
