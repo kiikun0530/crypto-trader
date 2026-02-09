@@ -44,6 +44,35 @@ def handler(event, context):
             stop_loss = float(position.get('stop_loss', entry_price * 0.95))
             take_profit = float(position.get('take_profit', entry_price * 1.10))
 
+            # ⚠️ entry_price 妥当性チェック
+            # fill取得バグで entry_price が桁違いに膨張した場合、即SL発動を防止
+            if entry_price > 0 and current_price > 0:
+                deviation = abs(entry_price - current_price) / current_price
+                if deviation > 0.5:  # 50%以上の乖離は異常
+                    print(f"⚠️ CRITICAL: {config['name']} entry_price ¥{entry_price:,.0f} "
+                          f"deviates {deviation*100:.1f}% from current ¥{current_price:,.0f}. "
+                          f"Skipping SL/TP check for this position.")
+                    # Slack通知（手動対応を促す）
+                    if SLACK_WEBHOOK_URL:
+                        try:
+                            alert_msg = (
+                                f"🚨 {config['name']} entry_price異常\n"
+                                f"entry: ¥{entry_price:,.0f}\n"
+                                f"current: ¥{current_price:,.0f}\n"
+                                f"乖離: {deviation*100:.1f}%\n"
+                                f"→ SL/TPチェックをスキップ（手動確認要）"
+                            )
+                            payload = {"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": alert_msg}}]}
+                            req = urllib.request.Request(
+                                SLACK_WEBHOOK_URL,
+                                data=json.dumps(payload).encode('utf-8'),
+                                headers={'Content-Type': 'application/json'}
+                            )
+                            urllib.request.urlopen(req, timeout=5)
+                        except Exception:
+                            pass
+                    continue
+
             result = {
                 'pair': coincheck_pair,
                 'name': config['name'],

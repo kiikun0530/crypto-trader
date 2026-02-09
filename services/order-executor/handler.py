@@ -10,8 +10,9 @@ SQSからシグナルを受信し、Coincheck APIで注文実行
 
 ⚠️ Coincheck成行注文の重要な仕様:
 - market_buy / market_sell のレスポンスは amount=None, rate=None
-- 約定データは非同期で /api/exchange/orders/transactions から取得
-- 約定は複数トランザクションに分割されることがある（limit=100必須）
+- 約定データは GET /api/exchange/orders/{id} (注文の詳細API) で取得
+- 補助: /api/exchange/orders/transactions は order_id フィルタ非対応
+  → レスポンスを order_id でPython側フィルタ必須
 - 各fundsの値は正負が混在するため abs() で処理する
 - 詳細: docs/bugfix-history.md
 
@@ -331,6 +332,32 @@ def execute_buy(pair: str, score: float):
             result['rate'] = estimated_rate
             print(f"Fill info unavailable, estimated: amount={estimated_amount}, rate={estimated_rate}")
 
+        # ⚠️ entry_price 妥当性チェック（ticker価格と比較）
+        # fill取得バグで entry_price が桁違いに膨張すると即SL発動→資金溶解
+        entry_rate = float(result.get('rate', 0))
+        if entry_rate > 0:
+            try:
+                ticker_price = get_current_price(pair)
+                if ticker_price > 0:
+                    deviation = abs(entry_rate - ticker_price) / ticker_price
+                    if deviation > 0.5:  # 50%以上の乖離は明らかに異常
+                        print(f"⚠️ CRITICAL: entry_price ¥{entry_rate:,.0f} deviates "
+                              f"{deviation*100:.1f}% from ticker ¥{ticker_price:,.0f}. "
+                              f"Using ticker price as fallback")
+                        send_notification(
+                            name,
+                            f"⚠️ {name}約定価格異常検知\n"
+                            f"取得値: ¥{entry_rate:,.0f}\n"
+                            f"Ticker: ¥{ticker_price:,.0f}\n"
+                            f"乖離: {deviation*100:.1f}%\n"
+                            f"→ Ticker価格で代替"
+                        )
+                        result['rate'] = ticker_price
+                        # 実際の購入数量も再計算
+                        result['amount'] = order_amount / ticker_price
+            except Exception as e:
+                print(f"Ticker sanity check failed: {e}")
+
         # ポジション保存
         save_position(pair, timestamp, 'long', result, order_amount)
 
@@ -501,6 +528,15 @@ def place_market_order(pair: str, side: str, amount_jpy: float = None, amount_cr
         return {'success': False, 'error': str(e)}
 
 
+def get_current_price(pair: str) -> float:
+    """Coincheck APIから現在の取引価格を取得（JPY）"""
+    url = f"https://coincheck.com/api/ticker?pair={pair}"
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=10) as response:
+        data = json.loads(response.read().decode())
+        return float(data['last'])
+
+
 def get_api_credentials() -> dict:
     """Secrets Managerからクレデンシャル取得"""
     if not COINCHECK_SECRET_ARN:
@@ -552,11 +588,16 @@ def call_coincheck_api(path: str, method: str, params: dict, creds: dict) -> dic
 def get_market_buy_fill(pair: str, order_id, currency: str, max_retries: int = 3) -> tuple:
     """
     成行買いの約定情報を取得
-    Coincheckの成行買いレスポンスはamount/rateがNoneのため、
-    約定後に取引履歴APIで実際の約定量・約定価格を取得する
-    
-    注意: 約定は複数のトランザクションに分割されることがあるため
-    ページネーションのlimit=100で十分なデータを取得する
+
+    ⚠️ 重要: Coincheck API の仕様
+    - GET /api/exchange/orders/transactions は order_id クエリパラメータ非対応
+      → レスポンスに全注文のトランザクションが混在する
+      → Python側で order_id フィルタ必須（フィルタなしだと全トランザクション合算で
+        entry_price が桁違いに膨張し、即座にSTOP_LOSS発動→資金溶解）
+
+    取得順序:
+    1. GET /api/exchange/orders/{id} (注文の詳細 — executed_amount/executed_market_buy_amount)
+    2. フォールバック: transactions API + order_id フィルタ
     """
     if not order_id:
         return None, None
@@ -568,23 +609,55 @@ def get_market_buy_fill(pair: str, order_id, currency: str, max_retries: int = 3
     for attempt in range(max_retries):
         time.sleep(2 * (attempt + 1))  # 2秒, 4秒, 6秒待機
         try:
-            # 注文のトランザクション（約定履歴）を取得
-            # limit=100で十分（1注文で100分割はほぼない）
+            # === 方法1: 注文の詳細API (最も信頼性が高い) ===
+            order_detail = call_coincheck_api(
+                f'/api/exchange/orders/{order_id}',
+                'GET', None, creds
+            )
+
+            if order_detail and order_detail.get('success'):
+                executed_amount = float(order_detail.get('executed_amount') or 0)
+                executed_jpy = float(order_detail.get('executed_market_buy_amount') or 0)
+
+                if executed_amount > 0 and executed_jpy > 0:
+                    avg_rate = executed_jpy / executed_amount
+                    print(f"Fill data from order detail API (attempt {attempt+1}): "
+                          f"amount={executed_amount}, rate={avg_rate:.2f}, "
+                          f"jpy={executed_jpy:.0f}, status={order_detail.get('status')}")
+                    return executed_amount, avg_rate
+                else:
+                    print(f"Order detail API: order not yet filled "
+                          f"(executed_amount={executed_amount}, status={order_detail.get('status')})")
+
+            # === 方法2: トランザクションAPI + order_id フィルタ ===
             result = call_coincheck_api(
-                f'/api/exchange/orders/transactions?order_id={order_id}&limit=100',
+                '/api/exchange/orders/transactions',
                 'GET', None, creds
             )
 
             if result and result.get('success') and result.get('transactions'):
-                transactions = result['transactions']
+                # ⚠️ CRITICAL: order_id でフィルタ必須
+                # この API は order_id クエリパラメータ非対応のため、
+                # フィルタしないと全注文のトランザクションが合算されて
+                # entry_price が桁違いに膨張する
+                transactions = [
+                    t for t in result['transactions']
+                    if str(t.get('order_id')) == str(order_id)
+                ]
+
+                if not transactions:
+                    print(f"No transactions found for order_id={order_id} "
+                          f"(total transactions returned: {len(result['transactions'])})")
+                    continue
+
                 total_amount = sum(abs(float(t.get('funds', {}).get(currency, 0))) for t in transactions)
                 total_jpy = sum(abs(float(t.get('funds', {}).get('jpy', 0))) for t in transactions)
 
                 if total_amount > 0:
                     avg_rate = total_jpy / total_amount
-                    print(f"Fill data retrieved (attempt {attempt+1}): "
+                    print(f"Fill data from transactions API (attempt {attempt+1}): "
                           f"amount={total_amount}, rate={avg_rate:.2f}, "
-                          f"txn_count={len(transactions)}")
+                          f"txn_count={len(transactions)} (filtered from {len(result['transactions'])})")
                     return total_amount, avg_rate
 
             print(f"Fill data not ready yet (attempt {attempt+1})")
@@ -600,6 +673,9 @@ def get_market_sell_fill(pair: str, order_id, currency: str, max_retries: int = 
     成行売りの約定情報を取得
     Coincheckの成行売りレスポンスもrateがNoneになることがあるため、
     約定後に取引履歴APIで実際の約定価格を取得する
+
+    ⚠️ transactions API は order_id クエリパラメータ非対応
+    → Python側で order_id フィルタ必須
     """
     if not order_id:
         return None, None
@@ -611,20 +687,50 @@ def get_market_sell_fill(pair: str, order_id, currency: str, max_retries: int = 
     for attempt in range(max_retries):
         time.sleep(2 * (attempt + 1))  # 2秒, 4秒, 6秒待機
         try:
+            # === 方法1: 注文の詳細API ===
+            order_detail = call_coincheck_api(
+                f'/api/exchange/orders/{order_id}',
+                'GET', None, creds
+            )
+
+            if order_detail and order_detail.get('success'):
+                executed_amount = float(order_detail.get('executed_amount') or 0)
+                # 成行売りの場合、rateから平均約定価格を推定
+                # executed_market_buy_amount は買い専用なので、売りではrateを使う
+                rate = order_detail.get('rate')
+                if executed_amount > 0 and rate:
+                    avg_rate = float(rate)
+                    print(f"Sell fill from order detail API (attempt {attempt+1}): "
+                          f"amount={executed_amount}, rate={avg_rate:.2f}, "
+                          f"status={order_detail.get('status')}")
+                    return executed_amount, avg_rate
+
+            # === 方法2: トランザクションAPI + order_id フィルタ ===
             result = call_coincheck_api(
-                f'/api/exchange/orders/transactions?order_id={order_id}',
+                '/api/exchange/orders/transactions',
                 'GET', None, creds
             )
 
             if result and result.get('success') and result.get('transactions'):
-                transactions = result['transactions']
+                # ⚠️ CRITICAL: order_id でフィルタ必須
+                transactions = [
+                    t for t in result['transactions']
+                    if str(t.get('order_id')) == str(order_id)
+                ]
+
+                if not transactions:
+                    print(f"No sell transactions for order_id={order_id} "
+                          f"(total: {len(result['transactions'])})")
+                    continue
+
                 total_amount = sum(abs(float(t.get('funds', {}).get(currency, 0))) for t in transactions)
                 total_jpy = sum(abs(float(t.get('funds', {}).get('jpy', 0))) for t in transactions)
 
                 if total_amount > 0 and total_jpy > 0:
                     avg_rate = total_jpy / total_amount
-                    print(f"Sell fill data retrieved (attempt {attempt+1}): "
-                          f"amount={total_amount}, rate={avg_rate:.2f}, jpy={total_jpy:.0f}")
+                    print(f"Sell fill from transactions API (attempt {attempt+1}): "
+                          f"amount={total_amount}, rate={avg_rate:.2f}, "
+                          f"jpy={total_jpy:.0f}, txn_count={len(transactions)}")
                     return total_amount, avg_rate
 
             print(f"Sell fill data not ready yet (attempt {attempt+1})")
