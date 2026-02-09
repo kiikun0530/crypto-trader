@@ -8,6 +8,7 @@
 - SELL優先: 保有ポジションでSELL閾値以下があれば売り
 - BUY: 未保有通貨でBUY閾値超えがあれば買い（複数同時保有OK）
 - ボラティリティ適応型閾値（市場状況に応じて動的調整）
+- 最低保有時間: BUYから30分はシグナルSELLを無視（SL/TPは有効）
 """
 import json
 import os
@@ -44,6 +45,10 @@ BASELINE_BB_WIDTH = float(os.environ.get('BASELINE_BB_WIDTH', '0.03'))
 # ボラティリティ補正のクランプ範囲
 VOL_CLAMP_MIN = 0.5
 VOL_CLAMP_MAX = 2.0
+
+# 最低保有時間（秒）: BUYから一定時間はシグナルSELLを無視（SL/TPは有効）
+# BUY→即SELL往復ビンタ防止
+MIN_HOLD_SECONDS = int(os.environ.get('MIN_HOLD_SECONDS', '1800'))  # デフォルト30分
 
 
 def handler(event, context):
@@ -238,10 +243,16 @@ def decide_action(scored_pairs: list, active_positions: list,
         held_coincheck_pairs = {p['pair'] for p in active_positions}
 
     # --- SELL判定（優先） ---
+    # ⚠️ 最低保有時間ルール: BUYからMIN_HOLD_SECONDS以内のポジションは
+    #    シグナルSELLを無視（SL/TPはposition-monitorが別途処理するため安全）
+    now = int(time.time())
     if active_positions:
         sell_candidates = []
+        hold_skipped = []
         for position in active_positions:
             position_pair = position['pair']
+            entry_time = int(position.get('entry_time', 0))
+            hold_elapsed = now - entry_time if entry_time else 999999
 
             analysis_pair = None
             for pair, config in TRADING_PAIRS.items():
@@ -252,7 +263,14 @@ def decide_action(scored_pairs: list, active_positions: list,
             if analysis_pair:
                 pair_data = next((s for s in scored_pairs if s['pair'] == analysis_pair), None)
                 if pair_data and pair_data['total_score'] <= sell_threshold:
-                    sell_candidates.append((position_pair, pair_data['total_score']))
+                    if hold_elapsed < MIN_HOLD_SECONDS:
+                        remaining = MIN_HOLD_SECONDS - hold_elapsed
+                        hold_skipped.append((position_pair, pair_data['total_score'], remaining))
+                        print(f"SELL skipped for {position_pair}: score={pair_data['total_score']:.4f} "
+                              f"but hold period active (elapsed={hold_elapsed}s, "
+                              f"remaining={remaining}s / {remaining/60:.0f}min)")
+                    else:
+                        sell_candidates.append((position_pair, pair_data['total_score']))
 
         if sell_candidates:
             sell_candidates.sort(key=lambda x: x[1])
@@ -260,6 +278,10 @@ def decide_action(scored_pairs: list, active_positions: list,
             print(f"SELL signal for {target_pair}: score={target_score:.4f} "
                   f"(threshold: {sell_threshold:.3f})")
             return 'SELL', target_pair, target_score
+
+        if hold_skipped:
+            pairs_text = ', '.join(f"{p}(残{r//60}分)" for p, _, r in hold_skipped)
+            print(f"SELL suppressed by hold period: {pairs_text}")
 
     # --- BUY判定（未保有の通貨から最高スコアを選定） ---
     for candidate in scored_pairs:
@@ -425,6 +447,16 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
                 except Exception as e:
                     print(f"Failed to get current price for {pos_pair}: {e}")
 
+                # 保有時間と最低保有期間ステータス
+                entry_time = int(pos.get('entry_time', 0))
+                hold_elapsed = int(time.time()) - entry_time if entry_time else 0
+                hold_min = hold_elapsed // 60
+                if hold_elapsed < MIN_HOLD_SECONDS:
+                    remaining_min = (MIN_HOLD_SECONDS - hold_elapsed) // 60
+                    hold_status = f" | 🔒 保有{hold_min}分 (あと{remaining_min}分)"
+                else:
+                    hold_status = f" | 保有{hold_min}分"
+
                 if entry_price > 0 and current_price > 0:
                     pnl = (current_price - entry_price) * amount
                     pnl_pct = (current_price - entry_price) / entry_price * 100
@@ -433,11 +465,11 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
                     position_lines.append(
                         f"{pnl_emoji} *{pos_name}* (`{pos_pair}`)\n"
                         f"    参入: ¥{entry_price:,.0f} → 現在: ¥{current_price:,.0f} | "
-                        f"P/L: `¥{pnl:+,.0f}` (`{pnl_pct:+.2f}%`)"
+                        f"P/L: `¥{pnl:+,.0f}` (`{pnl_pct:+.2f}%`){hold_status}"
                     )
                 else:
                     position_lines.append(
-                        f"📍 *{pos_name}* (`{pos_pair}`) 参入: ¥{entry_price:,.0f}"
+                        f"📍 *{pos_name}* (`{pos_pair}`) 参入: ¥{entry_price:,.0f}{hold_status}"
                     )
 
             position_text = '\n'.join(position_lines)
