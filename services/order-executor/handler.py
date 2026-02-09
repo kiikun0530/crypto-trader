@@ -74,7 +74,7 @@ RESERVE_JPY = float(os.environ.get('RESERVE_JPY', '1000'))
 
 # サーキットブレーカー設定
 CIRCUIT_BREAKER_ENABLED = os.environ.get('CIRCUIT_BREAKER_ENABLED', 'false').lower() == 'true'
-CB_DAILY_LOSS_LIMIT_JPY = float(os.environ.get('CB_DAILY_LOSS_LIMIT_JPY', '50000'))   # 日次累計損失上限（絶対値）
+CB_DAILY_LOSS_LIMIT_JPY = float(os.environ.get('CB_DAILY_LOSS_LIMIT_JPY', '15000'))   # 日次累計損失上限（資金の約12%）
 CB_MAX_CONSECUTIVE_LOSSES = int(os.environ.get('CB_MAX_CONSECUTIVE_LOSSES', '5'))      # 連敗上限
 CB_COOLDOWN_HOURS = float(os.environ.get('CB_COOLDOWN_HOURS', '6'))                    # トリップ後の冷却時間
 
