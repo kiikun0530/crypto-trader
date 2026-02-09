@@ -93,7 +93,13 @@ def handler(event, context):
 
 
 def get_price_history(pair: str, limit: int = 60) -> list:
-    """価格履歴取得"""
+    """
+    価格履歴取得
+    
+    OHLC データがある場合は Typical Price = (High + Low + Close) / 3 を返す。
+    ローソク足の値動きの重心を使うことで、close のみより豊かな情報を Chronos に提供。
+    OHLC がない古いレコードは従来通り close にフォールバック。
+    """
     table = dynamodb.Table(PRICES_TABLE)
     response = table.query(
         KeyConditionExpression='pair = :pair',
@@ -102,7 +108,21 @@ def get_price_history(pair: str, limit: int = 60) -> list:
         Limit=limit
     )
     items = response.get('Items', [])
-    return [float(i['price']) for i in reversed(items)]
+    
+    prices = []
+    for item in reversed(items):
+        high = item.get('high')
+        low = item.get('low')
+        close = float(item['price'])
+        
+        if high is not None and low is not None:
+            # Typical Price = (H + L + C) / 3
+            typical = (float(high) + float(low) + close) / 3
+            prices.append(typical)
+        else:
+            prices.append(close)
+    
+    return prices
 
 
 # ==============================================================
