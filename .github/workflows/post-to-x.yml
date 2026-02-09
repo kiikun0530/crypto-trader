@@ -61,16 +61,16 @@ jobs:
           tweet = (
               f"crypto-trader更新: {commit_subject}\n"
               f"https://github.com/kiikun0530/crypto-trader\n"
-              f"#個人開発 #AWS #フリーランスエンジニア #暗号通貨自動売買"
+              f"#個人開発 #AWS #フリーランスエンジニア #自動売買"
           )
 
           # 280文字制限チェック
           if len(tweet) > 280:
-              max_subject = 280 - len("crypto-trader更新: \nhttps://github.com/kiikun0530/crypto-trader\n#個人開発 #AWS #フリーランスエンジニア")
+              max_subject = 280 - len("crypto-trader更新: \nhttps://github.com/kiikun0530/crypto-trader\n#個人開発 #AWS #フリーランスエンジニア #自動売買")
               tweet = (
                   f"crypto-trader更新: {commit_subject[:max_subject]}...\n"
                   f"https://github.com/kiikun0530/crypto-trader\n"
-                  f"#個人開発 #AWS #フリーランスエンジニア #暗号通貨自動売買"
+                  f"#個人開発 #AWS #フリーランスエンジニア #自動売買"
               )
 
           print(f"Tweet ({len(tweet)} chars):\n{tweet}")
