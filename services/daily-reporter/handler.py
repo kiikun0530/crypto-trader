@@ -93,8 +93,18 @@ def handler(event, context):
         # Slack通知
         send_slack_summary(report)
 
-        # GitHub Actions トリガー
-        trigger_auto_improve(report)
+        # GitHub Actions トリガー (データ品質ゲート)
+        dq = report.get('data_quality', {})
+        if dq.get('allow_improvement', False):
+            trigger_auto_improve(report)
+            trigger_status = 'triggered'
+        else:
+            skip_reasons = dq.get('skip_reasons', ['unknown'])
+            print(f"Auto-improve SKIPPED: {', '.join(skip_reasons)}")
+            print(f"  confidence_score={dq.get('confidence_score', 0)}, "
+                  f"7d_trades={dq.get('trades_7d_paired', 0)}, "
+                  f"ci_width={dq.get('win_rate_7d_ci', {}).get('width', 'N/A')}")
+            trigger_status = f'skipped({skip_reasons[0]})'
 
         return {
             'statusCode': 200,
@@ -102,7 +112,8 @@ def handler(event, context):
                 'date': today_jst,
                 'trades_24h': report['trades']['total'],
                 'signals_24h': report['signals']['total'],
-                's3_key': s3_key
+                's3_key': s3_key,
+                'auto_improve': trigger_status
             })
         }
 
@@ -226,13 +237,134 @@ def fetch_improvements(since_ts: int) -> list:
 # レポート生成
 # =============================================================================
 
+def build_data_quality(trades_24h, trades_7d, trades_30d, signals_24h,
+                      recent_improvements) -> dict:
+    """
+    データ品質を評価し、自動改善の可否を判定する。
+    コードレベルの強制ゲート — Claudeプロンプト任せにしない。
+    """
+    import math
+
+    paired_24h = pair_trades(trades_24h)
+    paired_7d = pair_trades(trades_7d)
+    paired_30d = pair_trades(trades_30d)
+
+    n_24h = len(paired_24h)
+    n_7d = len(paired_7d)
+    n_30d = len(paired_30d)
+    n_signals = len(signals_24h)
+
+    # --- ゲート1: 最低データ量 ---
+    MIN_TRADES_24H = 3   # 日次3件未満は統計的に無意味
+    MIN_TRADES_7D = 5    # 週次5件未満は傾向判断不可
+    has_enough_data = (n_7d >= MIN_TRADES_7D)
+
+    # --- ゲート2: 直近改善のクールダウン ---
+    # PARAM_TUNE/CODE_CHANGE が直近7日以内にあったら抑制
+    COOLDOWN_DAYS = 7
+    active_changes = [
+        imp for imp in recent_improvements
+        if str(imp.get('decision', '')) in ('PARAM_TUNE', 'CODE_CHANGE')
+    ]
+    days_since_last_change = None
+    if active_changes:
+        latest = max(active_changes, key=lambda x: int(float(x.get('timestamp', 0))))
+        days_since_last_change = round(
+            (int(time.time()) - int(float(latest.get('timestamp', 0)))) / 86400, 1
+        )
+    cooldown_ok = (days_since_last_change is None or days_since_last_change >= COOLDOWN_DAYS)
+
+    # --- ゲート3: 勝率の信頼区間 (Wilson score interval) ---
+    # n が小さいときは信頼区間が広すぎるので変更すべきでない
+    def wilson_interval(wins, total, z=1.96):
+        """95% Wilson score interval for binomial proportion"""
+        if total == 0:
+            return (0, 1.0, 1.0)  # (lower, upper, width)
+        p = wins / total
+        denom = 1 + z**2 / total
+        centre = (p + z**2 / (2 * total)) / denom
+        margin = z * math.sqrt((p * (1 - p) + z**2 / (4 * total)) / total) / denom
+        lower = max(0, centre - margin)
+        upper = min(1, centre + margin)
+        return (round(lower, 4), round(upper, 4), round(upper - lower, 4))
+
+    wins_7d = len([t for t in paired_7d if t['pnl'] > 0])
+    ci_lower, ci_upper, ci_width = wilson_interval(wins_7d, n_7d)
+
+    # 信頼区間が0.40以上なら「どちらとも言えない」→ 変更抑制
+    CI_WIDTH_THRESHOLD = 0.40
+    statistically_significant = (ci_width < CI_WIDTH_THRESHOLD)
+
+    # --- ゲート4: 全通貨同方向チェック (市場全体の動き) ---
+    pair_pnls = {}
+    for t in paired_24h:
+        pair = t.get('pair', 'unknown')
+        if pair not in pair_pnls:
+            pair_pnls[pair] = []
+        pair_pnls[pair].append(t['pnl'])
+    if pair_pnls:
+        pair_directions = [sum(pnls) > 0 for pnls in pair_pnls.values()]
+        all_same_direction = all(pair_directions) or not any(pair_directions)
+    else:
+        all_same_direction = False
+
+    # --- 総合判定 ---
+    # allow_improvement: 全ゲート通過時のみ True
+    skip_reasons = []
+    if not has_enough_data:
+        skip_reasons.append(f'insufficient_data(7d={n_7d}<{MIN_TRADES_7D})')
+    if not cooldown_ok:
+        skip_reasons.append(f'cooldown(last_change={days_since_last_change}d<{COOLDOWN_DAYS}d)')
+    if not statistically_significant:
+        skip_reasons.append(f'wide_ci(width={ci_width:.3f}>={CI_WIDTH_THRESHOLD})')
+    if all_same_direction and n_24h >= 2:
+        skip_reasons.append(f'market_wide_move({len(pair_pnls)}pairs_same_dir)')
+
+    allow_improvement = len(skip_reasons) == 0
+
+    # 信頼度スコア (0.0-1.0)
+    confidence_score = 0.0
+    if n_7d > 0:
+        data_factor = min(1.0, n_7d / 20)           # 20件で満点
+        ci_factor = max(0, 1.0 - ci_width / 0.5)    # CI幅が狭いほど高い
+        cooldown_factor = 1.0 if cooldown_ok else 0.3
+        market_factor = 0.5 if all_same_direction else 1.0
+        confidence_score = round(
+            data_factor * 0.35 + ci_factor * 0.35 + cooldown_factor * 0.15 + market_factor * 0.15,
+            3
+        )
+
+    return {
+        'allow_improvement': allow_improvement,
+        'confidence_score': confidence_score,
+        'skip_reasons': skip_reasons,
+        'trades_24h_paired': n_24h,
+        'trades_7d_paired': n_7d,
+        'trades_30d_paired': n_30d,
+        'signals_24h': n_signals,
+        'win_rate_7d': round(wins_7d / n_7d, 4) if n_7d > 0 else 0,
+        'win_rate_7d_ci': {'lower': ci_lower, 'upper': ci_upper, 'width': ci_width},
+        'days_since_last_change': days_since_last_change,
+        'all_same_direction': all_same_direction,
+        'thresholds': {
+            'min_trades_7d': MIN_TRADES_7D,
+            'cooldown_days': COOLDOWN_DAYS,
+            'ci_width_threshold': CI_WIDTH_THRESHOLD
+        }
+    }
+
+
 def build_report(date, timestamp, trades_24h, trades_7d, trades_30d,
                  signals_24h, active_positions, market_context,
                  recent_improvements) -> dict:
     """構造化レポートを生成"""
+    data_quality = build_data_quality(
+        trades_24h, trades_7d, trades_30d, signals_24h, recent_improvements
+    )
     return {
         'date': date,
         'timestamp': timestamp,
+        'data_quality': data_quality,
         'trades': build_trade_stats(trades_24h, trades_7d, trades_30d),
         'signals': build_signal_stats(signals_24h),
         'positions': build_position_stats(active_positions, timestamp),
@@ -584,6 +716,7 @@ def trigger_auto_improve(report: dict):
     compact_report = {
         'date': report['date'],
         'timestamp': report['timestamp'],
+        'data_quality': report.get('data_quality', {}),
         'trades': report['trades'],
         'signals': {
             'total': report['signals']['total'],

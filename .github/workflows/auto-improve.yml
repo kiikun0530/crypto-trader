@@ -50,7 +50,78 @@ jobs:
           echo "=== Daily Report: ${REPORT_DATE} ==="
           echo "Trades: ${TRADES_COUNT}, Win Rate: ${WIN_RATE}, PnL: ¥${PNL}"
 
+      - name: Pre-check data quality gate
+        id: precheck
+        run: |
+          # === コードレベルの強制ゲート (Claudeプロンプト任せにしない) ===
+          echo "=== Pre-Check: Data Quality Gate ==="
+
+          # data_quality フィールドを確認
+          ALLOW=$(jq -r '.data_quality.allow_improvement // true' /tmp/daily_report.json)
+          CONFIDENCE=$(jq -r '.data_quality.confidence_score // 0' /tmp/daily_report.json)
+          SKIP_REASONS=$(jq -r '.data_quality.skip_reasons // [] | join(", ")' /tmp/daily_report.json)
+          TRADES_7D=$(jq -r '.data_quality.trades_7d_paired // 0' /tmp/daily_report.json)
+          CI_WIDTH=$(jq -r '.data_quality.win_rate_7d_ci.width // 1.0' /tmp/daily_report.json)
+          DAYS_SINCE=$(jq -r '.data_quality.days_since_last_change // "none"' /tmp/daily_report.json)
+
+          echo "allow_improvement: ${ALLOW}"
+          echo "confidence_score: ${CONFIDENCE}"
+          echo "trades_7d: ${TRADES_7D}"
+          echo "ci_width: ${CI_WIDTH}"
+          echo "days_since_last_change: ${DAYS_SINCE}"
+          echo "skip_reasons: ${SKIP_REASONS}"
+
+          # === ハードコード2次チェック (daily-reporter通過後の二重防御) ===
+          HARD_SKIP="false"
+
+          # 7日間のトレード数が5未満 → 強制スキップ
+          if [ "$(echo "${TRADES_7D} < 5" | bc)" = "1" ]; then
+            echo "HARD SKIP: trades_7d=${TRADES_7D} < 5"
+            HARD_SKIP="true"
+          fi
+
+          # 直近変更から7日未満 → 強制スキップ (効果測定中)
+          if [ "${DAYS_SINCE}" != "none" ] && [ "${DAYS_SINCE}" != "null" ]; then
+            if [ "$(echo "${DAYS_SINCE} < 7" | bc)" = "1" ]; then
+              echo "HARD SKIP: days_since_last_change=${DAYS_SINCE} < 7"
+              HARD_SKIP="true"
+            fi
+          fi
+
+          # data_quality.allow_improvement == false → 強制スキップ
+          if [ "${ALLOW}" = "false" ]; then
+            echo "HARD SKIP: data_quality.allow_improvement=false (${SKIP_REASONS})"
+            HARD_SKIP="true"
+          fi
+
+          echo "hard_skip=${HARD_SKIP}" >> $GITHUB_OUTPUT
+          echo "confidence=${CONFIDENCE}" >> $GITHUB_OUTPUT
+          echo "skip_reasons=${SKIP_REASONS}" >> $GITHUB_OUTPUT
+
+          if [ "${HARD_SKIP}" = "true" ]; then
+            echo "❌ Data quality gate FAILED — skipping Claude analysis"
+            # NO_ACTION decision を直接書き出し (Claude API呼び出しを完全にスキップ)
+            cat > /tmp/decision.json << EOF
+          {
+            "decision": "NO_ACTION",
+            "confidence": 0,
+            "reasoning": "データ品質ゲート不通過: ${SKIP_REASONS:-insufficient data}",
+            "statistical_evidence": {"key_metric": "data_quality_gate", "value": "${TRADES_7D} trades / CI ${CI_WIDTH}", "threshold": "5 trades / CI < 0.40"},
+            "proposed_changes": [],
+            "doc_updates_needed": false,
+            "lambdas_to_deploy": [],
+            "commit_message": "",
+            "slack_summary": "データ不足のため分析スキップ (7d trades=${TRADES_7D})",
+            "rollback_criteria": "N/A",
+            "improvement_record": {"summary": "NO_ACTION: data quality gate", "changes_applied": []}
+          }
+          EOF
+          else
+            echo "✅ Data quality gate PASSED — proceeding to Claude analysis"
+          fi
+
       - name: Read source code for analysis
+        if: steps.precheck.outputs.hard_skip != 'true'
         run: |
           # 分析に必要なソースコードを収集
           echo "=== Collecting source files ==="
@@ -91,6 +162,7 @@ jobs:
 
       - name: Analyze with Claude and decide
         id: claude
+        if: steps.precheck.outputs.hard_skip != 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
@@ -140,22 +212,36 @@ jobs:
 ## 現在のソースコード（主要ファイル）
 {source_summary}
 
+## データ品質情報
+レポートの `data_quality` フィールドに統計的信頼性の情報があります:
+- `allow_improvement`: 全ゲート通過時のみ true（false なら必ず NO_ACTION）
+- `confidence_score`: 0.0-1.0 のデータ信頼度
+- `win_rate_7d_ci`: 勝率の95% Wilson信頼区間 (lower, upper, width)
+- `skip_reasons`: ゲート不通過の理由リスト
+
+この情報を参考に、confidence_score が 0.5 未満の場合は NO_ACTION を強く推奨。
+信頼区間が広い (width > 0.30) 場合、勝率の良し悪しの判断は統計的に不確実です。
+
 ## 判断基準
 
 ### NO_ACTION（変更不要）の条件:
-- 市場全体が一方向に動いた日（全通貨下落時に損失は正常）
+- `data_quality.allow_improvement` が false（データ品質ゲート不通過）
+- `data_quality.confidence_score` が 0.5 未満（信頼性が低い）
+- 市場全体が一方向に動いた日（全通貨下落時に損失は正常、`all_same_direction` 参照）
 - 日次トレード3件未満（統計的に無意味）
-- 7日ローリング勝率が25-55%の範囲（正常動作）
+- 7日ローリング勝率の信頼区間が広い（width > 0.30）で、勝率が25-55%の範囲内
 - 個別損失の原因が市場急変（F&G急変動、突発ニュース）
-- 直近2週間以内に改善が適用されている場合は、効果測定のため変更を控える
+- 直近7日以内に改善が適用されている場合は、効果測定のため変更を控える
 
 ### PARAM_TUNE（パラメータ微調整）の条件:
+- `data_quality.confidence_score` >= 0.5 であること（必須条件）
 - 特定コンポーネントのnear_zero率が60%超（ウェイト削減候補）
 - 閾値近辺 (±0.02) のトレードが系統的に負ける
-- 7日ローリング勝率が20%未満で10件以上のサンプルがある
+- 7日ローリング勝率の信頼区間上限が40%未満、かつ10件以上のサンプル
 - 30日ローリングで一貫したパターン（特定通貨ペアが常に負ける等）
 
 ### CODE_CHANGE（ロジック変更）の条件:
+- `data_quality.confidence_score` >= 0.6 であること（必須条件）
 - 同一パターンの損失が3日以上連続（recent_improvements で確認）
 - 特定指標が一貫して逆方向を示す（ロジックバグの疑い）
 - 新たな市場パターンへの未対応が明確
@@ -165,9 +251,11 @@ jobs:
 2. 閾値変更は1回あたり ±0.03 まで
 3. VOL_CLAMP_MIN は 0.50〜1.00 の範囲
 4. 既存の安全機構（最低保有時間、通貨分散制限、サーキットブレーカー）は削除禁止
-5. データが不十分な場合は必ず NO_ACTION
-6. import文の追加・削除は慎重に（Lambda環境では標準ライブラリのみ使用可能、boto3, jsonは可）
-7. 過去の改善で入れたロジックを安易に消さない
+5. データが不十分な場合は必ず NO_ACTION（`data_quality.allow_improvement` が false なら絶対に変更しない）
+6. `data_quality.confidence_score` が 0.5 未満なら NO_ACTION 以外を選んではいけない
+7. import文の追加・削除は慎重に（Lambda環境では標準ライブラリのみ使用可能、boto3, jsonは可）
+8. 過去の改善で入れたロジックを安易に消さない
+9. 勝率の信頼区間 (win_rate_7d_ci) が広い場合、勝率の数値を根拠にしてはいけない
 
 ## 出力フォーマット（厳密にJSON形式で）:
 
