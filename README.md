@@ -9,10 +9,12 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 - **対象通貨**: 6通貨（Binance + Coincheck 両対応の銘柄を厳選）
 - **価格データ**: Binance API（5分足 OHLC × 6通貨）
 - **取引執行**: Coincheck API（各通貨/JPY）
-- **テクニカル分析**: SMA20/200、RSI、MACD、ボリンジャーバンド
+- **テクニカル分析**: SMA20/200、RSI、MACD、ボリンジャーバンド、ADX、ATR
+- **レジーム検知**: ADXによるトレンド/レンジ判定、適応型ウェイト
 - **ニュースセンチメント**: CryptoPanic API（全通貨一括取得 + BTC相関分析）
 - **時系列予測**: Amazon Chronos-T5-Tiny（ONNX Runtime on Lambda）
 - **ポジション管理**: 複数通貨同時保有対応（SELL優先 → 未保有通貨をBUY）
+- **リスク管理**: SL/TP + トレーリングストップ + サーキットブレーカー
 - **通知**: Slack Webhook（全通貨ランキング付き）
 
 ## アーキテクチャ
@@ -22,6 +24,8 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
   - [docs/trading-strategy.md](docs/trading-strategy.md) — 売買戦略・スコアリング
   - [docs/lambda-reference.md](docs/lambda-reference.md) — Lambda関数リファレンス
   - [docs/bugfix-history.md](docs/bugfix-history.md) — バグ修正履歴・設計原則
+  - [docs/system-status-v1.md](docs/system-status-v1.md) — 現行システムステータス & 評価ベースライン
+  - [docs/trading-logic-improvement-plan.md](docs/trading-logic-improvement-plan.md) — 改善企画書 (10項目実装済)
 
 > GitHub上でMermaidダイアグラムがレンダリングされます
 
@@ -41,12 +45,12 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | 関数名 | 役割 | 実行間隔 |
 |--------|------|----------|
 | price-collector | 全6通貨の価格取得・変動検知 | 5分 |
-| technical | テクニカル指標計算（RSI, MACD, SMA, BB） | Step Functions (×6) |
+| technical | テクニカル指標計算（RSI, MACD, SMA, BB, ADX, ATR） | Step Functions (×6) |
 | chronos-caller | AI時系列予測 (ONNX Runtime, Chronos-T5-Tiny) | Step Functions (×6) |
 | sentiment-getter | 通貨別センチメントスコア取得 | Step Functions (×6) |
 | aggregator | 全通貨スコアリング・ランキング・売買判定 | Step Functions |
 | order-executor | Coincheckで成行注文実行（同一通貨重複防止） | SQSトリガー |
-| position-monitor | 全通貨のSL(-5%)/TP(+10%)監視 | 5分 |
+| position-monitor | 全通貨のSL(-5%)/TP(+10%)/トレーリングストップ監視 | 5分 |
 | news-collector | 全通貨ニュース一括取得・BTC相関分析 | 30分 |
 | error-remediator | Lambdaエラー検知→Slack通知→自動修復 | CloudWatch Logs |
 | warm-up | 全通貨の初回データ投入（手動） | - |
@@ -314,7 +318,10 @@ crypto-trader/
 ├── docs/
 │   ├── architecture.md     # システム構成・設計思想
 │   ├── trading-strategy.md # 売買戦略・スコアリング
-│   └── lambda-reference.md # Lambda関数リファレンス
+    ├── lambda-reference.md # Lambda関数リファレンス
+    ├── bugfix-history.md   # バグ修正履歴
+    ├── system-status-v1.md # 現行システムステータス & 評価ベースライン
+    └── trading-logic-improvement-plan.md  # 改善企画書
 └── README.md
 ```
 
