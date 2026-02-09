@@ -104,19 +104,49 @@ def calculate_rsi(prices: list, period: int = 14) -> float:
     return 100 - (100 / (1 + rs))
 
 def calculate_macd(prices: list, fast: int = 12, slow: int = 26, signal_period: int = 9) -> tuple:
-    """MACD計算"""
+    """MACD計算（EMA(9)シグナルライン）"""
     if len(prices) < slow:
         return 0.0, 0.0, 0.0
-    
-    ema_fast = calculate_ema(prices, fast)
-    ema_slow = calculate_ema(prices, slow)
-    macd_line = ema_fast - ema_slow
-    
-    # シグナルライン（簡易版：直近9日の平均）
-    signal_line = macd_line * 0.9  # 簡易計算
+
+    # 全期間のMACD系列を計算してEMA(9)シグナルラインを求める
+    macd_series = calculate_macd_series(prices, fast, slow)
+    macd_line = macd_series[-1]
+
+    # シグナルライン = MACD系列のEMA(signal_period)
+    if len(macd_series) >= signal_period:
+        signal_line = calculate_ema(macd_series, signal_period)
+    else:
+        signal_line = sum(macd_series) / len(macd_series)
+
     histogram = macd_line - signal_line
-    
     return macd_line, signal_line, histogram
+
+
+def calculate_macd_series(prices: list, fast: int = 12, slow: int = 26) -> list:
+    """全期間のMACD値リストを計算（シグナルラインEMA算出用）"""
+    if len(prices) < slow:
+        return [0.0]
+
+    multiplier_fast = 2 / (fast + 1)
+    multiplier_slow = 2 / (slow + 1)
+
+    # EMA初期値（SMA）
+    ema_fast = sum(prices[:fast]) / fast
+    ema_slow = sum(prices[:slow]) / slow
+
+    # slow期間のEMA_fastを先に進める
+    for price in prices[fast:slow]:
+        ema_fast = (price - ema_fast) * multiplier_fast + ema_fast
+
+    macd_series = [ema_fast - ema_slow]
+
+    # slow以降で両方のEMAを更新
+    for price in prices[slow:]:
+        ema_fast = (price - ema_fast) * multiplier_fast + ema_fast
+        ema_slow = (price - ema_slow) * multiplier_slow + ema_slow
+        macd_series.append(ema_fast - ema_slow)
+
+    return macd_series
 
 def calculate_ema(prices: list, period: int) -> float:
     """EMA計算"""
