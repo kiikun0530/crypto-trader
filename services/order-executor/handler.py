@@ -21,6 +21,11 @@ SQSからシグナルを受信し、Coincheck APIで注文実行
 - 注文成功後にDB保存で失敗→raise→再配信→二重注文のリスク
 - エラーはログ+Slack通知のみ、raiseしない設計
 - _just_bought_pairs: 同一バッチ内のBUY→即SELL防止
+
+🛑 サーキットブレーカー:
+- 日次累計損失 or 連敗回数が閾値超過でBUY停止（SELLは許可）
+- CIRCUIT_BREAKER_ENABLED 環境変数で ON/OFF切替
+- デフォルトOFF
 """
 import json
 import os
@@ -66,6 +71,12 @@ CURRENCY_ORDER_RULES = {
 
 # 予備資金（常に残しておく金額）
 RESERVE_JPY = float(os.environ.get('RESERVE_JPY', '1000'))
+
+# サーキットブレーカー設定
+CIRCUIT_BREAKER_ENABLED = os.environ.get('CIRCUIT_BREAKER_ENABLED', 'false').lower() == 'true'
+CB_DAILY_LOSS_LIMIT_JPY = float(os.environ.get('CB_DAILY_LOSS_LIMIT_JPY', '50000'))   # 日次累計損失上限（絶対値）
+CB_MAX_CONSECUTIVE_LOSSES = int(os.environ.get('CB_MAX_CONSECUTIVE_LOSSES', '5'))      # 連敗上限
+CB_COOLDOWN_HOURS = float(os.environ.get('CB_COOLDOWN_HOURS', '6'))                    # トリップ後の冷却時間
 
 # スコア閾値と投資比率（期待値連動）
 # 現実的なスコア分布: 典型 ±0.25、最大 ±0.55
@@ -141,6 +152,20 @@ def process_order(order: dict):
         if current_position and current_position.get('side') == 'long':
             print(f"Already have long position for {pair}")
             return
+
+        # サーキットブレーカーチェック（BUYのみブロック、SELLは常に許可）
+        if CIRCUIT_BREAKER_ENABLED:
+            tripped, reason = check_circuit_breaker()
+            if tripped:
+                print(f"Circuit breaker TRIPPED: {reason}")
+                send_notification(
+                    name,
+                    f"🛑 サーキットブレーカー発動\n"
+                    f"通貨: {name}\n"
+                    f"理由: {reason}\n"
+                    f"BUY注文をブロックしました"
+                )
+                return
 
         # 買い注文
         execute_buy(pair, score)
@@ -820,6 +845,100 @@ def save_trade(pair: str, timestamp: int, action: str, result: dict):
         'order_id': str(result.get('id', '')),
         'fee_rate': Decimal(str(TAKER_FEE_RATE))
     })
+
+
+def check_circuit_breaker() -> tuple:
+    """
+    サーキットブレーカー判定
+
+    2つの条件のいずれかでトリップ:
+    1. 日次累計損失が CB_DAILY_LOSS_LIMIT_JPY を超過
+    2. 直近の連敗回数が CB_MAX_CONSECUTIVE_LOSSES を超過
+
+    Returns:
+        (tripped: bool, reason: str)
+    """
+    try:
+        table = dynamodb.Table(POSITIONS_TABLE)
+        now = int(time.time())
+        today_start = now - 86400  # 24時間前
+
+        closed_positions = []
+
+        # 全通貨ペアのクローズ済みポジションを収集
+        for config in TRADING_PAIRS.values():
+            coincheck_pair = config['coincheck']
+            try:
+                response = table.query(
+                    KeyConditionExpression='pair = :pair',
+                    ExpressionAttributeValues={':pair': coincheck_pair}
+                )
+                items = response.get('Items', [])
+                for item in items:
+                    if item.get('closed') and item.get('exit_time') and item.get('exit_price'):
+                        exit_time = int(item.get('exit_time', 0))
+                        if exit_time > today_start:
+                            entry_price = float(item.get('entry_price', 0))
+                            exit_price = float(item.get('exit_price', 0))
+                            amount = float(item.get('amount', 0))
+                            pnl = (exit_price - entry_price) * amount
+                            closed_positions.append({
+                                'exit_time': exit_time,
+                                'pnl': pnl,
+                                'pair': coincheck_pair
+                            })
+            except Exception as e:
+                print(f"Circuit breaker: error querying {coincheck_pair}: {e}")
+
+        if not closed_positions:
+            return False, ""
+
+        # 時系列ソート（古い順）
+        closed_positions.sort(key=lambda x: x['exit_time'])
+
+        # --- 条件1: 日次累計損失チェック ---
+        daily_pnl = sum(p['pnl'] for p in closed_positions)
+        if daily_pnl < -CB_DAILY_LOSS_LIMIT_JPY:
+            return True, (
+                f"日次累計損失 ¥{daily_pnl:,.0f} が上限 -¥{CB_DAILY_LOSS_LIMIT_JPY:,.0f} を超過 "
+                f"(24h内 {len(closed_positions)}件)"
+            )
+
+        # --- 条件2: 連敗回数チェック ---
+        consecutive_losses = 0
+        for p in reversed(closed_positions):
+            if p['pnl'] < 0:
+                consecutive_losses += 1
+            else:
+                break
+
+        if consecutive_losses >= CB_MAX_CONSECUTIVE_LOSSES:
+            return True, (
+                f"連敗 {consecutive_losses}回 が上限 {CB_MAX_CONSECUTIVE_LOSSES}回 に到達"
+            )
+
+        # --- 冷却期間チェック ---
+        # 前回トリップ条件を満たした直後の再開を防ぐ
+        # (連敗がリセットされても、しばらくはBUYを自粛)
+        # → 冷却中かどうかは、最後の負け取引からの経過時間で判定
+        if consecutive_losses >= CB_MAX_CONSECUTIVE_LOSSES - 1:
+            last_loss_time = closed_positions[-1]['exit_time']
+            cooldown_sec = CB_COOLDOWN_HOURS * 3600
+            elapsed = now - last_loss_time
+            if elapsed < cooldown_sec:
+                remaining_min = (cooldown_sec - elapsed) / 60
+                return True, (
+                    f"冷却期間中 (連敗{consecutive_losses}回後、残り{remaining_min:.0f}分)"
+                )
+
+        print(f"Circuit breaker: OK (daily_pnl=¥{daily_pnl:,.0f}, "
+              f"consecutive_losses={consecutive_losses})")
+        return False, ""
+
+    except Exception as e:
+        print(f"Circuit breaker check failed: {e}")
+        # チェック失敗時は安全側に倒さない（取引継続）
+        return False, ""
 
 
 def send_notification(name: str, message: str):
