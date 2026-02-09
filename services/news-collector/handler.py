@@ -181,7 +181,6 @@ def analyze_sentiment_weighted(news: list) -> tuple:
 
     vote_reliable_count = 0
     vote_unreliable_count = 0
-    sentiment_field_count = 0
 
     for article in news:
         # 記事の新鮮さ
@@ -218,20 +217,13 @@ def analyze_sentiment_weighted(news: list) -> tuple:
             # 投票データ不足時はタイトルベースの簡易センチメント
             article_score = estimate_sentiment_from_title(article.get('title', ''))
 
-        # CryptoPanicのsentimentフィールド（v1互換）
-        sentiment = article.get('sentiment', '')
-        if sentiment:
-            sentiment_field_count += 1
-            if sentiment == 'bullish':
-                article_score = min(article_score + 0.15, 1.0)
-            elif sentiment == 'bearish':
-                article_score = max(article_score - 0.15, 0.0)
-
-        # panic_score があれば補助的に使用（v2）
+        # panic_score があれば補助的に使用
+        # API v2: panic_score は 0〜100 の整数（市場重要度/インパクト）
+        # ※ Growth Plan では panic_period パラメータ非対応のため通常 null
         panic_score = article.get('panic_score')
         if panic_score is not None and isinstance(panic_score, (int, float)):
-            # panic_score: 0=ネガティブ, 2=中立, 4=ポジティブ
-            panic_adjustment = (panic_score - 2) * 0.05  # ±0.10 の微調整
+            # 0-100スケール → 50を中立とし、±0.10 の微調整
+            panic_adjustment = (panic_score - 50) / 500  # 0→-0.10, 50→0, 100→+0.10
             article_score = max(0.0, min(1.0, article_score + panic_adjustment))
 
         weight = time_weight * currency_weight
@@ -246,8 +238,7 @@ def analyze_sentiment_weighted(news: list) -> tuple:
     stats = {
         'total_articles': len(news),
         'vote_reliable': vote_reliable_count,
-        'vote_unreliable': vote_unreliable_count,
-        'has_sentiment_field': sentiment_field_count
+        'vote_unreliable': vote_unreliable_count
     }
 
     return final_score, fresh_count, stats
