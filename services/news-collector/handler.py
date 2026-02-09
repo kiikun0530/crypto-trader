@@ -288,6 +288,12 @@ def estimate_sentiment_from_title(title: str) -> float:
         'price target': 0.15, 'buy signal': 0.15, 'strong support': 0.15,
         'higher high': 0.15, 'bullish divergence': 0.15,
         'network upgrade': 0.12, 'strategic reserve': 0.12,
+        # contextual bullish (bearish word in bullish context)
+        'buy the dip': 0.15, 'buying the dip': 0.15, 'bought the dip': 0.15,
+        'buys the dip': 0.15, 'accumulate on dip': 0.12,
+        'whales buy': 0.12, 'whales buying': 0.12, 'whale buying': 0.12,
+        'bottom is in': 0.15, 'found support': 0.12, 'holds support': 0.12,
+        'signs of recovery': 0.15, 'showing strength': 0.12,
     }
     bearish_phrases = {
         # strong (-0.25)
