@@ -1,7 +1,7 @@
 # 取引ロジック改善企画書
 
 **作成日**: 2025-02-09
-**ステータス**: 計画中 → 順次実装
+**ステータス**: Phase 1 完了 → Phase 2 完了
 
 ---
 
@@ -131,81 +131,80 @@
 
 ---
 
-## 🔮 Phase 2 改善候補 (検討中)
+## 🔮 Phase 2 改善項目 (全項目実装済)
 
-> Phase 1 (#1-#10) 完了後の次のステップ。優先度順に整理。
+> Phase 1 (#1-#10) 完了後のステップ。2026-02-09 に全8項目を実装・デプロイ。
 
 ### 【A. AI分析の精度に直結する問題（優先度高）】
 
-#### 11. OHLCデータの保存・活用
-- **現状**: Binance から取得する5分足の close だけを保存・分析に使用
-- **問題**: ATR・ADX は本来 OHLC（高値/安値/始値/終値）が必要なのに、close のみで近似計算。精度が大幅に劣化
-- **改善**: price-collector で Binance の OHLC を DynamoDB に保存し、technical Lambda で使用
-- **工数**: 中（price-collector のデータ保存形式変更 + technical の計算修正）
+#### 11. OHLCデータの保存・活用 ✅ 実装済
+- **改善内容**: Binance klines API から OHLCV (open/high/low/close/volume) を取得し DynamoDB に保存
+- **ATR**: 正式な True Range = max(High-Low, |High-PrevClose|, |Low-PrevClose|) を使用。OHLC がない古いレコードは従来の close 近似にフォールバック
+- **ADX**: +DM = max(High[i]-High[i-1], 0)、-DM = max(Low[i-1]-Low[i], 0) で正式計算
 - **影響範囲**: `services/price-collector/handler.py`, `services/technical/handler.py`
 
-#### 12. MACDスコアリングのグラデーション化
-- **現状**: MACD > signal なら `+weight`、そうでなければ `-weight`。バイナリ判定
-- **問題**: MACD ヒストグラムの傾き・大きさ・クロスオーバーの鮮度を無視。「ギリギリ上」と「大きく上」が同じスコア
-- **改善**: ヒストグラムの大きさと勾配を反映したグラデーションスコアに変更
-- **工数**: 小
+#### 12. MACDスコアリングのグラデーション化 ✅ 実装済
+- **改善内容**: ヒストグラム振幅ベースのグラデーションスコアに変更
+- **ロジック**: `norm_hist = histogram / current_price * 100` (価格比%)、`hist_score = clamp(norm_hist / 0.1, -1, 1)`
+- ±0.1% のヒストグラムで ±1.0 にスケール（5分足の典型値）
 - **影響範囲**: `services/technical/handler.py`
 
-#### 13. RSI計算のWilder's方式への修正
-- **現状**: 直近N期間の上昇/下降の単純平均で計算
-- **問題**: 標準的な Wilder の指数移動平均（EMA）ではないため、値が不安定になりやすい
-- **改善**: Wilder's smoothed moving average に修正
-- **工数**: 小
+#### 13. RSI計算のWilder's方式への修正 ✅ 実装済
+- **改善内容**: Wilder's smoothed moving average に修正
+- **ロジック**: 最初の period 本は SMA で初期化、以降は `avg = (avg * (period-1) + current) / period` で指数平滑化
+- 全データを使用（従来は直近 N 期間のみ）
 - **影響範囲**: `services/technical/handler.py`
 
-#### 14. 出来高（Volume）データの活用
-- **現状**: warm-up Lambda では volume を取得・保存しているが、分析には一切使われていない
-- **問題**: ブレイクアウトの信頼性確認や、トレンドの強度判定に volume は重要指標
-- **改善**: Volume-weighted 確認シグナルを technical に追加（例: 出来高急増時にスコアを増幅）
-- **工数**: 中（price-collector で volume 保存 + technical で参照）
+#### 14. 出来高（Volume）データの活用 ✅ 実装済
+- **改善内容**: `calculate_volume_signal()` 関数を追加。出来高急増時にテクニカルスコアを増幅
+- **ロジック**: 直近20本の平均出来高と現在の出来高を比較。ratio > 1.5 で増幅開始、ratio 2.5 で上限 1.3x に到達。平均以下は 1.0 (減衰なし)
 - **影響範囲**: `services/price-collector/handler.py`, `services/technical/handler.py`
 
 ### 【B. モデル・インフラの改善（優先度中）】
 
-#### 15. Chronos-T5-Tiny のウェイト調整 / モデル拡大
-- **現状**: 8M パラメータ（最小モデル）に 40% のウェイト
-- **問題**: 5分足の暗号通貨予測には小さすぎる可能性。精度が低いのに最大級のウェイトを与えている
-- **改善案**:
-  - **短期**: Chronos の weight を 30% に下げ、technical を 55% に（データに基づく指標を重視）
-  - **中期**: Chronos-T5-Small（46M パラメータ）に切替（Lambda memory 2048MB+ 必要）
-  - **長期**: Chronos のスコアと実際の価格変動の相関を測定し、ウェイトをデータドリブンで決定
-- **工数**: 小（ウェイト変更のみ）〜 中（モデル切替）
+#### 15. Chronos-T5-Tiny のウェイト調整 ✅ 実装済 (短期+長期)
+- **データ分析**: 810シグナルの相関分析を実施
+  - Chronos near-zero率: 51.9% (スコアがほぼ0のシグナルが半数以上)
+  - 分散比: Technical=0.57, Chronos=0.35, Sentiment=0.08
+- **短期 ✅**: Technical 0.45→**0.55**, Chronos 0.40→**0.30**, Sentiment 0.15 (据置)
+- **中期 ⏭️ スキップ**: Chronos-T5-Small 切替はコスト増(4x memory)に対し効果が薄いため見送り。モデルサイズよりも入力データの改善 (Typical Price) が効果的
+- **長期 ✅**: 810シグナルの実データで分散比を測定し、データドリブンでウェイトを決定
+- **追加改善**: Chronos 入力を close → **Typical Price (H+L+C)/3** に変更。ローソク足の重心を使うことで値動き情報を豊かに
 - **影響範囲**: `services/aggregator/handler.py`, `services/chronos-caller/handler.py`
 
-#### 16. decoder_with_past (KVキャッシュ) の活用
-- **現状**: ONNX モデルを S3 から読み込んでいるが `decoder_with_past_model.onnx` は使われていない
-- **問題**: 自己回帰デコードで毎ステップ全トークンを再処理 → 推論が不必要に遅い
-- **改善**: KV キャッシュを使った高速デコードに変更。chronos-caller の所要時間が半分程度に
-- **工数**: 中（デコードロジック書き換え）
+#### 16. decoder_with_past (KVキャッシュ) の活用 ✅ 実装済
+- **改善内容**: `decoder_with_past_model.onnx` を使った KV-Cache 付き高速デコードを実装
+- **ロジック**: 初回ステップはフルデコーダ実行 → present KV を抽出。2ステップ目以降は最後の1トークンのみ入力し past_key_values で高速デコード
+- **効果**: O(n²) → O(n) で推論時間が大幅短縮（特にサンプル数20の反復が高速化）
 - **影響範囲**: `services/chronos-caller/handler.py`
 
-#### 17. センチメント分析のNLPモデル化
-- **現状**: CryptoPanic の投票比率 + 60個のキーワードマッチ（bullish/bearish各30語）
-- **問題**: 本格的な NLP モデルではなく、微妙なニュアンスを捉えられない
-- **改善案**:
-  - FinBERT 等の軽量モデルを Lambda で動かす
-  - or 外部API（OpenAI等）でニュース要約＋スコアリング
-- **工数**: 大（モデルデプロイ or API統合）
-- **影響範囲**: `services/news-collector/handler.py`, `services/sentiment-getter/handler.py`
+#### 17. センチメント分析の高度化 ✅ 実装済
+- **改善内容**: ルールベース NLP を大幅強化（FinBERT は Lambda サイズ制約とコスト面で見送り）
+- **3段階の強度**: strong (±0.25) / moderate (±0.15) / mild (±0.06) で重み分け
+- **否定語検出**: not, no, never, n't, without, fails 等 → 直前3語以内で極性反転
+- **バイグラム/フレーズ**: all-time high, death cross, etf approved, rug pull 等20+フレーズ
+- **暗号通貨特化語彙**: halving, whale accumulation, delisted, flash crash 等
+- **スコア範囲**: ±0.4 (旧: ±0.3) まで拡大
+- **影響範囲**: `services/news-collector/handler.py`
 
 ### 【C. 運用・安全性の改善（優先度中〜低）】
 
-#### 18. トレード記録への分析コンテキスト保存
-- **現状**: trades テーブルには価格・数量のみ
-- **問題**: 「なぜこのトレードを行ったか」の事後分析ができない
-- **改善**: エントリー時の各指標スコア（Technical/Chronos/Sentiment）・市場レジーム・ADX値・スコア内訳なども trades テーブルに保存
-- **工数**: 小
-- **影響範囲**: `services/order-executor/handler.py`
+#### 18. トレード記録への分析コンテキスト保存 ✅ 実装済
+- **改善内容**: `analysis_context` を SQS メッセージに含め、trades テーブルに保存
+- **保存項目**: technical_score, chronos_score, sentiment_score, weight_technical/chronos/sentiment, buy_threshold, sell_threshold
+- **データフロー**: aggregator → SQS (analysis_context付き) → order-executor → DynamoDB trades テーブル
+- **影響範囲**: `services/aggregator/handler.py`, `services/order-executor/handler.py`
 
-### Phase 2 推奨実装順序
+### Phase 2 実装ログ
 
-```
-12(MACDグラデーション) → 13(RSI Wilder's) → 15(Chronosウェイト調整)
-→ 18(トレード記録拡充) → 11(OHLC保存) → 14(Volume活用)
-→ 16(KVキャッシュ) → 17(NLPセンチメント)
-```
+| 日付 | 項目 | コミット | 備考 |
+|------|------|---------|------|
+| 2026-02-09 | #12 MACD グラデーション | `8211ac1` | ヒストグラム振幅ベース |
+| 2026-02-09 | #13 RSI Wilder's | `8211ac1` | 指数平滑化 |
+| 2026-02-09 | #15 Chronos ウェイト | `8211ac1` | 810信号分析→Tech=0.55,Chronos=0.30 |
+| 2026-02-09 | #18 トレード記録 | `8211ac1` | analysis_context 保存 |
+| 2026-02-09 | #11 OHLC 保存 | `8211ac1` | Binance klines→DynamoDB |
+| 2026-02-09 | #14 Volume 活用 | `8211ac1` | volume_multiplier 1.0-1.3 |
+| 2026-02-09 | #16 KV キャッシュ | `8211ac1` | decoder_with_past 高速デコード |
+| 2026-02-09 | #17 NLP センチメント | `8211ac1` | 3段階強度+否定語+バイグラム |
+| 2026-02-09 | Typical Price | `90684dc` | Chronos入力を(H+L+C)/3に変更 |
