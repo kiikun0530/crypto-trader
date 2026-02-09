@@ -37,20 +37,46 @@ def handler(event, context):
         # 各指標計算
         close_prices = [p['price'] for p in prices]
         
+        # OHLC データ抽出（存在する場合のみ — 古いレコードにはcloseのみ）
+        has_ohlc = all('high' in p and 'low' in p for p in prices[-50:])
+        if has_ohlc:
+            highs = [p.get('high', p['price']) for p in prices]
+            lows = [p.get('low', p['price']) for p in prices]
+            opens = [p.get('open', p['price']) for p in prices]
+        else:
+            highs = None
+            lows = None
+            opens = None
+        
+        # Volume データ抽出（存在する場合のみ）
+        volumes = [p.get('volume', 0) for p in prices]
+        has_volume = any(v > 0 for v in volumes[-20:])
+        
         rsi = calculate_rsi(close_prices, 14)
         macd, signal, histogram = calculate_macd(close_prices)
         sma_20 = calculate_sma(close_prices, 20)
         sma_200 = calculate_sma(close_prices, 200) if len(close_prices) >= 200 else None
         bb_upper, bb_lower = calculate_bollinger_bands(close_prices, 20, 2)
-        adx = calculate_adx(close_prices, 14)
-        atr = calculate_atr(close_prices, 14)
+        
+        # ADX/ATR: OHLC があれば正確な計算、なければ close-only 近似
+        adx = calculate_adx(close_prices, 14, highs=highs, lows=lows)
+        atr = calculate_atr(close_prices, 14, highs=highs, lows=lows)
         
         # レジーム検知: ADXでトレンド強度判定
         # ADX > 25: トレンド相場, ADX < 20: レンジ相場
         regime = 'trending' if adx > 25 else ('ranging' if adx < 20 else 'neutral')
         
+        # Volume 確認シグナル（出来高急増でスコア増幅）
+        volume_multiplier = 1.0
+        if has_volume and len(volumes) >= 20:
+            volume_multiplier = calculate_volume_signal(volumes)
+        
         # スコア計算（-1 to 1）- レジーム適応型
         score = calculate_score(close_prices[-1], rsi, macd, signal, sma_20, sma_200, bb_upper, bb_lower, regime)
+        
+        # Volume による確認: 出来高増加時にスコアの方向性を強化
+        if volume_multiplier > 1.0:
+            score = max(-1, min(1, score * volume_multiplier))
         
         indicators = {
             'rsi': round(rsi, 2),
@@ -65,7 +91,9 @@ def handler(event, context):
             'atr_percent': round(atr / close_prices[-1] * 100, 3) if close_prices[-1] > 0 else 0,
             'regime': regime,
             'current_price': close_prices[-1],
-            'data_count': len(prices)
+            'data_count': len(prices),
+            'has_ohlc': has_ohlc,
+            'volume_multiplier': round(volume_multiplier, 3)
         }
         
         if sma_200:
@@ -89,7 +117,7 @@ def handler(event, context):
         }
 
 def get_price_history(pair: str, limit: int = 100) -> list:
-    """価格履歴取得"""
+    """価格履歴取得（OHLCV対応）"""
     table = dynamodb.Table(PRICES_TABLE)
     response = table.query(
         KeyConditionExpression='pair = :pair',
@@ -98,19 +126,48 @@ def get_price_history(pair: str, limit: int = 100) -> list:
         Limit=limit
     )
     items = response.get('Items', [])
-    return [{'timestamp': int(i['timestamp']), 'price': float(i['price'])} for i in reversed(items)]
+    result = []
+    for i in reversed(items):
+        record = {
+            'timestamp': int(i['timestamp']),
+            'price': float(i['price'])
+        }
+        # OHLCV フィールドが存在する場合は追加
+        if 'high' in i:
+            record['high'] = float(i['high'])
+        if 'low' in i:
+            record['low'] = float(i['low'])
+        if 'open' in i:
+            record['open'] = float(i['open'])
+        if 'volume' in i:
+            record['volume'] = float(i['volume'])
+        result.append(record)
+    return result
 
 def calculate_rsi(prices: list, period: int = 14) -> float:
-    """RSI計算"""
+    """
+    RSI計算 (Wilder's Smoothed Moving Average)
+    
+    標準的なWilder方式:
+    - 最初のperiod期間は単純平均で初期化
+    - 以降は指数平滑化: avg = (prev_avg * (period-1) + current) / period
+    - 単純平均より安定した値を返す
+    """
     if len(prices) < period + 1:
         return 50.0
     
     deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
-    gains = [d if d > 0 else 0 for d in deltas[-period:]]
-    losses = [-d if d < 0 else 0 for d in deltas[-period:]]
+    gains = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
     
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
+    # Wilder's smoothed average: 最初のperiod期間はSMAで初期化
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    
+    # 以降は指数平滑化
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
     
     if avg_loss == 0:
         return 100.0
@@ -225,11 +282,23 @@ def calculate_score(current_price: float, rsi: float, macd: float, signal: float
     else:
         score += (50 - rsi) / 200 * (w_rsi / 0.25)  # ウェイトに応じてスケール
     
-    # MACD (シグナル上抜け: 買い)
-    if macd > signal:
-        score += w_macd
+    # MACD (ヒストグラムの大きさと勾配でグラデーション評価)
+    # 旧: バイナリ(MACD>signal → +w_macd, else -w_macd)
+    # 新: ヒストグラム(MACD-signal)の大きさをATR%で正規化し、
+    #     さらにヒストグラムの勾配(直近変化)も反映
+    histogram_val = macd - signal
+    if current_price > 0:
+        # ヒストグラムを価格比で正規化 (ATR%相当のスケール)
+        norm_hist = histogram_val / current_price * 100  # % of price
+        # ±0.1% で ±1.0 にスケール (5分足のMACD histogram典型値)
+        hist_score = max(-1.0, min(1.0, norm_hist / 0.1))
+        score += hist_score * w_macd
     else:
-        score -= w_macd
+        # フォールバック: バイナリ
+        if macd > signal:
+            score += w_macd
+        else:
+            score -= w_macd
     
     # SMA20/200 ゴールデン/デッドクロス
     if sma_200:
@@ -258,18 +327,29 @@ def calculate_score(current_price: float, rsi: float, macd: float, signal: float
     return max(-1, min(1, score))
 
 
-def calculate_atr(prices: list, period: int = 14) -> float:
+def calculate_atr(prices: list, period: int = 14, highs: list = None, lows: list = None) -> float:
     """
     ATR (Average True Range) 計算
     
-    単一価格系列（close）から近似計算。
-    本来はHigh/Low/Closeが必要だが、5分足closeのみの環境では
-    連続する2本のclose差の絶対値の移動平均で代用。
+    OHLC がある場合: TR = max(High-Low, |High-PrevClose|, |Low-PrevClose|)
+    Close のみの場合: TR ≈ |Close[i] - Close[i-1]| (従来の近似)
     """
     if len(prices) < period + 1:
         return 0.0
     
-    true_ranges = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]
+    use_ohlc = (highs is not None and lows is not None
+                and len(highs) == len(prices) and len(lows) == len(prices))
+    
+    true_ranges = []
+    for i in range(1, len(prices)):
+        if use_ohlc:
+            # 正式な True Range
+            hl = highs[i] - lows[i]
+            hc = abs(highs[i] - prices[i - 1])
+            lc = abs(lows[i] - prices[i - 1])
+            true_ranges.append(max(hl, hc, lc))
+        else:
+            true_ranges.append(abs(prices[i] - prices[i - 1]))
     
     # Wilder's smoothed average (exponential)
     atr = sum(true_ranges[:period]) / period
@@ -279,7 +359,7 @@ def calculate_atr(prices: list, period: int = 14) -> float:
     return atr
 
 
-def calculate_adx(prices: list, period: int = 14) -> float:
+def calculate_adx(prices: list, period: int = 14, highs: list = None, lows: list = None) -> float:
     """
     ADX (Average Directional Index) 計算
     
@@ -288,12 +368,17 @@ def calculate_adx(prices: list, period: int = 14) -> float:
     - ADX < 20: レンジ相場
     - 20-25: 転換期
     
-    単一価格系列から近似:
-    - +DM: 上昇幅 (price[i] - price[i-1] > 0)
-    - -DM: 下降幅 (price[i-1] - price[i] > 0)
+    OHLC がある場合:
+    - +DM = max(High[i]-High[i-1], 0)  (上昇幅 > 下降幅の場合)
+    - -DM = max(Low[i-1]-Low[i], 0)    (下降幅 > 上昇幅の場合)
+    - TR  = max(High-Low, |High-PrevClose|, |Low-PrevClose|)
+    Close のみの場合: 従来の近似
     """
     if len(prices) < period * 2 + 1:
         return 20.0  # データ不足時はneutral
+    
+    use_ohlc = (highs is not None and lows is not None
+                and len(highs) == len(prices) and len(lows) == len(prices))
     
     # +DM, -DM 計算
     plus_dm = []
@@ -301,11 +386,19 @@ def calculate_adx(prices: list, period: int = 14) -> float:
     tr_list = []
     
     for i in range(1, len(prices)):
-        up_move = prices[i] - prices[i-1]
-        down_move = prices[i-1] - prices[i]
+        if use_ohlc:
+            up_move = highs[i] - highs[i - 1]
+            down_move = lows[i - 1] - lows[i]
+            # True Range (正式)
+            hl = highs[i] - lows[i]
+            hc = abs(highs[i] - prices[i - 1])
+            lc = abs(lows[i] - prices[i - 1])
+            tr = max(hl, hc, lc)
+        else:
+            up_move = prices[i] - prices[i - 1]
+            down_move = prices[i - 1] - prices[i]
+            tr = abs(prices[i] - prices[i - 1])
         
-        # True Range (close-onlyの近似)
-        tr = abs(prices[i] - prices[i-1])
         tr_list.append(tr)
         
         if up_move > 0 and up_move > down_move:
@@ -358,3 +451,37 @@ def calculate_adx(prices: list, period: int = 14) -> float:
         return adx
     else:
         return sum(dx_list) / len(dx_list)
+
+
+def calculate_volume_signal(volumes: list, period: int = 20) -> float:
+    """
+    出来高シグナル計算
+    
+    直近出来高が移動平均に対してどれだけ乖離しているかを返す。
+    戻り値は乗数 (multiplier):
+    - 1.0: 平均的な出来高 → シグナルに影響なし
+    - >1.0: 出来高急増 → トレンド確信度を強化
+    - 最大 1.3 にキャップ (過度な増幅を防止)
+    
+    出来高が平均以下の場合は 1.0 (減衰させない — 偽シグナル抑制は他で対応)
+    """
+    if not volumes or len(volumes) < period + 1:
+        return 1.0
+    
+    # 直近を除いた period 本分の平均出来高
+    recent_volumes = volumes[-(period + 1):-1]
+    avg_volume = sum(recent_volumes) / len(recent_volumes)
+    
+    if avg_volume <= 0:
+        return 1.0
+    
+    current_volume = volumes[-1]
+    ratio = current_volume / avg_volume
+    
+    # 平均の 1.5 倍以上で増幅開始、2.5倍で上限 1.3
+    if ratio <= 1.5:
+        return 1.0
+    
+    # 線形補間: ratio 1.5→1.0, ratio 2.5→1.3
+    multiplier = 1.0 + (ratio - 1.5) / (2.5 - 1.5) * 0.3
+    return min(1.3, multiplier)

@@ -33,11 +33,11 @@ def handler(event, context):
 
     for pair, config in TRADING_PAIRS.items():
         try:
-            # 1. Binance APIから現在価格取得（5分足の終値）
-            current_price, candle_time = get_current_price(config['binance'])
+            # 1. Binance APIから現在価格取得（5分足のOHLCV）
+            current_price, candle_time, candle_data = get_current_price(config['binance'])
 
-            # 2. DynamoDBに価格保存
-            save_price(pair, candle_time, current_price)
+            # 2. DynamoDBに価格保存（OHLCV付き）
+            save_price(pair, candle_time, current_price, candle_data)
 
             # 3. 1時間前の価格取得
             price_1h_ago = get_price_at(pair, current_time - 3600)
@@ -88,26 +88,40 @@ def handler(event, context):
 
 
 def get_current_price(binance_symbol: str) -> tuple:
-    """Binance APIから5分足の終値を取得"""
+    """​Binance APIから5分足のOHLCVを取得"""
     url = f"https://api.binance.com/api/v3/klines?symbol={binance_symbol}&interval=5m&limit=1"
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=10) as response:
         data = json.loads(response.read().decode())
         candle = data[0]
+        # Binance kline format: [open_time, open, high, low, close, volume, ...]
         close_price = float(candle[4])
         candle_time = int(candle[0] / 1000)
-        return close_price, candle_time
+        candle_data = {
+            'open': float(candle[1]),
+            'high': float(candle[2]),
+            'low': float(candle[3]),
+            'close': close_price,
+            'volume': float(candle[5])
+        }
+        return close_price, candle_time, candle_data
 
 
-def save_price(pair: str, timestamp: int, price: float):
-    """DynamoDBに価格保存"""
+def save_price(pair: str, timestamp: int, price: float, candle_data: dict = None):
+    """DynamoDBに価格保存（OHLCV付き）"""
     table = dynamodb.Table(PRICES_TABLE)
-    table.put_item(Item={
+    item = {
         'pair': pair,
         'timestamp': timestamp,
         'price': Decimal(str(price)),
         'ttl': timestamp + 1209600  # 14日後に削除
-    })
+    }
+    if candle_data:
+        item['open'] = Decimal(str(candle_data['open']))
+        item['high'] = Decimal(str(candle_data['high']))
+        item['low'] = Decimal(str(candle_data['low']))
+        item['volume'] = Decimal(str(candle_data['volume']))
+    table.put_item(Item=item)
 
 
 def get_price_at(pair: str, target_time: int) -> float:

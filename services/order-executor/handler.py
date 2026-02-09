@@ -168,7 +168,7 @@ def process_order(order: dict):
                 return
 
         # 買い注文
-        execute_buy(pair, score)
+        execute_buy(pair, score, analysis_context)
 
     elif signal == 'SELL':
         if not current_position or current_position.get('side') != 'long':
@@ -186,7 +186,7 @@ def process_order(order: dict):
             return
 
         # 売り注文
-        execute_sell(pair, current_position, score)
+        execute_sell(pair, current_position, score, analysis_context)
 
 
 def get_position(pair: str) -> dict:
@@ -291,7 +291,7 @@ def calculate_order_amount(score: float, available_jpy: float) -> float:
     return order_amount
 
 
-def execute_buy(pair: str, score: float):
+def execute_buy(pair: str, score: float, analysis_context: dict = None):
     """買い注文実行（残高確認・スコア連動金額）"""
     timestamp = int(time.time())
     name = get_currency_name(pair)
@@ -386,8 +386,8 @@ def execute_buy(pair: str, score: float):
         # ポジション保存
         save_position(pair, timestamp, 'long', result, order_amount)
 
-        # 取引履歴保存
-        save_trade(pair, timestamp, 'BUY', result)
+        # 取引履歴保存（分析コンテキスト付き）
+        save_trade(pair, timestamp, 'BUY', result, analysis_context=analysis_context)
 
         # 同一バッチ内即売り防止フラグ
         _just_bought_pairs.add(pair)
@@ -409,7 +409,7 @@ def execute_buy(pair: str, score: float):
         send_notification(name, f"❌ {name}買い注文失敗\nエラー: {error_msg}")
 
 
-def execute_sell(pair: str, position: dict, score: float):
+def execute_sell(pair: str, position: dict, score: float, analysis_context: dict = None):
     """売り注文実行"""
     timestamp = int(time.time())
     currency = get_currency_from_pair(pair)
@@ -515,8 +515,8 @@ def execute_sell(pair: str, position: dict, score: float):
         # ポジションクローズ
         close_position(pair, position, timestamp, result)
 
-        # 取引履歴保存
-        save_trade(pair, timestamp, 'SELL', result)
+        # 取引履歴保存（分析コンテキスト付き）
+        save_trade(pair, timestamp, 'SELL', result, analysis_context=analysis_context)
 
         # P/L計算
         entry_price = float(position.get('entry_price', 0))
@@ -852,8 +852,9 @@ def close_position(pair: str, position: dict, timestamp: int, result: dict):
     )
 
 
-def save_trade(pair: str, timestamp: int, action: str, result: dict):
-    """取引履歴保存"""
+def save_trade(pair: str, timestamp: int, action: str, result: dict,
+               analysis_context: dict = None):
+    """取引履歴保存（分析コンテキスト付き）"""
     table = dynamodb.Table(TRADES_TABLE)
 
     amount = result.get('amount') or 0
@@ -867,7 +868,7 @@ def save_trade(pair: str, timestamp: int, action: str, result: dict):
     except (TypeError, ValueError):
         rate = 0
 
-    table.put_item(Item={
+    item = {
         'pair': pair,
         'timestamp': timestamp,
         'action': action,
@@ -875,7 +876,29 @@ def save_trade(pair: str, timestamp: int, action: str, result: dict):
         'rate': Decimal(str(rate)),
         'order_id': str(result.get('id', '')),
         'fee_rate': Decimal(str(TAKER_FEE_RATE))
-    })
+    }
+
+    # 分析コンテキストを保存（事後分析用）
+    if analysis_context:
+        components = analysis_context.get('components', {})
+        if components:
+            if 'technical' in components:
+                item['technical_score'] = Decimal(str(components['technical']))
+            if 'chronos' in components:
+                item['chronos_score'] = Decimal(str(components['chronos']))
+            if 'sentiment' in components:
+                item['sentiment_score'] = Decimal(str(components['sentiment']))
+        weights = analysis_context.get('weights', {})
+        if weights:
+            item['weight_technical'] = Decimal(str(weights.get('technical', 0)))
+            item['weight_chronos'] = Decimal(str(weights.get('chronos', 0)))
+            item['weight_sentiment'] = Decimal(str(weights.get('sentiment', 0)))
+        if 'buy_threshold' in analysis_context:
+            item['buy_threshold'] = Decimal(str(analysis_context['buy_threshold']))
+        if 'sell_threshold' in analysis_context:
+            item['sell_threshold'] = Decimal(str(analysis_context['sell_threshold']))
+
+    table.put_item(Item=item)
 
 
 def check_circuit_breaker() -> tuple:

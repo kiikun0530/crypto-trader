@@ -234,16 +234,18 @@ def run_onnx_inference(prices: list, prediction_length: int = 12, num_samples: i
     """
     ONNX Runtime で Chronos-T5-Tiny 推論
 
-    Top-k sampling で確率的予測を生成し、中央値を返す
+    Top-k sampling で確率的予測を生成し、中央値を返す。
+    decoder_with_past モデルがある場合は KV-Cache を使った高速デコードを行う。
     """
     model_data = load_model()
     encoder_session = model_data['encoder']
     decoder_session = model_data['decoder']
+    decoder_with_past = model_data.get('decoder_with_past')
 
     # Tokenize
     token_ids, attention_mask, scale = tokenize_input(prices, model_data)
 
-    # Encoder
+    # Encoder (1回のみ — 全サンプルで共有)
     encoder_outputs = encoder_session.run(
         None,
         {
@@ -253,35 +255,84 @@ def run_onnx_inference(prices: list, prediction_length: int = 12, num_samples: i
     )
     encoder_hidden = encoder_outputs[0]  # (1, seq_len, hidden_dim)
 
+    # Decoder I/O名を取得
+    decoder_input_names = [inp.name for inp in decoder_session.get_inputs()]
+    decoder_output_names = [out.name for out in decoder_session.get_outputs()]
+
+    # KV-Cache 利用判定
+    use_kv_cache = decoder_with_past is not None
+    if use_kv_cache:
+        past_output_names = [n for n in decoder_output_names if 'present' in n]
+        use_kv_cache = len(past_output_names) > 0  # decoder がpastを出力しない場合はフォールバック
+    if use_kv_cache:
+        dwp_input_names = [inp.name for inp in decoder_with_past.get_inputs()]
+        dwp_output_names = [out.name for out in decoder_with_past.get_outputs()]
+        dwp_past_output_names = [n for n in dwp_output_names if 'present' in n]
+
     # Decoder: generate predictions autoregressively
     all_samples = []
 
-    # Get decoder input names
-    decoder_input_names = [inp.name for inp in decoder_session.get_inputs()]
-
     for sample_idx in range(num_samples):
         generated_tokens = []
-        decoder_input = np.array([[PAD_TOKEN_ID]], dtype=np.int64)
+        past_kv = None
 
         for step in range(prediction_length):
-            # Build decoder inputs
-            decoder_feeds = {}
-            for name in decoder_input_names:
-                if name == 'input_ids':
-                    decoder_feeds['input_ids'] = token_ids
-                elif name == 'decoder_input_ids':
-                    decoder_feeds['decoder_input_ids'] = decoder_input
-                elif name == 'attention_mask':
-                    decoder_feeds['attention_mask'] = attention_mask
-                elif name == 'encoder_hidden_states':
-                    decoder_feeds['encoder_hidden_states'] = encoder_hidden
-                elif 'encoder_attention_mask' in name:
-                    decoder_feeds[name] = attention_mask
+            if step == 0 or not use_kv_cache:
+                # 初回ステップ (or KVなし): フルデコーダ
+                if step == 0:
+                    decoder_input = np.array([[PAD_TOKEN_ID]], dtype=np.int64)
+                else:
+                    decoder_input = np.array([generated_tokens], dtype=np.int64)
 
-            decoder_outputs = decoder_session.run(None, decoder_feeds)
-            logits = decoder_outputs[0]  # (1, seq_len, vocab_size)
+                decoder_feeds = {}
+                for name in decoder_input_names:
+                    if name == 'input_ids':
+                        decoder_feeds['input_ids'] = token_ids
+                    elif name == 'decoder_input_ids':
+                        decoder_feeds['decoder_input_ids'] = decoder_input
+                    elif name == 'attention_mask':
+                        decoder_feeds['attention_mask'] = attention_mask
+                    elif name == 'encoder_hidden_states':
+                        decoder_feeds['encoder_hidden_states'] = encoder_hidden
+                    elif 'encoder_attention_mask' in name:
+                        decoder_feeds[name] = attention_mask
 
-            # Get logits for last position
+                outputs = decoder_session.run(None, decoder_feeds)
+                logits = outputs[0]
+
+                # KV-Cache を抽出 (step==0 のみ。以降は decoder_with_past で更新)
+                if use_kv_cache and step == 0:
+                    past_kv = {}
+                    for pname in past_output_names:
+                        idx = decoder_output_names.index(pname)
+                        cache_key = pname.replace('present', 'past_key_values')
+                        past_kv[cache_key] = outputs[idx]
+            else:
+                # 2ステップ目以降: KV-Cache付き高速デコード (最後の1トークンのみ入力)
+                dwp_feeds = {
+                    'decoder_input_ids': np.array([[generated_tokens[-1]]], dtype=np.int64),
+                }
+                for name in dwp_input_names:
+                    if name == 'decoder_input_ids':
+                        continue  # 既にセット済み
+                    elif name == 'encoder_hidden_states':
+                        dwp_feeds[name] = encoder_hidden
+                    elif 'encoder_attention_mask' in name or name == 'attention_mask':
+                        dwp_feeds[name] = attention_mask
+                    elif name in past_kv:
+                        dwp_feeds[name] = past_kv[name]
+
+                outputs = decoder_with_past.run(None, dwp_feeds)
+                logits = outputs[0]
+
+                # KV-Cache 更新
+                past_kv = {}
+                for pname in dwp_past_output_names:
+                    idx = dwp_output_names.index(pname)
+                    cache_key = pname.replace('present', 'past_key_values')
+                    past_kv[cache_key] = outputs[idx]
+
+            # 最後のポジションの logits を取得
             next_logits = logits[0, -1, :]  # (vocab_size,)
 
             # Top-k sampling with temperature
@@ -302,7 +353,6 @@ def run_onnx_inference(prices: list, prediction_length: int = 12, num_samples: i
             next_token = top_k_indices[chosen_idx]
 
             generated_tokens.append(int(next_token))
-            decoder_input = np.array([generated_tokens], dtype=np.int64)
 
         all_samples.append(generated_tokens)
 

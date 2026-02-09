@@ -260,37 +260,133 @@ def get_article_age_hours(published_at: str) -> float:
 
 
 def estimate_sentiment_from_title(title: str) -> float:
-    """タイトルからセンチメントを簡易推定（投票データ不足時のフォールバック）"""
+    """
+    タイトルから高度なルールベース NLP でセンチメントを推定
+    
+    改善点 (Phase 2 #17):
+    - 3段階の強度 (strong/moderate/mild) で重み分け
+    - 否定語の検出 (not, no, fails, without → 極性反転)
+    - バイグラム/フレーズマッチング
+    - 暗号通貨ドメイン特化の語彙
+    - 複数キーワードの相乗効果
+    """
     if not title:
         return 0.5
 
     title_lower = title.lower()
+    words = title_lower.split()
 
-    bullish_keywords = [
-        'surge', 'soar', 'rally', 'breakout', 'bullish', 'pump', 'moon',
-        'all-time high', 'ath', 'gain', 'rises', 'jumps', 'boost',
-        'adoption', 'partnership', 'upgrade', 'approval', 'etf approved',
-        'inflow', 'accumulate', 'buying', 'bought', 'record high',
-        'outperform', 'momentum', 'recovery', 'rebound', 'reclaim',
+    # ===== フレーズマッチング (バイグラム/トリグラム優先) =====
+    bullish_phrases = {
+        # strong (+0.25)
+        'all-time high': 0.25, 'all time high': 0.25, 'new ath': 0.25,
+        'etf approved': 0.25, 'etf approval': 0.25, 'mass adoption': 0.25,
+        'short squeeze': 0.25, 'whale accumulation': 0.20,
+        'institutional buying': 0.20, 'record inflow': 0.20,
+        # moderate (+0.15)
+        'golden cross': 0.15, 'breaks out': 0.15, 'breaks above': 0.15,
+        'price target': 0.15, 'buy signal': 0.15, 'strong support': 0.15,
+        'higher high': 0.15, 'bullish divergence': 0.15,
+        'network upgrade': 0.12, 'strategic reserve': 0.12,
+    }
+    bearish_phrases = {
+        # strong (-0.25)
+        'death cross': 0.25, 'bank run': 0.25, 'rug pull': 0.25,
+        'ponzi scheme': 0.25, 'sec lawsuit': 0.25, 'exchange hack': 0.25,
+        'mass liquidation': 0.25, 'flash crash': 0.25,
+        # moderate (-0.15)
+        'breaks below': 0.15, 'sell signal': 0.15, 'lower low': 0.15,
+        'bearish divergence': 0.15, 'key support': 0.15, 'lost support': 0.15,
+        'whale dump': 0.15, 'record outflow': 0.15, 'under investigation': 0.15,
+        'class action': 0.15, 'security breach': 0.15,
+    }
+
+    phrase_score = 0.0
+    matched_phrase = False
+    for phrase, weight in bullish_phrases.items():
+        if phrase in title_lower:
+            phrase_score += weight
+            matched_phrase = True
+    for phrase, weight in bearish_phrases.items():
+        if phrase in title_lower:
+            phrase_score -= weight
+            matched_phrase = True
+
+    # ===== 単語レベル (強度別) =====
+    strong_bullish = [
+        'surge', 'soar', 'skyrocket', 'explode', 'moon', 'parabolic',
     ]
-    bearish_keywords = [
-        'crash', 'plunge', 'dump', 'bearish', 'sell-off', 'selloff',
-        'collapse', 'decline', 'drop', 'falls', 'tank', 'slump',
-        'hack', 'exploit', 'vulnerability', 'fraud', 'scam',
-        'ban', 'restriction', 'crackdown', 'regulate', 'lawsuit',
-        'outflow', 'liquidat', 'fear', 'panic', 'warning', 'risk',
-        'fud', 'bubble', 'overvalued', 'correction',
+    moderate_bullish = [
+        'rally', 'breakout', 'bullish', 'pump', 'gain', 'jump', 'boost',
+        'adoption', 'partnership', 'upgrade', 'approval', 'inflow',
+        'accumulate', 'outperform', 'momentum', 'recovery', 'rebound',
+        'reclaim', 'optimistic', 'milestone', 'halving',
+    ]
+    mild_bullish = [
+        'rise', 'climb', 'advance', 'positive', 'support', 'buying',
+        'uptrend', 'upside', 'opportunity', 'growth', 'strengthen',
     ]
 
-    bullish_count = sum(1 for kw in bullish_keywords if kw in title_lower)
-    bearish_count = sum(1 for kw in bearish_keywords if kw in title_lower)
+    strong_bearish = [
+        'crash', 'plunge', 'collapse', 'tank', 'devastate', 'implode',
+    ]
+    moderate_bearish = [
+        'dump', 'bearish', 'selloff', 'sell-off', 'decline', 'drop',
+        'slump', 'hack', 'exploit', 'vulnerability', 'fraud', 'scam',
+        'ban', 'crackdown', 'lawsuit', 'outflow', 'liquidat',
+        'panic', 'warning', 'bubble', 'overvalued', 'correction',
+        'bankrupt', 'insolvent', 'delisted',
+    ]
+    mild_bearish = [
+        'fall', 'dip', 'slide', 'weak', 'fear', 'risk', 'concern',
+        'uncertain', 'volatile', 'downtrend', 'resistance', 'struggle',
+        'caution', 'fud', 'restriction',
+    ]
 
-    if bullish_count == 0 and bearish_count == 0:
-        return 0.5
+    # 否定語リスト
+    negation_words = {'not', 'no', 'never', "n't", 'without', 'fails',
+                      'failed', 'unlikely', 'hardly', 'barely', 'neither'}
 
-    # スコア調整: キーワード1つにつき ±0.1、最大 ±0.3
-    net_score = (bullish_count - bearish_count) * 0.1
-    net_score = max(-0.3, min(0.3, net_score))
+    def is_negated(word_idx: int) -> bool:
+        """指定位置の単語が直前3語以内の否定語に修飾されているか"""
+        for j in range(max(0, word_idx - 3), word_idx):
+            w = words[j].rstrip('.,!?:;')
+            if w in negation_words or w.endswith("n't"):
+                return True
+        return False
+
+    word_score = 0.0
+    weights = {
+        'strong_bullish': 0.20, 'moderate_bullish': 0.12, 'mild_bullish': 0.06,
+        'strong_bearish': 0.20, 'moderate_bearish': 0.12, 'mild_bearish': 0.06,
+    }
+
+    for i, word in enumerate(words):
+        w = word.rstrip('.,!?:;')
+        negated = is_negated(i)
+
+        if w in strong_bullish:
+            delta = weights['strong_bullish'] * (-1 if negated else 1)
+            word_score += delta
+        elif w in moderate_bullish:
+            delta = weights['moderate_bullish'] * (-1 if negated else 1)
+            word_score += delta
+        elif w in mild_bullish:
+            delta = weights['mild_bullish'] * (-1 if negated else 1)
+            word_score += delta
+        elif w in strong_bearish:
+            delta = weights['strong_bearish'] * (-1 if negated else 1)
+            word_score -= delta
+        elif w in moderate_bearish:
+            delta = weights['moderate_bearish'] * (-1 if negated else 1)
+            word_score -= delta
+        elif w in mild_bearish:
+            delta = weights['mild_bearish'] * (-1 if negated else 1)
+            word_score -= delta
+
+    # ===== 最終スコア: フレーズ + 単語、上限 ±0.4 =====
+    net_score = phrase_score + word_score
+    net_score = max(-0.4, min(0.4, net_score))
     return 0.5 + net_score
 
 

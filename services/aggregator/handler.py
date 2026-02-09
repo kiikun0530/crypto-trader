@@ -32,9 +32,12 @@ DEFAULT_PAIRS = {
 }
 TRADING_PAIRS = json.loads(os.environ.get('TRADING_PAIRS_CONFIG', json.dumps(DEFAULT_PAIRS)))
 
-# 重み設定
-TECHNICAL_WEIGHT = float(os.environ.get('TECHNICAL_WEIGHT', '0.45'))
-CHRONOS_WEIGHT = float(os.environ.get('AI_PREDICTION_WEIGHT', '0.40'))
+# 重み設定 (データドリブン: signals 810件の分散比例 + Chronos near-zero 52%)
+# 分析結果: Tech std=0.435, Chronos std=0.264, Sent std=0.063
+# 分散比例: Tech=0.57, Chronos=0.35, Sent=0.08
+# Chronos が50%以上ほぼ0 & SELL寄与ほぼなし → ウェイト30%に削減
+TECHNICAL_WEIGHT = float(os.environ.get('TECHNICAL_WEIGHT', '0.55'))
+CHRONOS_WEIGHT = float(os.environ.get('AI_PREDICTION_WEIGHT', '0.30'))
 SENTIMENT_WEIGHT = float(os.environ.get('SENTIMENT_WEIGHT', '0.15'))
 
 # ボラティリティ適応型閾値
@@ -93,9 +96,30 @@ def handler(event, context):
 
         has_signal = signal in ['BUY', 'SELL']
 
-        # 7. 注文送信
+        # 7. 注文送信（分析コンテキスト付き）
         if has_signal and ORDER_QUEUE_URL:
-            send_order_message(target_pair, signal, target_score, int(time.time()))
+            # 対象通貨のコンポーネントスコアを取得
+            target_scored = None
+            for s in scored_pairs:
+                coincheck = TRADING_PAIRS.get(s['pair'], {}).get('coincheck', '')
+                if coincheck == target_pair or s['pair'] == target_pair:
+                    target_scored = s
+                    break
+            analysis_context = {}
+            if target_scored:
+                analysis_context = {
+                    'components': target_scored.get('components', {}),
+                    'bb_width': target_scored.get('bb_width', 0),
+                }
+            analysis_context['buy_threshold'] = round(buy_threshold, 4)
+            analysis_context['sell_threshold'] = round(sell_threshold, 4)
+            analysis_context['weights'] = {
+                'technical': TECHNICAL_WEIGHT,
+                'chronos': CHRONOS_WEIGHT,
+                'sentiment': SENTIMENT_WEIGHT
+            }
+            send_order_message(target_pair, signal, target_score,
+                             int(time.time()), analysis_context)
 
         result = {
             'signal': signal,
@@ -385,16 +409,20 @@ def save_signal(scored: dict, buy_threshold: float, sell_threshold: float):
     })
 
 
-def send_order_message(pair: str, signal: str, score: float, timestamp: int):
-    """SQSに注文メッセージ送信"""
+def send_order_message(pair: str, signal: str, score: float, timestamp: int,
+                       analysis_context: dict = None):
+    """​SQSに注文メッセージ送信（分析コンテキスト付き）"""
+    message = {
+        'pair': pair,
+        'signal': signal,
+        'score': score,
+        'timestamp': timestamp
+    }
+    if analysis_context:
+        message['analysis_context'] = analysis_context
     sqs.send_message(
         QueueUrl=ORDER_QUEUE_URL,
-        MessageBody=json.dumps({
-            'pair': pair,
-            'signal': signal,
-            'score': score,
-            'timestamp': timestamp
-        })
+        MessageBody=json.dumps(message)
     )
 
 
