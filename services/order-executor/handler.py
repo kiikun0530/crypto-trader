@@ -463,19 +463,18 @@ def execute_sell(pair: str, position: dict, score: float):
     if result and result.get('success'):
         order_id = result.get('id')
 
-        # 成行売りもamount/rateがNoneで返ることがあるため、約定情報を取得
-        sell_rate = result.get('rate')
+        # 成行売りの rate は Coincheck API レスポンスで信頼できないため
+        # 必ず約定履歴から取得する
+        sell_rate = None
         sell_amount = result.get('amount')
 
-        # rate が None または無効な場合、約定履歴から取得
-        if sell_rate is None or sell_amount is None:
-            fill_amount, fill_rate = get_market_sell_fill(pair, order_id, currency)
-            if fill_rate:
-                sell_rate = fill_rate
-                result['rate'] = fill_rate
-            if fill_amount:
-                sell_amount = fill_amount
-                result['amount'] = fill_amount
+        fill_amount, fill_rate = get_market_sell_fill(pair, order_id, currency)
+        if fill_rate:
+            sell_rate = fill_rate
+            result['rate'] = fill_rate
+        if fill_amount:
+            sell_amount = fill_amount
+            result['amount'] = fill_amount
 
         # それでもrateが取れない場合、現在価格から推定
         if not sell_rate:
@@ -488,6 +487,30 @@ def execute_sell(pair: str, position: dict, score: float):
             except Exception as e:
                 print(f"Ticker fallback failed: {e}")
                 sell_rate = 0
+
+        # ⚠️ sell_rate 妥当性チェック（ticker価格と比較）
+        if sell_rate and float(sell_rate) > 0:
+            try:
+                ticker_price = get_current_price(pair)
+                if ticker_price > 0:
+                    sell_rate_f = float(sell_rate)
+                    deviation = abs(sell_rate_f - ticker_price) / ticker_price
+                    if deviation > 0.15:  # 15%以上の乖離は異常
+                        print(f"⚠️ CRITICAL: sell_rate ¥{sell_rate_f:,.0f} deviates "
+                              f"{deviation*100:.1f}% from ticker ¥{ticker_price:,.0f}. "
+                              f"Using ticker price as fallback")
+                        send_notification(
+                            name,
+                            f"⚠️ {name}売却価格異常検知\n"
+                            f"取得値: ¥{sell_rate_f:,.0f}\n"
+                            f"Ticker: ¥{ticker_price:,.0f}\n"
+                            f"乖離: {deviation*100:.1f}%\n"
+                            f"→ Ticker価格で代替"
+                        )
+                        sell_rate = ticker_price
+                        result['rate'] = ticker_price
+            except Exception as e:
+                print(f"Sell rate sanity check failed: {e}")
 
         # ポジションクローズ
         close_position(pair, position, timestamp, result)
@@ -510,12 +533,14 @@ def execute_sell(pair: str, position: dict, score: float):
         emoji = '💰' if net_pnl > 0 else '💸'
         fee_info = f"\n手数料: ¥{sell_fee:,.0f}" if sell_fee > 0 else ""
         pnl_text = f"¥{net_pnl:,.0f}" if exit_price > 0 else "不明（約定価格取得失敗）"
+        pnl_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
         send_notification(
             name,
             f"{emoji} {name}売り約定\n"
             f"通貨ペア: {pair}\n"
             f"数量: {amount:.6f} {currency.upper()}\n"
-            f"P/L: {pnl_text}{fee_info}\n"
+            f"約定価格: ¥{exit_price:,.0f} (参入: ¥{entry_price:,.0f})\n"
+            f"P/L: {pnl_text} ({pnl_pct:+.2f}%){fee_info}\n"
             f"スコア: {score:.3f}"
         )
     else:
@@ -656,7 +681,7 @@ def get_market_buy_fill(pair: str, order_id, currency: str, max_retries: int = 3
 
             # === 方法2: トランザクションAPI + order_id フィルタ ===
             result = call_coincheck_api(
-                '/api/exchange/orders/transactions',
+                '/api/exchange/orders/transactions?limit=100',
                 'GET', None, creds
             )
 
@@ -699,8 +724,12 @@ def get_market_sell_fill(pair: str, order_id, currency: str, max_retries: int = 
     Coincheckの成行売りレスポンスもrateがNoneになることがあるため、
     約定後に取引履歴APIで実際の約定価格を取得する
 
-    ⚠️ transactions API は order_id クエリパラメータ非対応
-    → Python側で order_id フィルタ必須
+    ⚠️ 注意事項:
+    - 注文詳細APIの rate は成行売りでは信頼できない（null or 不正確）
+    - executed_market_buy_amount は買い専用で売りには存在しない
+    - → トランザクションAPIから JPY/数量 で正確な平均約定価格を算出
+    - transactions API は order_id クエリパラメータ非対応
+      → Python側で order_id フィルタ必須
     """
     if not order_id:
         return None, None
@@ -712,7 +741,7 @@ def get_market_sell_fill(pair: str, order_id, currency: str, max_retries: int = 
     for attempt in range(max_retries):
         time.sleep(2 * (attempt + 1))  # 2秒, 4秒, 6秒待機
         try:
-            # === 方法1: 注文の詳細API ===
+            # === 方法1: 注文の詳細API（約定完了確認のみ） ===
             order_detail = call_coincheck_api(
                 f'/api/exchange/orders/{order_id}',
                 'GET', None, creds
@@ -720,19 +749,21 @@ def get_market_sell_fill(pair: str, order_id, currency: str, max_retries: int = 
 
             if order_detail and order_detail.get('success'):
                 executed_amount = float(order_detail.get('executed_amount') or 0)
-                # 成行売りの場合、rateから平均約定価格を推定
-                # executed_market_buy_amount は買い専用なので、売りではrateを使う
-                rate = order_detail.get('rate')
-                if executed_amount > 0 and rate:
-                    avg_rate = float(rate)
-                    print(f"Sell fill from order detail API (attempt {attempt+1}): "
-                          f"amount={executed_amount}, rate={avg_rate:.2f}, "
-                          f"status={order_detail.get('status')}")
-                    return executed_amount, avg_rate
+                status = order_detail.get('status')
+                # ⚠️ 成行売りの rate は信頼できないため使わない
+                # （executed_market_buy_amount は買い専用で売りには存在しない）
+                # 約定完了を確認したらトランザクションAPIで正確な価格を取得
+                if executed_amount > 0:
+                    print(f"Sell order confirmed filled (attempt {attempt+1}): "
+                          f"executed_amount={executed_amount}, status={status}")
+                else:
+                    print(f"Sell order not yet filled (attempt {attempt+1}): "
+                          f"executed_amount={executed_amount}, status={status}")
+                    continue  # 未約定なら次のリトライへ
 
-            # === 方法2: トランザクションAPI + order_id フィルタ ===
+            # === 方法2: トランザクションAPI + order_id フィルタ（正確な約定価格） ===
             result = call_coincheck_api(
-                '/api/exchange/orders/transactions',
+                '/api/exchange/orders/transactions?limit=100',
                 'GET', None, creds
             )
 
