@@ -1,6 +1,12 @@
 """
 ポジション監視 Lambda
 5分間隔で全通貨のアクティブポジションを監視し、SL/TP判定
+
+トレーリングストップ:
+- 含み益+3%以上: SLを建値に引き上げ（損失ゼロ保証）
+- 含み益+5%以上: SLを+3%に引き上げ
+- 含み益+8%以上: SLを+6%に引き上げ
+- DynamoDBのstop_lossを実際に更新（永続化）
 """
 import json
 import os
@@ -92,6 +98,24 @@ def handler(event, context):
             elif current_price >= take_profit:
                 result['action'] = 'TAKE_PROFIT'
                 trigger_sell(coincheck_pair, config['name'], 'take_profit', current_price, entry_price)
+
+            else:
+                # トレーリングストップ: 含み益に応じてSLを引き上げ
+                new_sl = calculate_trailing_stop(entry_price, current_price, stop_loss)
+                if new_sl and new_sl > stop_loss:
+                    old_sl = stop_loss
+                    stop_loss = new_sl
+                    result['stop_loss'] = new_sl
+                    # DynamoDBのSLを更新（永続化）
+                    update_stop_loss(position, new_sl)
+                    pnl_pct = (current_price - entry_price) / entry_price * 100
+                    sl_pct = (new_sl - entry_price) / entry_price * 100
+                    print(f"  📈 Trailing stop raised for {config['name']}: "
+                          f"SL ¥{old_sl:,.0f} → ¥{new_sl:,.0f} "
+                          f"(entry+{sl_pct:.1f}%, current P/L: {pnl_pct:+.1f}%)")
+                    # Slack通知
+                    notify_trailing_stop(config['name'], coincheck_pair,
+                                       old_sl, new_sl, entry_price, current_price)
 
             # P/L計算
             amount = float(position.get('amount', 0))
@@ -197,3 +221,83 @@ def trigger_sell(pair: str, name: str, reason: str, current_price: float, entry_
             print(f"Slack notification sent (status: {response.status})")
         except Exception as e:
             print(f"Slack notification failed: {e}")
+
+
+def calculate_trailing_stop(entry_price: float, current_price: float, current_sl: float) -> float:
+    """
+    トレーリングストップ計算
+    
+    含み益に応じて段階的にSLを引き上げ:
+    - +3%以上: SL = 建値 (損失ゼロ保証)
+    - +5%以上: SL = entry + 3%
+    - +8%以上: SL = entry + 6%
+    
+    Returns: 新しいSL価格 (引き上げ不要ならNone)
+    """
+    if entry_price <= 0:
+        return None
+    
+    pnl_pct = (current_price - entry_price) / entry_price * 100
+    
+    # トレーリングストップの段階
+    # (含み益の閾値%, SLをentryの何%に設定するか)
+    TRAILING_LEVELS = [
+        (8.0, 6.0),   # +8%以上 → SL = entry + 6%
+        (5.0, 3.0),   # +5%以上 → SL = entry + 3%
+        (3.0, 0.0),   # +3%以上 → SL = entry (建値)
+    ]
+    
+    new_sl = None
+    for threshold, sl_offset in TRAILING_LEVELS:
+        if pnl_pct >= threshold:
+            new_sl = entry_price * (1 + sl_offset / 100)
+            break
+    
+    # 現在のSLより高い場合のみ更新（SLは上がるだけ、下がらない）
+    if new_sl and new_sl > current_sl:
+        return new_sl
+    return None
+
+
+def update_stop_loss(position: dict, new_sl: float):
+    """DynamoDBのstop_lossを更新"""
+    from decimal import Decimal
+    table = dynamodb.Table(POSITIONS_TABLE)
+    try:
+        table.update_item(
+            Key={
+                'pair': position['pair'],
+                'position_id': position['position_id']
+            },
+            UpdateExpression='SET stop_loss = :sl',
+            ExpressionAttributeValues={
+                ':sl': Decimal(str(round(new_sl, 2)))
+            }
+        )
+    except Exception as e:
+        print(f"Failed to update stop_loss in DB: {e}")
+
+
+def notify_trailing_stop(name: str, pair: str, old_sl: float, new_sl: float,
+                         entry_price: float, current_price: float):
+    """トレーリングストップ引き上げのSlack通知"""
+    if not SLACK_WEBHOOK_URL:
+        return
+    try:
+        pnl_pct = (current_price - entry_price) / entry_price * 100
+        sl_pct = (new_sl - entry_price) / entry_price * 100
+        message = (
+            f"📈 {name} トレーリングストップ引き上げ\n"
+            f"通貨: {pair}\n"
+            f"SL: ¥{old_sl:,.0f} → ¥{new_sl:,.0f} (entry+{sl_pct:.1f}%)\n"
+            f"現在: ¥{current_price:,.0f} (P/L: {pnl_pct:+.1f}%)"
+        )
+        payload = {"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": message}}]}
+        req = urllib.request.Request(
+            SLACK_WEBHOOK_URL,
+            data=json.dumps(payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json'}
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f"Trailing stop Slack notification failed: {e}")

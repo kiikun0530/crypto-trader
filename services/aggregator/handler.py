@@ -9,6 +9,7 @@
 - BUY: 未保有通貨でBUY閾値超えがあれば買い（複数同時保有OK）
 - ボラティリティ適応型閾値（市場状況に応じて動的調整）
 - 最低保有時間: BUYから30分はシグナルSELLを無視（SL/TPは有効）
+- 通貨分散: 同一通貨の同時保有はMAX_POSITIONS_PER_PAIRまで
 """
 import json
 import os
@@ -38,7 +39,7 @@ SENTIMENT_WEIGHT = float(os.environ.get('SENTIMENT_WEIGHT', '0.15'))
 
 # ボラティリティ適応型閾値
 # 基準閾値（平均的なボラティリティ時に使用）
-BASE_BUY_THRESHOLD = float(os.environ.get('BASE_BUY_THRESHOLD', '0.20'))
+BASE_BUY_THRESHOLD = float(os.environ.get('BASE_BUY_THRESHOLD', '0.30'))
 BASE_SELL_THRESHOLD = float(os.environ.get('BASE_SELL_THRESHOLD', '-0.20'))
 # BB幅の基準値（暗号通貨の典型的なBB幅 ≈ 3%）
 BASELINE_BB_WIDTH = float(os.environ.get('BASELINE_BB_WIDTH', '0.03'))
@@ -49,6 +50,9 @@ VOL_CLAMP_MAX = 2.0
 # 最低保有時間（秒）: BUYから一定時間はシグナルSELLを無視（SL/TPは有効）
 # BUY→即SELL往復ビンタ防止
 MIN_HOLD_SECONDS = int(os.environ.get('MIN_HOLD_SECONDS', '1800'))  # デフォルト30分
+
+# 同一通貨の最大同時保有ポジション数（通貨分散ルール）
+MAX_POSITIONS_PER_PAIR = int(os.environ.get('MAX_POSITIONS_PER_PAIR', '1'))
 
 
 def handler(event, context):
@@ -284,10 +288,15 @@ def decide_action(scored_pairs: list, active_positions: list,
             print(f"SELL suppressed by hold period: {pairs_text}")
 
     # --- BUY判定（未保有の通貨から最高スコアを選定） ---
+    # 通貨分散ルール: 同一通貨はMAX_POSITIONS_PER_PAIRまで
+    from collections import Counter
+    held_pair_counts = Counter(p['pair'] for p in active_positions) if active_positions else Counter()
+
     for candidate in scored_pairs:
         coincheck_pair = TRADING_PAIRS.get(candidate['pair'], {}).get('coincheck', candidate['pair'])
-        if coincheck_pair in held_coincheck_pairs:
-            continue  # 既に保有中 → スキップ
+        current_count = held_pair_counts.get(coincheck_pair, 0)
+        if current_count >= MAX_POSITIONS_PER_PAIR:
+            continue  # 同一通貨の保有上限に達している
         if candidate['total_score'] >= buy_threshold:
             print(f"BUY signal for {candidate['pair']} ({coincheck_pair}): "
                   f"score={candidate['total_score']:.4f} (threshold: {buy_threshold:.3f})")
