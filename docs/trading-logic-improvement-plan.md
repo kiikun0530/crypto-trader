@@ -1,7 +1,7 @@
 # 取引ロジック改善企画書
 
 **作成日**: 2025-02-09
-**ステータス**: Phase 1 完了 → Phase 2 完了
+**ステータス**: Phase 1 完了 → Phase 2 完了 → Phase 3 完了
 
 ---
 
@@ -204,6 +204,28 @@
 - **効果**: BTC/AVAXの限界的トレード(計¥313損失)を阻止。XRP(0.222>0.20)は閾値超えで正当なシグナルとして引き続き発動可能
 - **影響範囲**: `services/aggregator/handler.py`
 
+#### 20. Market Context 第4の柱 ✅ 実装済
+- **問題**: 3成分体制ではマクロ市場環境（恋怐/強欲、レバレッジ偏り、BTC支配力）を考慮できない
+- **新規Lambda**: `market-context` (30分間隔 EventBridge)
+  - Fear & Greed Index (Alternative.me) — 市場の恐怖/強欲度
+  - Funding Rate (Binance Futures) — レバレッジポジションの偏り
+  - BTC Dominance (CoinGecko) — 資金フロー方向
+- **Aggregator更新**: ウェイトを Tech=0.45, Chronos=0.25, Sent=0.15, MktCtx=0.15 に変更
+- **BTC Dominance補正**: アルトコインにBTC Dom >60%で-0.05、<40%で+0.05
+- **データ鮮度チェック**: 2時間以上古い場合は中立(0.0)扱い
+- **影響範囲**: `services/market-context/handler.py`(新規), `services/aggregator/handler.py`, Terraform全体
+
+#### 20a. 4成分化に伴う閾値調整 ✅ 実装済
+- **問題**: 4成分に分散したことでスコアが約15%圧縮 + Market Context の上方バイアス(+0.02)
+- **修正**: BUY閾値 0.30→0.28、SELL閾値 -0.20→-0.15
+- **検証**: 1,578件のシグナルデータで旧3成分と同等のシグナル頻度を維持する閾値を算出
+- **影響範囲**: `services/aggregator/handler.py`
+
+#### 17a. NLP「buy the dip」コンテキスト修正 ✅ 実装済
+- **問題**: 「buy the dip」「whales accumulate」等の逆張りフレーズで、「buy」がBullish、「dip」がBearishと個別検出され相殺していた
+- **修正**: バイグラム/フレーズマッチングを個別キーワードより先に処理し、使用済み単語をスキップ
+- **影響範囲**: `services/news-collector/handler.py`
+
 ### Phase 2 実装ログ
 
 | 日付 | 項目 | コミット | 備考 |
@@ -217,4 +239,7 @@
 | 2026-02-09 | #16 KV キャッシュ | `8211ac1` | decoder_with_past 高速デコード |
 | 2026-02-09 | #17 NLP センチメント | `8211ac1` | 3段階強度+否定語+バイグラム |
 | 2026-02-09 | Typical Price | `90684dc` | Chronos入力を(H+L+C)/3に変更 |
-| 2026-02-09 | #19 VOL_CLAMP_MIN | - | 0.5→0.67, 最低BUY閾値 0.15→0.20 |
+| 2026-02-09 | #19 VOL_CLAMP_MIN | `5ffcbea` | 0.5→0.67, 最低BUY閾値 0.15→0.20 |
+| 2026-02-10 | #17a NLP buy the dip | `aa138cf` | コンテキスト認識、使用済み単語スキップ |
+| 2026-02-10 | #20 Market Context | `72cf12f` | 第4の柱: F&G + Funding + BTC Dom, Tech=0.45/Chronos=0.25/Sent=0.15/Mkt=0.15 |
+| 2026-02-10 | #20a 閾値調整 | `8b5f2a4` | BUY 0.30→0.28, SELL -0.20→-0.15, 4成分圧縮補正 |

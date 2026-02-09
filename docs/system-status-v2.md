@@ -1,9 +1,9 @@
-# システム現状ステータス v2 — Phase 2 + VOL_CLAMP_MIN修正後チェックポイント
+# システム現状ステータス v2 — Phase 3 Market Context + 閾値調整後チェックポイント
 
-**スナップショット日時**: 2026-02-09 23:00 JST  
+**スナップショット日時**: 2026-02-10 JST  
 **前回スナップショット**: v1 (`a986c13`, Phase 1 完了時点)  
-**最新コミット**: `5ffcbea` (main) — VOL_CLAMP_MIN 0.5→0.67  
-**目的**: Phase 2 実装 + 初日運用分析 + VOL_CLAMP_MIN修正後の状態記録。次回調査の起点。
+**最新コミット**: `8b5f2a4` (main) — 4成分化閾値調整 (BUY 0.28, SELL -0.15)  
+**目的**: Phase 2 実装 + Phase 3 Market Context第4の柱 + 閾値調整後の状態記録。次回調査の起点。
 
 ---
 
@@ -16,7 +16,12 @@
    - スコア0.20未満の限界的シグナルが正しくブロックされているか確認
    - 逆に有効なシグナルまでブロックされていないかチェック
 
-2. **Phase 2 トレードの勝率改善確認**
+2. **Market Context 第4の柱の効果検証** (新規)
+   - 4成分体制 (Tech=0.45, Chronos=0.25, Sent=0.15, MktCtx=0.15) のバランス確認
+   - Fear & Greed / Funding Rate / BTC Dominance がシグナル品質に与える影響
+   - 調整後閾値 (BUY=0.28, SELL=-0.15) でのシグナル頻度が適切か
+
+3. **Phase 2/3 トレードの勝率改善確認**
    - Phase 2 初日は 0勝3敗 (XRP ¥-462, BTC ¥-102, AVAX ¥-211 = 合計 ¥-775)
    - VOL_CLAMP_MIN修正後のトレードで改善しているか
 
@@ -70,13 +75,15 @@ aws dynamodb scan --table-name eth-trading-signals --output json > data/signals_
 | `technical_score` | N | Phase 2+ | テクニカルスコア (-1.0 ~ +1.0) |
 | `chronos_score` | N | Phase 2+ | Chronos予測スコア (-1.0 ~ +1.0) |
 | `sentiment_score` | N | Phase 2+ | センチメントスコア (-1.0 ~ +1.0) |
-| `weight_technical` | N | Phase 2+ | テクニカル重み (0.55) |
-| `weight_chronos` | N | Phase 2+ | Chronos重み (0.30) |
+| `weight_technical` | N | Phase 2+ | テクニカル重み (0.45) |
+| `weight_chronos` | N | Phase 2+ | Chronos重み (0.25) |
 | `weight_sentiment` | N | Phase 2+ | センチメント重み (0.15) |
+| `weight_market_context` | N | Phase 3+ | マーケットコンテキスト重み (0.15) |
+| `market_context_score` | N | Phase 3+ | マーケットコンテキストスコア |
 | `buy_threshold` | N | Phase 2+ | 実効BUY閾値 (動的) |
 | `sell_threshold` | N | Phase 2+ | 実効SELL閾値 (動的) |
 
-> **Phase 2 トレードの見分け方**: `weight_technical=0.55` を持つレコードがPhase 2以降
+> **Phase 3 トレードの見分け方**: `weight_technical=0.45` + `weight_market_context` が存在するレコードがPhase 3以降
 
 ### Slack ログの活用
 
@@ -123,11 +130,12 @@ aws dynamodb scan --table-name eth-trading-signals --output json > data/signals_
 
 | パラメータ | 環境変数 | 現在値 | Phase 1 | Phase 2変更 | 変更理由 |
 |-----------|---------|--------|---------|------------|---------|
-| テクニカル重み | `TECHNICAL_WEIGHT` | **0.55** | 0.45 | `8211ac1` | #15 データドリブン分析 |
-| Chronos重み | `AI_PREDICTION_WEIGHT` | **0.30** | 0.40 | `8211ac1` | #15 near-zero 52% |
+| テクニカル重み | `TECHNICAL_WEIGHT` | **0.45** | 0.45 | `72cf12f` | #20 4成分化 |
+| Chronos重み | `AI_PREDICTION_WEIGHT` | **0.25** | 0.40 | `72cf12f` | #20 4成分化 |
 | センチメント重み | `SENTIMENT_WEIGHT` | 0.15 | 0.15 | - | 変更なし |
-| BUY基準閾値 | `BASE_BUY_THRESHOLD` | **0.30** | 0.20 | - | #9 (Phase 1) |
-| SELL基準閾値 | `BASE_SELL_THRESHOLD` | -0.20 | -0.20 | - | 変更なし |
+| マーケットCtx重み | `MARKET_CONTEXT_WEIGHT` | **0.15** | - | `72cf12f` | #20 新規 |
+| BUY基準閾値 | `BASE_BUY_THRESHOLD` | **0.28** | 0.20 | `8b5f2a4` | #20a 4成分圧縮補正 |
+| SELL基準閾値 | `BASE_SELL_THRESHOLD` | **-0.15** | -0.20 | `8b5f2a4` | #20a 4成分圧縮補正 |
 | BB幅基準 | `BASELINE_BB_WIDTH` | 0.03 | 0.03 | - | 変更なし |
 | ボラ補正下限 | `VOL_CLAMP_MIN` | **0.67** | 0.50 | `5ffcbea` | #19 最低BUY閾値0.15→0.20 |
 | ボラ補正上限 | `VOL_CLAMP_MAX` | 2.0 | 2.0 | - | 変更なし |
@@ -138,8 +146,10 @@ aws dynamodb scan --table-name eth-trading-signals --output json > data/signals_
 ```
 vol_ratio = avg_bb_width / BASELINE_BB_WIDTH(0.03)
 vol_ratio = clamp(vol_ratio, VOL_CLAMP_MIN(0.67), VOL_CLAMP_MAX(2.0))
-BUY_threshold = BASE_BUY_THRESHOLD(0.30) × vol_ratio
-→ 範囲: [0.20, 0.60]  # 修正前は [0.15, 0.60]
+BUY_threshold = BASE_BUY_THRESHOLD(0.28) × vol_ratio
+SELL_threshold = BASE_SELL_THRESHOLD(-0.15) × vol_ratio
+→ BUY範囲: [0.19, 0.56]
+→ SELL範囲: [-0.10, -0.30]
 ```
 
 ### Technical (`services/technical/handler.py`, ~488行)
@@ -219,11 +229,14 @@ BUY_threshold = BASE_BUY_THRESHOLD(0.30) × vol_ratio
 | 18 | トレードコンテキスト保存 | `8211ac1` | aggregator, order-executor |
 | - | Chronos Typical Price (H+L+C)/3 | `90684dc` | chronos-caller |
 
-### Phase 3 (運用データフィードバック)
+### Phase 3 (運用データフィードバック + Market Context)
 
 | # | 改善内容 | コミット | Lambda |
 |---|---------|---------|--------|
 | 19 | VOL_CLAMP_MIN 0.5→0.67 | `5ffcbea` | aggregator |
+| 17a | NLP "buy the dip" コンテキスト修正 | `aa138cf` | news-collector |
+| 20 | Market Context 第4の柱 (F&G/Funding/BTC Dom) | `72cf12f` | market-context(新規), aggregator |
+| 20a | 4成分化閾値調整 (BUY 0.28, SELL -0.15) | `8b5f2a4` | aggregator |
 
 ---
 
@@ -238,9 +251,10 @@ BUY_threshold = BASE_BUY_THRESHOLD(0.30) × vol_ratio
 | `eth-trading-chronos-caller` | ONNX Chronos-T5-Tiny (KVキャッシュ+Typical Price) | 2026-02-09 | ~433 |
 | `eth-trading-sentiment-getter` | CryptoPanic センチメント | - | - |
 | `eth-trading-news-collector` | ニュース収集 + BTC相関 + NLPセンチメント | 2026-02-09 | ~370+ |
-| `eth-trading-aggregator` | 統合スコアリング + 売買判定 + context | 2026-02-09 | ~580 |
+| `eth-trading-aggregator` | 4成分統合スコアリング + 売買判定 + context | 2026-02-10 | ~660 |
 | `eth-trading-order-executor` | Coincheck 成行注文 + CB + context保存 | 2026-02-09 | ~1027 |
 | `eth-trading-position-monitor` | SL/TP/トレーリング (5分間隔) | 2026-02-09 | - |
+| `eth-trading-market-context` | F&G/Funding/BTC Dom収集 (30分間隔) | 2026-02-10 | ~300 |
 | `eth-trading-error-remediator` | エラー検知→Slack→自動修復 | - | - |
 
 ### AWS環境
@@ -275,13 +289,20 @@ Compress-Archive -Path "services/chronos-caller/*" -DestinationPath "chronos.zip
                     ┌─────────┼─────────┐
                 technical  chronos  sentiment
                     └─────────┼─────────┘
-                          aggregator (0.55/0.30/0.15 weighted)
-                              ↓ (BUY: score>threshold / SELL: score<threshold)
+                          aggregator
+                              │ + DynamoDB(market-context) ← market-context Lambda (30分毎)
+                              ↓ 4成分加重 (0.45/0.25/0.15/0.15)
+                              ↓ (BUY: score>0.28×vol / SELL: score<-0.15×vol)
                           SQS → order-executor → Coincheck API
                                                       ↓
 [5分間隔] EventBridge → position-monitor → SL/TP/トレーリング判定
                               ↓ (トリガー時)
                           SQS → order-executor → Coincheck API
+
+[30分間隔] EventBridge → market-context → DynamoDB(market-context)
+                              ↑ Alternative.me (F&G)
+                              ↑ Binance Futures (Funding)
+                              ↑ CoinGecko (BTC Dom)
 ```
 
 ---
@@ -312,7 +333,8 @@ Compress-Archive -Path "services/chronos-caller/*" -DestinationPath "chronos.zip
 
 | アイデア | 優先度 | 前提条件 |
 |----------|--------|---------|
-| VOL_CLAMP_MIN 微調整 (0.67→?) | 高 | 修正後データ蓄積 |
+| Market Context第4の柱 | 中 | Phase 3効果検証 |
+| VOL_CLAMP_MIN 微調整 (0.67→?) | 中 | 修正後データ蓄積 |
 | サーキットブレーカー ON | 中 | 連敗パターン分析 |
 | トレーリングストップ段階追加 | 中 | 利確パターン分析 |
 | ポーリング間隔短縮 (5分→1分) | 中 | コスト試算 |
@@ -325,6 +347,9 @@ Compress-Archive -Path "services/chronos-caller/*" -DestinationPath "chronos.zip
 ## 📝 コミット履歴（全件）
 
 ```
+8b5f2a4 feat: adjust thresholds for 4-component scoring (BUY 0.30→0.28, SELL -0.20→-0.15)
+72cf12f feat: add market-context 4th pillar (F&G + Funding + BTC Dom) (#20)
+aa138cf fix: NLP buy-the-dip context recognition
 5ffcbea feat: raise VOL_CLAMP_MIN 0.5→0.67 (#19) - min BUY threshold 0.15→0.20
 4705a49 fix: order-executor analysis_context NameError + auto-fix workflow timeout
 37bfe9b chore: hashtag change #暗号通貨自動売買 → #自動売買

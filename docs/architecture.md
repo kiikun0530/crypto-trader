@@ -18,6 +18,9 @@ flowchart LR
         API_BINANCE["Binance API<br/>6通貨の価格取得"]
         API_COINCHECK["Coincheck API<br/>取引執行（JPYペア）"]
         API_CRYPTOPANIC["CryptoPanic API v2<br/>Growth Plan"]
+        API_FNG["Alternative.me<br/>Fear & Greed Index"]
+        API_FUNDING["Binance Futures<br/>ファンディングレート"]
+        API_COINGECKO["CoinGecko Global<br/>BTC Dominance"]
         SLACK["Slack Webhook"]
     end
 
@@ -25,6 +28,7 @@ flowchart LR
         EB_PRICE["5分間隔<br/>price-collection"]
         EB_POSITION["5分間隔<br/>position-monitor"]
         EB_NEWS["30分間隔<br/>news-collection"]
+        EB_MKTCTX["30分間隔<br/>market-context"]
     end
 
     subgraph Lambda["Lambda Functions (VPC外)"]
@@ -36,13 +40,14 @@ flowchart LR
         L_ORDER["order-executor<br/>注文実行"]
         L_POSITION["position-monitor<br/>全通貨SL/TP監視"]
         L_NEWS["news-collector<br/>ニュース収集"]
+        L_MKTCTX["market-context<br/>市場環境収集"]
         L_REMEDIATE["error-remediator<br/>エラー自動修復"]
     end
 
     subgraph StepFunctions["Step Functions (Map State)"]
         SF_MAP["Map: 全通貨をイテレート"]
         SF_PARALLEL["Parallel: 3分析を並列実行"]
-        SF_AGG["Aggregator: 全通貨スコア比較"]
+        SF_AGG["Aggregator: 全通貨スコア比較<br/>+ Market Context取得"]
     end
 
     subgraph Messaging["Messaging"]
@@ -51,13 +56,14 @@ flowchart LR
         SNS_ALERTS{{"alerts"}}
     end
 
-    subgraph DynamoDB["DynamoDB (6 Tables, 全通貨共有)"]
+    subgraph DynamoDB["DynamoDB (7 Tables, 全通貨共有)"]
         DB_PRICES[("prices<br/>pair=PK, TTL:14日")]
         DB_SENTIMENT[("sentiment<br/>pair=PK, TTL:14日")]
         DB_POSITIONS[("positions<br/>pair=PK")]
         DB_TRADES[("trades<br/>pair=PK")]
         DB_SIGNALS[("signals<br/>pair=PK, TTL:90日")]
         DB_STATE[("analysis_state<br/>pair=PK")]
+        DB_MKTCTX[("market-context<br/>context_type=PK, TTL:14日")]
     end
 
     subgraph S3["S3"]
@@ -75,6 +81,7 @@ flowchart LR
     EB_PRICE -->|"毎5分"| L_PRICE
     EB_POSITION -->|"毎5分"| L_POSITION
     EB_NEWS -->|"30分毎"| L_NEWS
+    EB_MKTCTX -->|"30分毎"| L_MKTCTX
 
     %% 価格収集 → 分析トリガー
     L_PRICE -->|"6通貨取得"| API_BINANCE
@@ -97,8 +104,10 @@ flowchart LR
     L_CHRONOS -->|"ONNX Model"| S3_ONNX
     L_SENTIMENT -->|"R"| DB_SENTIMENT
     L_NEWS -->|"W"| DB_SENTIMENT
+    L_MKTCTX -->|"W"| DB_MKTCTX
     L_PRICE -->|"R/W"| DB_STATE
     L_AGG -->|"R"| DB_POSITIONS
+    L_AGG -->|"R"| DB_MKTCTX
     L_AGG -->|"W"| DB_SIGNALS
     L_ORDER -->|"R/W"| DB_POSITIONS
     L_ORDER -->|"W"| DB_TRADES
@@ -120,6 +129,9 @@ flowchart LR
     %% 外部API
     L_ORDER --> API_COINCHECK
     L_NEWS --> API_CRYPTOPANIC
+    L_MKTCTX --> API_FNG
+    L_MKTCTX --> API_FUNDING
+    L_MKTCTX --> API_COINGECKO
 
     %% 監視・自動修復
     SQS_DLQ -.->|"滞留監視"| CW_ALARM
@@ -197,7 +209,7 @@ DynamoDB は全テーブルが `pair` を Partition Key にしており、通貨
 
 ### AI価格予測 (Chronos) のインフラ選定
 
-スコアリング全体の **40%のウェイト** を占める AI 価格予測コンポーネントについて、以下の選択肢を比較検討した。
+スコアリング全体の **25%のウェイト** を占める AI 価格予測コンポーネントについて、以下の選択肢を比較検討した。
 
 | 選択肢 | 方式 | 月額 | 推論時間 | 精度 | 運用負荷 |
 |---|---|---|---|---|---|
@@ -284,8 +296,8 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
                                                         └→ コード修正 → デプロイ → 検証
 ```
 
-- **CloudWatch Alarms (18個)**: 全9 Lambda × (Errors + Duration) で異常検知
-- **Subscription Filters (8個)**: warm-up以外の全Lambdaのエラーログを検知
+- **CloudWatch Alarms (20個)**: 全10 Lambda × (Errors + Duration) で異常検知
+- **Subscription Filters (9個)**: warm-up以外の全Lambdaのエラーログを検知
 - **error-remediator Lambda**: エラー検知 → Slack通知 + GitHub Actions トリガー（30分クールダウン付き）
 - **GitHub Actions**: Claude Sonnet によるエラー分析 → コード修正 → Terraform デプロイ → 検証 → 自動push
 
@@ -314,6 +326,7 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
 | positions | pair (S) | position_id (S) | - | ポジション管理 |
 | trades | pair (S) | timestamp (N) | - | 取引履歴（永続・税務対応） |
 | analysis_state | pair (S) | - | - | 通貨別の最終分析時刻 |
+| market-context | context_type (S) | timestamp (N) | 14日 | マクロ市場環境指標 |
 
 ### TTL 設計の根拠
 
@@ -324,6 +337,7 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
 | signals | 90日 | パフォーマンス分析用に長めに保持 |
 | positions | なし | 取引履歴は永続保存（税務対応） |
 | trades | なし | 取引履歴は永続保存（税務対応） |
+| market-context | 14日 | マクロ指標は短期分のみ必要 |
 
 ---
 
@@ -349,9 +363,9 @@ IAM ロールは最小権限原則で設計。各 Lambda は必要な DynamoDB �
 | 項目 | 月額 | 備考 |
 |---|---|---|
 | Lambda | ~$5.00 | 6通貨分析 + ONNX推論 + error-remediator含む |
-| DynamoDB | ~$0.30 | 6テーブル×6通貨分のR/W + クールダウン |
+| DynamoDB | ~$0.35 | 7テーブル×6通貨分のR/W + クールダウン |
 | Step Functions | ~$0.10 | Map State で遷移数増加 |
-| CloudWatch | ~$0.50 | ログ保存14日 + Metric Alarms 18個 + Subscription Filters |
+| CloudWatch | ~$0.55 | ログ保存14日 + Metric Alarms 20個 + Subscription Filters |
 | Secrets Manager | ~$0.50 | Coincheck + GitHub PAT |
 | SQS/SNS/EventBridge | ~$0.05 | 軽微 |
 | **AWS合計** | **~$7/月** | |
@@ -360,7 +374,9 @@ IAM ロールは最小権限原則で設計。各 Lambda は必要な DynamoDB �
 
 | API | 費用 | 備考 |
 |---|---|---|
-| Binance | 無料 | 6通貨分の価格取得（認証不要） |
+| Binance | 無料 | 6通貨分の価格取得 + ファンディングレート（認証不要） |
+| Alternative.me | 無料 | Fear & Greed Index |
+| CoinGecko | 無料 | BTC Dominance |
 | CryptoPanic | 無料 or $199/月 | Growth Plan でリアルタイム取得 |
 | Coincheck | 0% | 取引手数料無料 |
 | Anthropic | 従量制 | 自動修復パイプライン (~$0.01-0.03/修復) |

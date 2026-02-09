@@ -1,6 +1,6 @@
 # Lambda関数リファレンス
 
-全10個の Lambda 関数の仕様、入出力、設定の詳細。
+全11個の Lambda 関数の仕様、入出力、設定の詳細。
 
 ---
 
@@ -24,6 +24,7 @@
 | `MODEL_BUCKET` | ONNXモデル格納S3バケット |
 | `MODEL_PREFIX` | ONNXモデルのS3プレフィックス |
 | `CRYPTOPANIC_API_KEY` | CryptoPanic APIキー |
+| `MARKET_CONTEXT_TABLE` | マーケットコンテキストテーブル名 |
 | `VOLATILITY_THRESHOLD` | 変動閾値（%） |
 | `MAX_POSITION_JPY` | 最大ポジション額（円） |
 
@@ -273,14 +274,14 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
 
 ## aggregator
 
-全通貨の分析結果を統合、スコアランキングを作成し、最適な売買判定を行う。
+全通貨の分析結果を統合、マーケットコンテキストを加味してスコアランキングを作成し、最適な売買判定を行う。
 
 | 項目 | 値 |
 |---|---|
 | トリガー | Step Functions (Map完了後) |
 | メモリ | 512MB |
 | タイムアウト | 120秒 |
-| DynamoDB | signals (W), positions (R) |
+| DynamoDB | signals (W), positions (R), market-context (R) |
 
 ### 入力 (Step Functions Map の出力)
 
@@ -300,11 +301,14 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
 
 ### 処理フロー
 
-1. 各通貨の加重平均スコアを計算
+0. DynamoDB `market-context` テーブルから最新のマーケットコンテキストを取得
+   - 2時間以上古い場合は中立 (0.0) として扱う
+1. 各通貨の4成分加重平均スコアを計算 (Tech×0.45 + Chronos×0.25 + Sent×0.15 + MktCtx×0.15)
+   - アルトコインはBTC Dominance補正: >60%で-0.05、<40%で+0.05
 2. BB幅（ボリンジャーバンド幅）からボラティリティ適応型閾値を計算
-   - `vol_ratio = avg_bb_width / baseline(0.03)` → クランプ 0.5〜2.0
-   - `buy_threshold = 0.20 × vol_ratio`, `sell_threshold = -0.20 × vol_ratio`
-3. 全通貨のシグナルを DynamoDB に保存（動的閾値・BB幅も記録）
+   - `vol_ratio = avg_bb_width / baseline(0.03)` → クランプ 0.67〜2.0
+   - `buy_threshold = 0.28 × vol_ratio`, `sell_threshold = -0.15 × vol_ratio`
+3. 全通貨のシグナルを DynamoDB に保存（動的閾値・BB幅・market_context_scoreも記録）
 4. 全通貨をスコア降順でランキング
 5. 全通貨のアクティブポジションを取得（複数保有対応）
 6. 売買判定（SELL優先、動的閾値で判定）:
@@ -312,7 +316,7 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
    - BUY判定: 未保有通貨の中で最高スコア >= buy_threshold → BUY
    - それ以外 → HOLD
 7. シグナルがあれば SQS に注文メッセージ送信
-8. Slack にランキング + 動的閾値付き分析結果を通知
+8. Slack にランキング + 動的閾値 + 市場環境付き分析結果を通知
 
 ### 出力
 
@@ -320,16 +324,24 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
 {
   "signal": "BUY",
   "target_pair": "eth_jpy",
-  "target_score": 0.7234,
+  "target_score": 0.5234,
   "has_signal": true,
   "ranking": [
-    {"pair": "eth_usdt", "name": "Ethereum", "score": 0.7234},
-    {"pair": "btc_usdt", "name": "Bitcoin", "score": 0.4521},
+    {"pair": "eth_usdt", "name": "Ethereum", "score": 0.5234},
+    {"pair": "btc_usdt", "name": "Bitcoin", "score": 0.3521},
     ...
   ],
   "active_positions": ["eth_jpy", "btc_jpy"],
-  "buy_threshold": 0.2000,
-  "sell_threshold": -0.2000
+  "buy_threshold": 0.2800,
+  "sell_threshold": -0.1500,
+  "market_context": {
+    "market_score": 0.1468,
+    "components": {
+      "fear_greed": {"value": 14, "score": 0.397},
+      "funding_rate": {"avg_rate": -0.0066, "score": 0.133},
+      "btc_dominance": {"value": 56.86, "score": -0.457}
+    }
+  }
 }
 ```
 
@@ -493,6 +505,71 @@ DLQ滞留等のシステムアラートを Slack Webhook に転送。取引通�
 
 ---
 
+## market-context (Phase 3 新設)
+
+30分間隔でマクロ市場環境指標を収集し、DynamoDB に保存。Aggregator が直接読み取って4番目の分析成分として使用。
+
+| 項目 | 値 |
+|---|---|
+| トリガー | EventBridge (30分間隔) |
+| メモリ | 256MB |
+| タイムアウト | 60秒 |
+| DynamoDB | market-context (W) |
+| 外部API | Alternative.me, Binance Futures, CoinGecko |
+
+### 処理フロー
+
+1. Alternative.me API から Fear & Greed Index を取得
+2. Binance Futures API から主要通貨のファンディングレートを取得
+3. CoinGecko Global API から BTC Dominance を取得
+4. 3つのサブスコアを加重平均してマーケットスコアを算出
+5. DynamoDB `market-context` テーブルに保存 (TTL: 14日)
+
+### 外部API
+
+| API | エンドポイント | 取得データ | コスト |
+|---|---|---|---|
+| Alternative.me | `api.alternative.me/fng/` | Fear & Greed Index (0-100) | 無料 |
+| Binance Futures | `fapi.binance.com/fapi/v1/premiumIndex` | ファンディングレート | 無料 |
+| CoinGecko | `api.coingecko.com/api/v3/global` | BTC Dominance (%) | 無料 |
+
+### スコア計算
+
+```
+market_score = fng_score × 0.50 + funding_score × 0.30 + dominance_score × 0.20
+```
+
+| サブスコア | 重み | ロジック |
+|---|---|---|
+| F&G Score | 50% | 逆張り: Extreme Fear(0-10)→+1.0, Extreme Greed(90-100)→-1.0 |
+| Funding Score | 30% | 逆符号: 正のfunding(ロング過多)→売り圧力、負→買いチャンス |
+| Dominance Score | 20% | 50%を中立として ±15%で±1.0にスケール |
+
+### 出力 (DynamoDB)
+
+```json
+{
+  "context_type": "market_context",
+  "timestamp": 1770523800,
+  "market_score": 0.1468,
+  "components": {
+    "fear_greed": {"value": 14, "classification": "Extreme Fear", "score": 0.397},
+    "funding_rate": {"symbols": ["BTCUSDT", "ETHUSDT", ...], "avg_rate": -0.000066, "score": 0.133},
+    "btc_dominance": {"value": 56.86, "score": -0.457}
+  },
+  "ttl": 1771733400
+}
+```
+
+### 設計上の注意点
+
+- Step Functions パイプラインには**含まれない**（独立した EventBridge スケジュール）
+- Aggregator が DynamoDB から直接読み取る（2時間以上古い場合は中立扱い）
+- 全通貨で同一スコアを適用（マクロ環境は通貨間で共通）
+- BTC Dominance によるアルトコイン補正は Aggregator 側で実施
+
+---
+
 ## データフロー図
 
 ```mermaid
@@ -501,6 +578,7 @@ flowchart TD
         E1["5分毎"] --> PC["price-collector"]
         E2["5分毎"] --> PM["position-monitor"]
         E3["30分毎"] --> NC["news-collector"]
+        E4["30分毎"] --> MC["market-context"]
     end
 
     subgraph Step Functions
@@ -511,13 +589,21 @@ flowchart TD
         TECH & CHRON & SENT --> AGG["aggregator"]
     end
 
+    subgraph 外部API
+        MC -->|"Fear & Greed"| ALT["Alternative.me"]
+        MC -->|"Funding Rate"| BIN["Binance Futures"]
+        MC -->|"BTC Dominance"| CG["CoinGecko"]
+    end
+
     subgraph DynamoDB
         PC -->|"W"| DB_P["prices"]
         PC -->|"R/W"| DB_ST["analysis_state"]
         NC -->|"W"| DB_S["sentiment"]
+        MC -->|"W"| DB_MC["market-context"]
         TECH -->|"R"| DB_P
         CHRON -->|"R"| DB_P
         SENT -->|"R"| DB_S
+        AGG -->|"R"| DB_MC
         AGG -->|"W"| DB_SIG["signals"]
         AGG -->|"R"| DB_POS["positions"]
         OE -->|"R/W"| DB_POS
