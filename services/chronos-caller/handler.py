@@ -19,7 +19,7 @@ import traceback
 from botocore.exceptions import ClientError
 from botocore.config import Config
 
-# SageMaker用のリトライ設定を強化
+# SageMaker用のリトライ設定を修正（不正なretry_delayパラメータを削除）
 sagemaker_config = Config(
     retries={
         'max_attempts': 3,
@@ -189,10 +189,12 @@ def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_s
                     raise
             else:
                 # ThrottlingException以外のエラーは即座に再発生
+                print(f"SageMaker error (non-throttling): {error_code} - {str(e)}")
                 raise
                 
         except Exception as e:
             # その他の例外（ネットワークエラー等）も再発生
+            print(f"SageMaker unexpected error: {str(e)}")
             raise
     
     # ここには到達しないはずだが、安全のため
