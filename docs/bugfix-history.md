@@ -477,3 +477,48 @@ filter_pattern = "?\"[ERROR]\" ?Traceback ?\"raise Exception\" -\"[INFO]\" -\"ex
 | 同時実行数の階層設計 | クォータ(10) > Endpoint(8) > StepFunctions(6) でマージン確保 |
 | リトライログの分類 | `[INFO]` / `[WARN]` / `[ERROR]` プレフィックスで監視フィルターと連携 |
 | Endpoint Config のバージョン管理 | `config-v2` として新規作成 → エンドポイントに適用 |
+
+---
+
+## 9. 02/11 Chronos-T5-Base → Chronos-2 モデルアップグレード
+
+### 概要
+
+- **日時**: 2026-02-11 02:00 JST
+- **変更種別**: モデルアップグレード（性能改善）
+- **影響**: chronos-caller Lambda、SageMaker Endpoint
+
+### 動機
+
+ThrottlingException修正の調査中にChronos-2の存在を発見。Chronos-T5-Base (200M) に比べて:
+- **250倍高速**: サンプリング不要の分位数直接出力
+- **10%高精度**: WQL (Weighted Quantile Loss) で改善
+- **40%軽量**: 200M → 120M パラメータ
+
+### 変更内容
+
+| ファイル | 変更内容 |
+|----------|----------|
+| `scripts/deploy_sagemaker_chronos.py` | Chronos-2用にフルリライト: DLC 2.6.0 + predict_quantiles API |
+| `services/chronos-caller/handler.py` | NUM_SAMPLES廃止、モデル名更新、q10/q90追加 |
+| `terraform/lambda.tf` | 関数説明を "Chronos-2 AI予測" に更新 |
+
+### SageMaker 構成変更
+
+| 項目 | 旧 (T5-Base) | 新 (Chronos-2) |
+|------|-------------|----------------|
+| Model Name | `eth-trading-chronos-base` | `eth-trading-chronos-2` |
+| Endpoint Config | `eth-trading-chronos-base-config-v2` | `eth-trading-chronos-2-config` |
+| DLC Image | `huggingface-pytorch-inference:2.1.0-transformers4.37.0-cpu-py310` | `huggingface-pytorch-inference:2.6.0-transformers4.49.0-cpu-py312` |
+| HF_MODEL_ID | `amazon/chronos-t5-base` | `amazon/chronos-2` |
+| 依存 | `chronos-forecasting==1.3.0` | `chronos-forecasting>=2.2.0` |
+| S3 Key | `chronos-base/model.tar.gz` | `chronos-2/model.tar.gz` |
+| 推論方式 | 50回サンプリング → median/std | predict_quantiles → q10/q50/q90 直接出力 |
+
+### デプロイ時の注意点
+
+1. **DLC イメージバージョン**: `chronos-forecasting>=2.2.0` は `torch>=2.2` を要求するため、DLC を 2.6.0 に更新が必要
+2. **predict API**: `predict()` は `list[Tensor]` を返す（各要素 shape: `(variates, quantiles, time)`）
+3. **predict_quantiles API**: `tuple[list[Tensor], list[Tensor]]` = `(quantiles, mean)` を返す
+4. **3D入力**: Chronos-2 は `(batch, variates, time)` の3Dテンソルが必要（旧版は2D）
+5. **Endpoint Name**: 既存のまま `eth-trading-chronos-base` を維持（handler.py/terraform変更不要）

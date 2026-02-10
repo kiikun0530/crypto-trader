@@ -64,7 +64,7 @@ locals {
       handler     = "handler.handler"
     }
     chronos-caller = {
-      description = "Chronos AI予測 (SageMaker Base)"
+      description = "Chronos-2 AI予測 (SageMaker Serverless)"
       timeout     = 180
       memory      = 256
       handler     = "handler.handler"

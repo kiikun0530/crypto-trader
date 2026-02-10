@@ -1,6 +1,6 @@
 """
 SageMaker Serverless Endpoint デプロイスクリプト
-Chronos-T5-Base (200M) を HuggingFace DLC でデプロイ
+Chronos-2 (120M) を HuggingFace DLC でデプロイ
 
 boto3のみ使用（sagemaker SDK 不要）
 
@@ -8,9 +8,13 @@ boto3のみ使用（sagemaker SDK 不要）
     python scripts/deploy_sagemaker_chronos.py
 
 コスト見積もり:
-    - Serverless: 使った分だけ課金 (~$5-15/月)
+    - Serverless: 使った分だけ課金 (~$0.5-2/月)
     - メモリ: 6144MB (推論時のみ確保)
-    - コールドスタート: 60-120秒 (Step Functions タイムアウト 300秒以内)
+    - コールドスタート: 30-60秒 (Chronos-2はBoltベースで高速)
+
+変更履歴:
+    - v1: Chronos-T5-Base (200M) — サンプリングベース推論
+    - v2: Chronos-2 (120M) — 分位数直接出力、250倍高速、5%高精度
 """
 import boto3
 import json
@@ -26,42 +30,43 @@ import time
 REGION = "ap-northeast-1"
 ACCOUNT_ID = "652679684315"
 ENDPOINT_NAME = "eth-trading-chronos-base"
-MODEL_NAME = "eth-trading-chronos-base"
-ENDPOINT_CONFIG_NAME = "eth-trading-chronos-base-config"
+MODEL_NAME = "eth-trading-chronos-2"
+ENDPOINT_CONFIG_NAME = "eth-trading-chronos-2-config"
 ROLE_ARN = f"arn:aws:iam::{ACCOUNT_ID}:role/eth-trading-sagemaker-execution-role"
 
-# HuggingFace DLC イメージ (PyTorch 2.1.0, Python 3.10, HuggingFace Inference)
-# ap-northeast-1 の HuggingFace Inference CPU イメージ
-HF_IMAGE_URI = f"763104351884.dkr.ecr.{REGION}.amazonaws.com/huggingface-pytorch-inference:2.1.0-transformers4.37.0-cpu-py310-ubuntu22.04"
+# HuggingFace DLC イメージ (PyTorch 2.6.0, Python 3.12, HuggingFace Inference)
+# Chronos-2 は torch>=2.2, transformers>=4.41 を要求するため 2.6.0 に更新
+HF_IMAGE_URI = f"763104351884.dkr.ecr.{REGION}.amazonaws.com/huggingface-pytorch-inference:2.6.0-transformers4.49.0-cpu-py312-ubuntu22.04"
 
 # Serverless設定
-MEMORY_SIZE_MB = 6144  # 6GB (Chronos-Base + PyTorch CPU)
-MAX_CONCURRENCY = 2    # 最大同時実行数
+MEMORY_SIZE_MB = 6144  # 6GB (Chronos-2 + PyTorch CPU)
+MAX_CONCURRENCY = 8    # 最大同時実行数 (クォータ10以内)
 
 MODEL_BUCKET = f"eth-trading-sagemaker-models-{ACCOUNT_ID}"
-MODEL_S3_KEY = "chronos-base/model.tar.gz"
+MODEL_S3_KEY = "chronos-2/model.tar.gz"
 
 
 def create_inference_code():
-    """SageMaker推論コード (inference.py) を生成"""
+    """SageMaker推論コード (inference.py) を生成 — Chronos-2版"""
     return '''
 import json
 import torch
 import numpy as np
-from chronos import ChronosPipeline
 
 # グローバルにモデルをキャッシュ
 _pipeline = None
 
 def model_fn(model_dir):
-    """モデルロード"""
+    """モデルロード — Chronos-2"""
     global _pipeline
     if _pipeline is None:
-        _pipeline = ChronosPipeline.from_pretrained(
-            "amazon/chronos-t5-base",
+        from chronos import BaseChronosPipeline
+        _pipeline = BaseChronosPipeline.from_pretrained(
+            "amazon/chronos-2",
             device_map="cpu",
             torch_dtype=torch.float32,
         )
+        print(f"[INFO] Model loaded: {type(_pipeline).__name__}", flush=True)
     return _pipeline
 
 def input_fn(request_body, request_content_type):
@@ -71,29 +76,39 @@ def input_fn(request_body, request_content_type):
     raise ValueError(f"Unsupported content type: {request_content_type}")
 
 def predict_fn(data, model):
-    """推論実行"""
-    context = torch.tensor([data["context"]], dtype=torch.float32)
+    """
+    推論実行 — Chronos-2 (分位数直接出力)
+    出力フォーマットは旧版と互換性を維持: median, mean, std, confidence
+    """
+    # Chronos-2 は 3D: (batch, variates, time)
+    context = torch.tensor([[data["context"]]], dtype=torch.float32)  # (1, 1, T)
     prediction_length = data.get("prediction_length", 12)
-    num_samples = data.get("num_samples", 50)
 
-    # Chronos推論 (確率的サンプリング)
-    forecast = model.predict(
+    # predict_quantiles → tuple(list[Tensor], list[Tensor])
+    #   quantiles_list[i]: (n_variates, prediction_length, n_quantile_levels)
+    #   mean_list[i]:      (n_variates, prediction_length)
+    quantiles_list, mean_list = model.predict_quantiles(
         context,
-        prediction_length,
-        num_samples=num_samples,
+        prediction_length=prediction_length,
+        quantile_levels=[0.1, 0.5, 0.9],
         limit_prediction_length=False,
     )
-    # forecast shape: (1, num_samples, prediction_length)
-    samples = forecast[0].numpy()  # (num_samples, prediction_length)
 
-    # 統計計算
-    median = np.median(samples, axis=0).tolist()
-    mean = np.mean(samples, axis=0).tolist()
-    std = np.std(samples, axis=0).tolist()
+    # 最初のシリーズ(唯一)、最初のvariate(univariate)
+    q = quantiles_list[0][0]  # (prediction_length, 3)
+    m = mean_list[0][0]       # (prediction_length,)
 
-    # 各ステップの確信度 (coefficient of variation ベース)
+    q10 = q[:, 0].numpy().tolist()     # 10th percentile
+    median = q[:, 1].numpy().tolist()  # 50th percentile
+    q90 = q[:, 2].numpy().tolist()     # 90th percentile
+    mean = m.numpy().tolist()
+
+    # std: 分位数の広がりから推定 (正規分布近似: q90-q10 = 2.56 sigma)
+    std = [abs(q90[i] - q10[i]) / 2.56 for i in range(len(q10))]
+
+    # 確信度: 予測区間の狭さベース
     confidence_per_step = []
-    for i in range(prediction_length):
+    for i in range(len(median)):
         if abs(median[i]) > 1e-8:
             cv = std[i] / abs(median[i])
             confidence_per_step.append(round(1.0 / (1.0 + cv * 10), 3))
@@ -104,9 +119,11 @@ def predict_fn(data, model):
         "median": median,
         "mean": mean,
         "std": std,
+        "q10": q10,
+        "q90": q90,
         "confidence_per_step": confidence_per_step,
         "confidence": round(float(np.mean(confidence_per_step)), 3),
-        "num_samples": num_samples,
+        "model": "chronos-2",
     }
 
 def output_fn(prediction, accept):
@@ -124,12 +141,13 @@ def package_model_artifacts():
     os.makedirs(code_dir, exist_ok=True)
 
     # inference.py
-    with open(os.path.join(code_dir, "inference.py"), "w") as f:
+    with open(os.path.join(code_dir, "inference.py"), "w", encoding="utf-8") as f:
         f.write(create_inference_code())
 
-    # requirements.txt
-    with open(os.path.join(code_dir, "requirements.txt"), "w") as f:
-        f.write("chronos-forecasting[inference]>=1.3.0\ntorch>=2.0.0\nnumpy\n")
+    # requirements.txt (Chronos-2 は cronos-forecasting 2.x 以降が必要)
+    # torch は DLC (2.6.0) にプリインストール済みなので不要
+    with open(os.path.join(code_dir, "requirements.txt"), "w", encoding="utf-8") as f:
+        f.write("chronos-forecasting>=2.2.0\nnumpy\n")
 
     # tar.gz 作成
     with tarfile.open(model_tar_path, "w:gz") as tar:
@@ -183,7 +201,7 @@ def create_sagemaker_role():
 
 
 def cleanup_existing(sm_client):
-    """既存リソースの削除"""
+    """既存リソースの削除 (旧T5モデルも含む)"""
     # Endpoint
     try:
         sm_client.describe_endpoint(EndpointName=ENDPOINT_NAME)
@@ -195,25 +213,27 @@ def cleanup_existing(sm_client):
     except sm_client.exceptions.ClientError:
         print("  No existing endpoint.")
 
-    # Endpoint Config
-    try:
-        sm_client.delete_endpoint_config(EndpointConfigName=ENDPOINT_CONFIG_NAME)
-        print("  Deleted existing endpoint config.")
-    except sm_client.exceptions.ClientError:
-        pass
+    # Endpoint Config — 新旧両方削除
+    for config_name in [ENDPOINT_CONFIG_NAME, "eth-trading-chronos-base-config-v2", "eth-trading-chronos-base-config"]:
+        try:
+            sm_client.delete_endpoint_config(EndpointConfigName=config_name)
+            print(f"  Deleted endpoint config: {config_name}")
+        except sm_client.exceptions.ClientError:
+            pass
 
-    # Model
-    try:
-        sm_client.delete_model(ModelName=MODEL_NAME)
-        print("  Deleted existing model.")
-    except sm_client.exceptions.ClientError:
-        pass
+    # Model — 新旧両方削除
+    for model_name in [MODEL_NAME, "eth-trading-chronos-base"]:
+        try:
+            sm_client.delete_model(ModelName=model_name)
+            print(f"  Deleted model: {model_name}")
+        except sm_client.exceptions.ClientError:
+            pass
 
 
 def deploy():
     """SageMaker Serverless エンドポイントをデプロイ (boto3のみ)"""
     print("=" * 60)
-    print("SageMaker Chronos-Base Serverless Endpoint Deploy")
+    print("SageMaker Chronos-2 Serverless Endpoint Deploy")
     print("=" * 60)
 
     sm_client = boto3.client("sagemaker", region_name=REGION)
@@ -242,7 +262,7 @@ def deploy():
             "Image": HF_IMAGE_URI,
             "ModelDataUrl": model_data_url,
             "Environment": {
-                "HF_MODEL_ID": "amazon/chronos-t5-base",
+                "HF_MODEL_ID": "amazon/chronos-2",
                 "HF_TASK": "time-series-forecasting",
                 "SAGEMAKER_MODEL_SERVER_TIMEOUT": "300",
             },
@@ -304,7 +324,6 @@ def deploy():
     test_data = {
         "context": [100.0 + i * 0.5 for i in range(60)],
         "prediction_length": 12,
-        "num_samples": 5,
     }
     try:
         response = runtime.invoke_endpoint(
@@ -312,9 +331,15 @@ def deploy():
             ContentType="application/json",
             Body=json.dumps(test_data),
         )
-        result = json.loads(response["Body"].read().decode("utf-8"))
+        raw = json.loads(response["Body"].read().decode("utf-8"))
+        # HuggingFace DLC wraps output_fn tuple as [json_string, content_type]
+        if isinstance(raw, list) and len(raw) >= 1 and isinstance(raw[0], str):
+            result = json.loads(raw[0])
+        else:
+            result = raw
         print(f"  Median (first 3): {result['median'][:3]}")
         print(f"  Confidence: {result['confidence']}")
+        print(f"  Model: {result.get('model', 'unknown')}")
         print("  Test PASSED")
     except Exception as e:
         print(f"  Test failed (cold start may need more time): {e}")

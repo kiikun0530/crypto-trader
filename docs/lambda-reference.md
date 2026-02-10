@@ -153,7 +153,7 @@ DynamoDB から価格履歴を読み取り、テクニカル指標を計算し�
 
 ## chronos-caller
 
-SageMaker Serverless Endpoint 上の Amazon Chronos-T5-Base (200M params) を呼び出し、AI 価格予測を行う。確信度 (confidence) 付きのスコアを返す。推論失敗時はモメンタムベースの代替スコアにフォールバック。
+SageMaker Serverless Endpoint 上の Amazon Chronos-2 (120M params) を呼び出し、AI 価格予測を行う。分位数予測 (q10/q50/q90) + 確信度 (confidence) 付きのスコアを返す。推論失敗時はモメンタムベースの代替スコアにフォールバック。
 
 | 項目 | 値 |
 |---|---|
@@ -167,7 +167,7 @@ SageMaker Serverless Endpoint 上の Amazon Chronos-T5-Base (200M params) を呼
 
 | モード | 条件 | 動作 |
 |---|---|---|
-| SageMaker推論 | エンドポイント正常 | Chronos-T5-Base で12ステップ先のAI価格予測 + 確信度算出 |
+| SageMaker推論 | エンドポイント正常 | Chronos-2 で12ステップ先のAI価格予測 + 分位数予測 + 確信度算出 |
 | フォールバック | SageMaker障害時 | モメンタムベーススコア（短期60% + 中期40%）、confidence=0.1 |
 
 ### SageMaker エンドポイント構成
@@ -177,11 +177,12 @@ SageMaker Serverless Endpoint 上の Amazon Chronos-T5-Base (200M params) を呼
 | エンドポイント名 | `eth-trading-chronos-base` |
 | タイプ | Serverless (6144MB, MaxConcurrency=8) |
 | アカウントクォータ | 全Serverlessエンドポイント合計のMaxConcurrency上限=10 |
-| DLC Image | `huggingface-pytorch-inference:2.1.0-transformers4.37.0-cpu-py310-ubuntu22.04` |
-| モデル格納 | `s3://eth-trading-sagemaker-models-652679684315/chronos-base/model.tar.gz` |
-| 依存ピン | `chronos-forecasting==1.3.0` (⚠️ torch 2.1.0互換に必須、>=1.3.0はtorch>=2.2を要求しCUDAを引き込む) |
+| DLC Image | `huggingface-pytorch-inference:2.6.0-transformers4.49.0-cpu-py312-ubuntu22.04` |
+| モデル格納 | `s3://eth-trading-sagemaker-models-652679684315/chronos-2/model.tar.gz` |
+| 依存 | `chronos-forecasting>=2.2.0` (torch 2.6.0 は DLC にプリインストール済) |
 | IAMロール | `eth-trading-sagemaker-execution-role` |
-| Endpoint Config | `eth-trading-chronos-base-config-v2` |
+| Endpoint Config | `eth-trading-chronos-2-config` |
+| Model Name | `eth-trading-chronos-2` |
 | デプロイスクリプト | `scripts/deploy_sagemaker_chronos.py` |
 
 #### 同時実行数の関係
@@ -202,7 +203,6 @@ AWSクォータ (10) ≥ エンドポイント MaxConcurrency (8) ≥ Step Funct
 |---|---|---|
 | 入力長 | 336本 (28h = 日次サイクル1周+α) | `INPUT_LENGTH` |
 | 予測ステップ | 12 (= 1h先) | `PREDICTION_LENGTH` |
-| サンプル数 | 50 | `NUM_SAMPLES` |
 | スコアスケール | ±3% = ±1.0 | `SCORE_SCALE_PERCENT` |
 
 ### 予測 → スコア変換
@@ -228,7 +228,8 @@ AWSクォータ (10) ≥ エンドポイント MaxConcurrency (8) ≥ Step Funct
 
 ### 確信度 (confidence)
 
-SageMaker側でサンプル分散から算出 (0.0-1.0):
+SageMaker側で分位数の広がりから算出 (0.0-1.0):
+- std を q90-q10 の正規分布近似で推定: `std = (q90 - q10) / 2.56`
 - 各ステップの `cv = std / |median|` → `confidence_step = 1 / (1 + cv * 10)`
 - 全ステップの平均が `confidence`
 - Aggregatorの動的ウェイトに使用 (#31)
@@ -239,13 +240,14 @@ SageMaker側でサンプル分散から算出 (0.0-1.0):
 {
   "pair": "eth_usdt",
   "chronos_score": 0.312,
-  "confidence": 0.948,
+  "confidence": 0.965,
   "prediction": [2355.2, 2361.8, 2358.5, ...],
   "prediction_std": [12.5, 15.3, 18.1, ...],
+  "prediction_q10": [2342.7, 2346.5, 2340.4, ...],
+  "prediction_q90": [2367.7, 2377.1, 2376.6, ...],
   "current_price": 2350.50,
   "data_points": 336,
-  "model": "chronos-t5-base",
-  "num_samples": 50
+  "model": "chronos-2"
 }
 ```
 

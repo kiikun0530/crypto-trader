@@ -1,14 +1,18 @@
 """
 Chronos呼び出し Lambda (SageMaker Endpoint版)
-SageMaker Serverless Endpoint 上の Chronos-T5-Base (200M) を呼び出し
+SageMaker Serverless Endpoint 上の Chronos-2 (120M) を呼び出し
 確信度 (confidence) 付きのスコアを返す
 
-改善点 (vs 旧ONNX Tiny版):
-- モデル: Tiny(8M) → Base(200M) — 予測精度大幅向上
-- 入力: 60本(5h) → 200本(16h) — パターン認識強化
-- サンプル: 20 → 50 — 中央値の安定性向上
-- スコアリング: ±1%飽和 → ±3%スケール + 外れ値カット
-- 確信度: なし → サンプル分散ベースの confidence を返却
+モデル遷移履歴:
+  v1: ONNX Tiny(8M)  — 軽量低精度
+  v2: T5-Base(200M)  — 50回サンプリング、高精度低速
+  v3: Chronos-2(120M) — 分位数直接出力、250倍高速、10%高精度
+
+改善点 (vs v2 T5-Base):
+- モデル: T5-Base(200M) → Chronos-2(120M) — 軽量化+高精度
+- 推論: 50回サンプリング → 分位数直接出力 — 250倍高速
+- 出力: q10/q50/q90 の分位数予測を追加
+- スコアリング: ±3%スケール + 分位数ベースの確信度
 """
 import json
 import os
@@ -36,7 +40,6 @@ sagemaker_client = boto3.client('sagemaker', config=sagemaker_config)
 PRICES_TABLE = os.environ.get('PRICES_TABLE', 'eth-trading-prices')
 SAGEMAKER_ENDPOINT = os.environ.get('SAGEMAKER_ENDPOINT', 'eth-trading-chronos-base')
 PREDICTION_LENGTH = int(os.environ.get('PREDICTION_LENGTH', '12'))
-NUM_SAMPLES = int(os.environ.get('NUM_SAMPLES', '50'))
 INPUT_LENGTH = int(os.environ.get('INPUT_LENGTH', '336'))  # 336 × 5min = 28h (日次サイクル1周+α)
 
 # スコアリング設定
@@ -78,7 +81,7 @@ def handler(event, context):
 
         # SageMaker Endpoint で推論（リトライ機能付き）
         try:
-            result = invoke_sagemaker_with_retry(prices, PREDICTION_LENGTH, NUM_SAMPLES)
+            result = invoke_sagemaker_with_retry(prices, PREDICTION_LENGTH)
             if result and 'median' in result:
                 score = predictions_to_score(result, prices[-1])
                 confidence = result.get('confidence', 0.5)
@@ -92,10 +95,11 @@ def handler(event, context):
                     'confidence': round(confidence, 3),
                     'prediction': result.get('median'),
                     'prediction_std': result.get('std'),
+                    'prediction_q10': result.get('q10'),
+                    'prediction_q90': result.get('q90'),
                     'current_price': prices[-1],
                     'data_points': len(prices),
-                    'model': 'chronos-t5-base',
-                    'num_samples': NUM_SAMPLES
+                    'model': result.get('model', 'chronos-2'),
                 }
             else:
                 print(f"SageMaker returned empty, fallback to momentum: {pair}")
@@ -207,17 +211,18 @@ def get_price_history(pair: str, limit: int = 200) -> list:
 # SageMaker Inference (リトライ機能強化)
 # ==============================================================
 
-def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_samples: int = 50) -> dict:
+def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12) -> dict:
     """
     SageMaker Serverless Endpoint を呼び出し（ThrottlingException対応リトライ付き）
     
     ThrottlingExceptionに対して指数バックオフでリトライを実行
     ValidationException/ValidationErrorの場合は即座に例外を再発生（エンドポイント不存在）
     SageMaker Serverlessは同時実行制限があるため、Throttlingは想定内の動作
+    Chronos-2 はサンプリング不要のため num_samples パラメータは廃止
     """
     for attempt in range(MAX_RETRIES):
         try:
-            return invoke_sagemaker(prices, prediction_length, num_samples)
+            return invoke_sagemaker(prices, prediction_length)
             
         except ClientError as e:
             error_code = e.response.get('Error', {}).get('Code', '')
@@ -266,17 +271,17 @@ def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_s
     raise Exception("Unexpected error in retry loop")
 
 
-def invoke_sagemaker(prices: list, prediction_length: int = 12, num_samples: int = 50) -> dict:
+def invoke_sagemaker(prices: list, prediction_length: int = 12) -> dict:
     """
-    SageMaker Serverless Endpoint を呼び出し
+    SageMaker Serverless Endpoint を呼び出し (Chronos-2)
 
-    Input: {"context": [...], "prediction_length": 12, "num_samples": 50}
-    Output: {"median": [...], "std": [...], "confidence": 0.7, ...}
+    Input: {"context": [...], "prediction_length": 12}
+    Output: {"median": [...], "mean": [...], "std": [...], "q10": [...], "q90": [...],
+             "confidence": 0.7, "model": "chronos-2"}
     """
     payload = {
         "context": prices,
         "prediction_length": prediction_length,
-        "num_samples": num_samples,
     }
 
     start_time = time.time()

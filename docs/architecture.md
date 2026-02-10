@@ -69,11 +69,11 @@ flowchart LR
     end
 
     subgraph SageMaker["SageMaker"]
-        SM_CHRONOS["eth-trading-chronos-base<br/>Serverless Endpoint<br/>Chronos-T5-Base (200M)<br/>MaxConcurrency=8"]
+        SM_CHRONOS["eth-trading-chronos-base<br/>Serverless Endpoint<br/>Chronos-2 (120M)<br/>MaxConcurrency=8"]
     end
 
     subgraph S3["S3"]
-        S3_MODEL["chronos-base/<br/>model.tar.gz"]
+        S3_MODEL["chronos-2/<br/>model.tar.gz"]
     end
 
     subgraph Monitoring["Monitoring"]
@@ -221,16 +221,17 @@ DynamoDB は全テーブルが `pair` を Partition Key にしており、通貨
 |---|---|---|---|---|---|
 | モメンタム代替 | Lambda 内計算 | $0 | <1秒 | ❌ 予測ではない | なし |
 | Lambda + ONNX | Chronos-Tiny ONNX変換 | ~$0 | 3-10秒 | ⭕ | 中 |
-| **SageMaker Serverless** | **Chronos-Base (200M)** | **~$3-8** | **5-15秒** | **◎** | **低（クォータ申請済）** |
+| **SageMaker Serverless** | **Chronos-2 (120M)** | **~$3-8** | **2-5秒** | **◎** | **低（クォータ申請済）** |
 | SageMaker Real-time | Chronos-Small (46M) | ~$50-80 | 1-3秒 | ◎ | 低 |
 | ECS Fargate Spot | Chronos-Small コンテナ | ~$15-25 | 2-5秒 | ◎ | 中 |
 | EC2 Spot GPU | Chronos-Large (710M) | ~$25-60 | <1秒 | ◎◎ | 高 |
 
-**選定: SageMaker Serverless Endpoint（Chronos-T5-Base）**
+**選定: SageMaker Serverless Endpoint（Chronos-2）**
 
-初期は Lambda + ONNX Runtime (Chronos-Tiny 8M) を使用していたが、精度向上のため SageMaker Serverless に移行:
-- **モデルサイズ向上**: Tiny (8M) → Base (200M) で予測精度大幅改善
-- **入力データ量増加**: 60本 (5h) → 336本 (28h) でパターン認識強化
+初期は Lambda + ONNX Runtime (Chronos-Tiny 8M) → Chronos-T5-Base (200M) → 現在 Chronos-2 (120M) へ移行:
+- **モデル更新**: T5-Base (200M) → Chronos-2 (120M) — 120Mパラメータでも250倍高速、10%高精度
+- **推論方式**: 50回サンプリング → 分位数直接出力 (q10/q50/q90) — サンプリング不要で大幅高速化
+- **入力データ量**: 336本 (28h) で日次サイクルのパターン認識強化
 - **サーバーレス維持**: 推論リクエスト時のみ課金、アイドル時は0円
 - **フォールバック**: SageMaker障害時はモメンタムベースの代替スコアに自動切替
 - **デプロイスクリプト**: `scripts/deploy_sagemaker_chronos.py` で再デプロイ可能
