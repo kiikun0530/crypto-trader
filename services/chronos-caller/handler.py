@@ -169,10 +169,15 @@ def check_endpoint_exists(endpoint_name: str) -> bool:
     except ClientError as e:
         error_code = e.response.get('Error', {}).get('Code', '')
         if error_code in ['ValidationException', 'ResourceNotFound']:
+            print(f"[ERROR] Failed to check endpoint '{endpoint_name}': {error_code}")
+            return False
+        elif error_code == 'AccessDeniedException':
+            print(f"[ERROR] Failed to check endpoint '{endpoint_name}': {error_code}")
             return False
         # その他のエラーは一時的なものかもしれないのでTrueを返す
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR] Failed to check endpoint '{endpoint_name}': {str(e)}")
         # その他の例外も一時的なものと仮定
         return True
 
@@ -186,8 +191,8 @@ def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_s
     """
     # 事前にエンドポイントの存在確認
     if not check_endpoint_exists(SAGEMAKER_ENDPOINT):
-        print(f"[ERROR] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not found or not InService")
-        raise Exception(f"Endpoint {SAGEMAKER_ENDPOINT} not found")
+        print(f"[WARN] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not available, using fallback")
+        raise Exception(f"Endpoint {SAGEMAKER_ENDPOINT} not found or not accessible")
     
     for attempt in range(MAX_RETRIES):
         try:
@@ -213,19 +218,20 @@ def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_s
                     raise
             elif error_code in ['ValidationException', 'ValidationError']:
                 # エンドポイントが存在しない場合は即座に諦める
-                print(f"[ERROR] SageMaker endpoint validation failed: {error_code} - {str(e)}")
-                print(f"[ERROR] Endpoint '{SAGEMAKER_ENDPOINT}' may have been deleted or is not accessible")
+                print(f"[ERROR] SageMaker error (non-throttling): {error_code} - {str(e)}")
+                print(f"[WARN] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not available, using fallback")
                 raise
             else:
                 # その他のエラーは即座に再発生
-                print(f"[ERROR] SageMaker error (non-retriable): {error_code} - {str(e)}")
+                print(f"[ERROR] SageMaker error (non-throttling): {error_code} - {str(e)}")
                 raise
                 
         except Exception as e:
             # その他の例外（ネットワークエラー等）
             if "not found" in str(e).lower() or "validation" in str(e).lower():
                 # エンドポイント関連のエラーは即座に諦める
-                print(f"[ERROR] SageMaker endpoint error: {str(e)}")
+                print(f"[ERROR] SageMaker error (non-throttling): ValidationError - {str(e)}")
+                print(f"[WARN] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not available, using fallback")
                 raise
             else:
                 # その他のエラーは再発生
