@@ -139,6 +139,9 @@ def get_current_price(binance_symbol: str, retries: int = 2) -> tuple:
     url = f"https://api.binance.com/api/v3/klines?symbol={binance_symbol}&interval=5m&limit=1"
     print(f"Calling Binance API: {url}")
     
+    current_time = int(time.time())
+    print(f"Current system time: {current_time}")
+    
     for attempt in range(retries + 1):
         try:
             req = urllib.request.Request(url)
@@ -171,7 +174,21 @@ def get_current_price(binance_symbol: str, retries: int = 2) -> tuple:
                 # Binance kline format: [open_time, open, high, low, close, volume, ...]
                 try:
                     open_time_ms = int(candle[0])
+                    print(f"Raw timestamp from API for {binance_symbol}: {open_time_ms} ms")
+                    
                     candle_time = int(open_time_ms / 1000)  # ミリ秒を秒に変換
+                    print(f"Converted timestamp for {binance_symbol}: {candle_time} seconds")
+                    
+                    # タイムスタンプの妥当性チェック（現在時刻の±1日以内）
+                    time_diff = abs(candle_time - current_time)
+                    max_allowed_diff = 86400  # 1日（秒）
+                    
+                    print(f"Time difference for {binance_symbol}: {time_diff} seconds (max allowed: {max_allowed_diff})")
+                    
+                    if time_diff > max_allowed_diff:
+                        print(f"WARNING: Timestamp seems invalid for {binance_symbol}: API={candle_time}, Current={current_time}, Diff={time_diff}s")
+                        print(f"Using current time instead for {binance_symbol}")
+                        candle_time = current_time
                     
                     open_price = float(candle[1])
                     high_price = float(candle[2])
