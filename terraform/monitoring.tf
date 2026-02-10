@@ -76,7 +76,9 @@ resource "aws_cloudwatch_log_subscription_filter" "error_filter" {
 
   name            = "${local.name_prefix}-${each.key}-error-filter"
   log_group_name  = "/aws/lambda/${local.name_prefix}-${each.key}"
-  filter_pattern  = "?ERROR ?Traceback ?Exception"
+  # [ERROR] プレフィックスを持つログ、またはTraceback、または真のExceptionエラーを検出
+  # ただし [INFO] や "expected behavior" を含む想定内のリトライログは除外
+  filter_pattern  = "?\"[ERROR]\" ?Traceback ?\"raise Exception\" -\"[INFO]\" -\"expected behavior\" -\"retrying in\""
   destination_arn = aws_lambda_function.error_remediator.arn
 
   depends_on = [

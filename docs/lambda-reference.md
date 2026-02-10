@@ -175,12 +175,26 @@ SageMaker Serverless Endpoint 上の Amazon Chronos-T5-Base (200M params) を呼
 | 項目 | 値 |
 |---|---|
 | エンドポイント名 | `eth-trading-chronos-base` |
-| タイプ | Serverless (6144MB, max_concurrency=2) |
-| DLC Image | `huggingface-pytorch-inference:2.1.0-transformers4.37.0-cpu-py310` |
+| タイプ | Serverless (6144MB, MaxConcurrency=8) |
+| アカウントクォータ | 全Serverlessエンドポイント合計のMaxConcurrency上限=10 |
+| DLC Image | `huggingface-pytorch-inference:2.1.0-transformers4.37.0-cpu-py310-ubuntu22.04` |
 | モデル格納 | `s3://eth-trading-sagemaker-models-652679684315/chronos-base/model.tar.gz` |
 | 依存ピン | `chronos-forecasting==1.3.0` (⚠️ torch 2.1.0互換に必須、>=1.3.0はtorch>=2.2を要求しCUDAを引き込む) |
 | IAMロール | `eth-trading-sagemaker-execution-role` |
+| Endpoint Config | `eth-trading-chronos-base-config-v2` |
 | デプロイスクリプト | `scripts/deploy_sagemaker_chronos.py` |
+
+#### 同時実行数の関係
+
+```
+AWSクォータ (10) ≥ エンドポイント MaxConcurrency (8) ≥ Step Functions MaxConcurrency (6)
+```
+
+- **AWSクォータ**: Service Quotas で申請・承認が必要なアカウントレベルの上限
+- **エンドポイント MaxConcurrency**: エンドポイントが受け付ける同時リクエスト数 (超過時 ThrottlingException)
+- **Step Functions MaxConcurrency**: Map State での同時実行ペア数
+
+⚠️ クォータが承認されてもエンドポイント自体の MaxConcurrency を別途更新しないと反映されない。
 
 ### 予測パラメータ
 
@@ -199,6 +213,18 @@ SageMaker Serverless Endpoint 上の Amazon Chronos-T5-Base (200M params) を呼
 - 外れ値カット: ±20%超の予測を現在価格で置換
 - トレンド加速ボーナス: 後半予測 > 前半予測で最大±0.15加算
 - std減衰: CV > 5%でスコアを50%まで減衰
+
+### リトライ設定
+
+| パラメータ | 値 | 説明 |
+|---|---|---|
+| MAX_RETRIES | 5 | 最大リトライ回数 |
+| BASE_DELAY | 3.0秒 | 基本待機時間 (SageMaker Serverless冷起動考慮) |
+| MAX_DELAY | 45.0秒 | 最大待機時間 |
+| アルゴリズム | 指数バックオフ + jitter | `delay = min(BASE_DELAY * 2^attempt, MAX_DELAY) + random(0.1-0.5)*delay` |
+
+- ThrottlingException は `[INFO]` ログとして出力（想定内動作、エラーアラートをトリガーしない）
+- 全リトライ失敗時はモメンタムフォールバックに自動切替
 
 ### 確信度 (confidence)
 

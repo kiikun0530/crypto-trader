@@ -14,6 +14,7 @@
 5. [インシデント全体タイムライン](#5-インシデント全体タイムライン)
 6. [02/09 ゴミデータ事件（order_id未指定フォールバック）](#6-0209-ゴミデータ事件order_id未指定フォールバック)
 7. [02/10 Extreme Fear損失とF&G BUY抑制](#7-0210-extreme-fear損失とfg-buy抑制)
+8. [02/11 SageMaker Serverless ThrottlingException 頻発](#8-0211-sagemaker-serverless-throttlingexception-頻発)
 
 ---
 
@@ -394,3 +395,85 @@ if fng_value is not None:
 | **Extreme Fearは買い控え** | 市場恐怖時はAIスコアの信頼性が低下する。閾値引き上げで高確信度のみ通過 |
 | **Extreme Greedは過熱警戒** | バブル時の天井掴みを防止。ただしFearほど厳しくない (×1.20 vs ×1.35) |
 | **SELL閾値は不変** | 損切り・利確は市場環境に関係なく常に実行すべき |
+
+---
+
+## 8. 02/11 SageMaker Serverless ThrottlingException 頻発
+
+### 概要
+
+2026-02-11 01:18頃、`chronos-caller` Lambda から大量の ThrottlingException エラーが発生。6通貨ペアの並列分析で SageMaker Serverless Endpoint の同時実行上限を超過していた。CloudWatch Subscription Filter がリトライログもエラーとして検知し、error-remediator が連鎖的にトリガーされてエラーアラートが頻発した。
+
+### エラー内容
+
+```
+ThrottlingException (attempt 1/5), waiting 2.4s...
+ThrottlingException (attempt 2/5), waiting 4.7s...
+Traceback (most recent call last): ...
+```
+
+### 根本原因（3層の問題）
+
+| レイヤー | 問題 | 影響 |
+|----------|------|------|
+| SageMaker Endpoint | `MaxConcurrency = 2` のまま | 3つ目以降のリクエストが ThrottlingException |
+| Step Functions | `MaxConcurrency` 未設定（無制限） | 6通貨ペアが全て同時に chronos-caller を呼び出し |
+| Monitoring | `filter_pattern = "?ERROR ?Traceback ?Exception"` | 想定内のリトライログもエラーアラートをトリガー |
+
+**重要な学び**: AWS Service Quotas の承認（アカウントレベルの上限=10）と、エンドポイント個別の `MaxConcurrency` 設定は**別物**。クォータが承認されても、エンドポイント自体の設定を変更しなければ反映されない。
+
+```
+AWSクォータ (10) ← アカウント全体の全Serverlessエンドポイントの MaxConcurrency 合計上限
+    └→ エンドポイント MaxConcurrency (8) ← 1エンドポイントが受け付ける同時リクエスト数
+         └→ Step Functions MaxConcurrency (6) ← Map State の同時実行ペア数
+```
+
+### 修正内容
+
+#### 1. SageMaker Endpoint MaxConcurrency 引き上げ
+```bash
+# 新しい Endpoint Config を作成して適用
+aws sagemaker create-endpoint-config \
+  --endpoint-config-name eth-trading-chronos-base-config-v2 \
+  --production-variants '[{"VariantName":"AllTraffic","ModelName":"eth-trading-chronos-base","InitialVariantWeight":1.0,"ServerlessConfig":{"MemorySizeInMB":6144,"MaxConcurrency":8}}]'
+
+aws sagemaker update-endpoint \
+  --endpoint-name eth-trading-chronos-base \
+  --endpoint-config-name eth-trading-chronos-base-config-v2
+```
+
+#### 2. Step Functions MaxConcurrency 追加 (stepfunctions.tf)
+```hcl
+AnalyzeAllPairs = {
+  Type           = "Map"
+  MaxConcurrency = 6  # SageMaker MaxConcurrency=8 の範囲内
+  ItemsPath      = "$.pairs"
+  ...
+}
+```
+
+#### 3. chronos-caller リトライ改善 (handler.py)
+```python
+# リトライ設定の調整
+BASE_DELAY = 3.0   # 2.0 → 3.0s (SageMaker Serverless冷起動考慮)
+MAX_DELAY = 45.0    # 30.0 → 45.0s
+
+# ThrottlingException のログレベルを [INFO] に変更（エラーアラート回避）
+print(f"[INFO] SageMaker throttled (attempt {attempt + 1}/{MAX_RETRIES}), "
+      f"retrying in {total_delay:.1f}s - this is expected behavior")
+```
+
+#### 4. 監視フィルター改善 (monitoring.tf)
+```hcl
+filter_pattern = "?\"[ERROR]\" ?Traceback ?\"raise Exception\" -\"[INFO]\" -\"expected behavior\" -\"retrying in\""
+```
+- `[INFO]` を含むログを除外 → 想定内リトライがアラートをトリガーしない
+- `[ERROR]` プレフィックス付きの真のエラーのみ検出
+
+### 再発防止
+
+| 対策 | 内容 |
+|------|------|
+| 同時実行数の階層設計 | クォータ(10) > Endpoint(8) > StepFunctions(6) でマージン確保 |
+| リトライログの分類 | `[INFO]` / `[WARN]` / `[ERROR]` プレフィックスで監視フィルターと連携 |
+| Endpoint Config のバージョン管理 | `config-v2` として新規作成 → エンドポイントに適用 |

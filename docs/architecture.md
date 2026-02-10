@@ -68,8 +68,12 @@ flowchart LR
         DB_MKTCTX[("market-context<br/>context_type=PK, TTL:14日")]
     end
 
+    subgraph SageMaker["SageMaker"]
+        SM_CHRONOS["eth-trading-chronos-base<br/>Serverless Endpoint<br/>Chronos-T5-Base (200M)<br/>MaxConcurrency=8"]
+    end
+
     subgraph S3["S3"]
-        S3_ONNX["chronos-onnx/<br/>ONNX Runtime モデル"]
+        S3_MODEL["chronos-base/<br/>model.tar.gz"]
     end
 
     subgraph Monitoring["Monitoring"]
@@ -103,7 +107,7 @@ flowchart LR
     %% DynamoDB連携
     L_TECH -->|"R"| DB_PRICES
     L_CHRONOS -->|"R"| DB_PRICES
-    L_CHRONOS -->|"ONNX Model"| S3_ONNX
+    L_CHRONOS -->|"SageMaker Endpoint"| SM_CHRONOS
     L_SENTIMENT -->|"R"| DB_SENTIMENT
     L_NEWS -->|"W"| DB_SENTIMENT
     L_MKTCTX -->|"W"| DB_MKTCTX
@@ -216,24 +220,32 @@ DynamoDB は全テーブルが `pair` を Partition Key にしており、通貨
 | 選択肢 | 方式 | 月額 | 推論時間 | 精度 | 運用負荷 |
 |---|---|---|---|---|---|
 | モメンタム代替 | Lambda 内計算 | $0 | <1秒 | ❌ 予測ではない | なし |
-| SageMaker Serverless | Chronos-Tiny (8M) | ~$3-8 | 5-15秒 | ⭕ | なし（要クォータ申請） |
+| Lambda + ONNX | Chronos-Tiny ONNX変換 | ~$0 | 3-10秒 | ⭕ | 中 |
+| **SageMaker Serverless** | **Chronos-Base (200M)** | **~$3-8** | **5-15秒** | **◎** | **低（クォータ申請済）** |
 | SageMaker Real-time | Chronos-Small (46M) | ~$50-80 | 1-3秒 | ◎ | 低 |
 | ECS Fargate Spot | Chronos-Small コンテナ | ~$15-25 | 2-5秒 | ◎ | 中 |
-| **Lambda + ONNX** | **Chronos-Tiny ONNX変換** | **~$0（Lambda実行費に含む）** | **3-10秒** | **⭕** | **中（初回変換のみ）** |
 | EC2 Spot GPU | Chronos-Large (710M) | ~$25-60 | <1秒 | ◎◎ | 高 |
 
-**選定: Lambda + ONNX Runtime（Chronos-T5-Tiny）**
+**選定: SageMaker Serverless Endpoint（Chronos-T5-Base）**
 
-SageMaker Serverless はクォータ申請が必要で承認待ちが発生するため、Lambda + ONNX Runtime を採用:
-- **追加コストゼロ**: ONNX推論はLambda実行時間内で完結（SageMaker不要）
-- **クォータ不要**: SageMakerのServerlessエンドポイントクォータ申請が不要
-- **精度同等**: 同じChronos-T5-Tinyモデルを使用（ONNX変換による精度劣化なし）
-- **Lambda Layer**: onnxruntime + numpy をLambda Layerとして配置（~30MB zip）
-- **S3キャッシュ**: ONNXモデルファイルはS3→/tmpにダウンロード＆キャッシュ（ウォームスタート時は即座）
-- **再現性**: `scripts/convert_chronos_onnx.py` でモデル変換可能
-- **フォールバック**: ONNX推論失敗時はモメンタムベースの代替スコアに自動切替
+初期は Lambda + ONNX Runtime (Chronos-Tiny 8M) を使用していたが、精度向上のため SageMaker Serverless に移行:
+- **モデルサイズ向上**: Tiny (8M) → Base (200M) で予測精度大幅改善
+- **入力データ量増加**: 60本 (5h) → 336本 (28h) でパターン認識強化
+- **サーバーレス維持**: 推論リクエスト時のみ課金、アイドル時は0円
+- **フォールバック**: SageMaker障害時はモメンタムベースの代替スコアに自動切替
+- **デプロイスクリプト**: `scripts/deploy_sagemaker_chronos.py` で再デプロイ可能
 
-ECS/EC2 は常時課金が発生し、現行の「完全サーバーレス」設計思想に反する。SageMaker Serverless はクォータ申請が必要なため不採用。
+#### SageMaker Serverless クォータ
+
+| クォータ | 値 | 備考 |
+|----------|-----|------|
+| アカウント全体の最大同時実行数 | 10 | AWS Service Quotas で承認済 |
+| エンドポイントの MaxConcurrency | 8 | 6通貨並列 + マージン2 |
+| Step Functions MaxConcurrency | 6 | 6通貨ペアの並列分析 |
+
+⚠️ **注意**: AWS クォータ（10）は「全Serverlessエンドポイントの MaxConcurrency 合計値の上限」であり、実際のエンドポイントの `MaxConcurrency` は別途設定が必要。
+
+ECS/EC2 は常時課金が発生し、現行の「完全サーバーレス」設計思想に反する。
 
 ### VPC外実行
 
@@ -268,11 +280,13 @@ Lambda を VPC 内に配置すると、外部 API（Binance, Coincheck, CryptoPa
 price-collector
   └→ Step Functions
        └→ Map: [eth_usdt, btc_usdt, xrp_usdt, sol_usdt, doge_usdt, avax_usdt]
+            MaxConcurrency = 6 (SageMaker Serverless MaxConcurrency=8 の範囲内)
             └→ Parallel: [テクニカル分析, AI予測, センチメント取得]
        └→ Aggregator: 全通貨のスコアを比較 → 最高期待値の通貨を選定
 ```
 
 - Map State で全通貨を **並列分析** → 6通貨×3分析 = 18 Lambda が並列実行
+- `MaxConcurrency = 6` で SageMaker Serverless のスロットリング防止
 - ワークフローの可視化・リトライ・エラーハンドリングを Step Functions が提供
 - Lambda の直接連鎖だと失敗時の状態管理が複雑
 
@@ -300,6 +314,8 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
 
 - **CloudWatch Alarms (24個)**: 全12 Lambda × (Errors + Duration) で異常検知
 - **Subscription Filters (11個)**: warm-up以外の全Lambdaのエラーログを検知
+  - フィルターパターン: `?"[ERROR]" ?Traceback ?"raise Exception" -"[INFO]" -"expected behavior" -"retrying in"`
+  - SageMaker Serverless の想定内リトライログ（ThrottlingException → 自動リカバリ）を除外
 - **error-remediator Lambda**: エラー検知 → Slack通知 + GitHub Actions トリガー（30分クールダウン付き）
 - **GitHub Actions (auto-fix-errors.yml)**: Claude Sonnet によるエラー分析 → コード修正 → デプロイ → 自動push
 

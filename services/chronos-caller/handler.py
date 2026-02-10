@@ -42,10 +42,10 @@ INPUT_LENGTH = int(os.environ.get('INPUT_LENGTH', '336'))  # 336 × 5min = 28h (
 SCORE_SCALE_PERCENT = 3.0    # ±3%変動で±1.0 (旧: ±1%で飽和していた)
 OUTLIER_PERCENTILE = 10      # 上下10%をカットして外れ値除去
 
-# リトライ設定
+# リトライ設定 (SageMaker Serverlessは冷起動に時間がかかるため長めに設定)
 MAX_RETRIES = 5
-BASE_DELAY = 2.0  # 基本待機時間（秒）
-MAX_DELAY = 30.0  # 最大待機時間（秒）
+BASE_DELAY = 3.0   # 基本待機時間（秒）- SageMaker Serverlessの冷起動考慮
+MAX_DELAY = 45.0   # 最大待機時間（秒）- 十分な回復時間を確保
 
 
 def handler(event, context):
@@ -164,6 +164,7 @@ def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_s
     SageMaker Serverless Endpoint を呼び出し（ThrottlingException対応リトライ付き）
     
     ThrottlingExceptionに対して指数バックオフでリトライを実行
+    SageMaker Serverlessは同時実行制限があるため、Throttlingは想定内の動作
     """
     for attempt in range(MAX_RETRIES):
         try:
@@ -174,26 +175,27 @@ def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_s
             
             if error_code == 'ThrottlingException':
                 if attempt < MAX_RETRIES - 1:
-                    # 指数バックオフ + jitter
+                    # 指数バックオフ + jitter (SageMaker Serverlessの冷起動を考慮)
                     delay = min(BASE_DELAY * (2 ** attempt), MAX_DELAY)
-                    jitter = random.uniform(0.1, 0.3) * delay
+                    jitter = random.uniform(0.1, 0.5) * delay
                     total_delay = delay + jitter
                     
-                    print(f"ThrottlingException (attempt {attempt + 1}/{MAX_RETRIES}), "
-                          f"waiting {total_delay:.1f}s...")
+                    # INFO: 想定内のThrottlingなのでエラーではなく情報ログとして出力
+                    print(f"[INFO] SageMaker throttled (attempt {attempt + 1}/{MAX_RETRIES}), "
+                          f"retrying in {total_delay:.1f}s - this is expected behavior")
                     time.sleep(total_delay)
                     continue
                 else:
-                    print(f"Max retries exceeded for ThrottlingException")
+                    print(f"[WARN] SageMaker throttling persisted after {MAX_RETRIES} retries, using fallback")
                     raise
             else:
                 # ThrottlingException以外のエラーは即座に再発生
-                print(f"SageMaker error (non-throttling): {error_code} - {str(e)}")
+                print(f"[ERROR] SageMaker error (non-throttling): {error_code} - {str(e)}")
                 raise
                 
         except Exception as e:
             # その他の例外（ネットワークエラー等）も再発生
-            print(f"SageMaker unexpected error: {str(e)}")
+            print(f"[ERROR] SageMaker unexpected error: {str(e)}")
             raise
     
     # ここには到達しないはずだが、安全のため

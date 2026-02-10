@@ -10,10 +10,11 @@ resource "aws_sfn_state_machine" "analysis_workflow" {
     Comment = "Multi-Currency Trading Analysis Workflow"
     StartAt = "AnalyzeAllPairs"
     States = {
-      # Map: 全通貨ペアを並列分析
+      # Map: 全通貨ペアを並列分析 (クォータ10に対して6ペア並列)
       AnalyzeAllPairs = {
-        Type      = "Map"
-        ItemsPath = "$.pairs"
+        Type           = "Map"
+        MaxConcurrency = 6
+        ItemsPath      = "$.pairs"
         ItemSelector = {
           "pair.$"      = "$$.Map.Item.Value"
           "timestamp.$" = "$.timestamp"
