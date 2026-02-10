@@ -31,6 +31,7 @@ sagemaker_config = Config(
 
 dynamodb = boto3.resource('dynamodb')
 sagemaker_runtime = boto3.client('sagemaker-runtime', config=sagemaker_config)
+sagemaker_client = boto3.client('sagemaker', config=sagemaker_config)
 
 PRICES_TABLE = os.environ.get('PRICES_TABLE', 'eth-trading-prices')
 SAGEMAKER_ENDPOINT = os.environ.get('SAGEMAKER_ENDPOINT', 'eth-trading-chronos-base')
@@ -66,6 +67,15 @@ def handler(event, context):
                 'current_price': 0
             }
 
+        # エンドポイント存在確認
+        endpoint_status = check_endpoint_availability()
+        if endpoint_status == 'not_found':
+            print(f"[INFO] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not found, using fallback")
+            return _fallback_response(pair, prices, 'endpoint_not_found')
+        elif endpoint_status == 'not_ready':
+            print(f"[INFO] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not ready, using fallback")
+            return _fallback_response(pair, prices, 'endpoint_not_ready')
+
         # SageMaker Endpoint で推論（リトライ機能付き）
         try:
             result = invoke_sagemaker_with_retry(prices, PREDICTION_LENGTH, NUM_SAMPLES)
@@ -100,6 +110,44 @@ def handler(event, context):
         print(f"Error in chronos-caller: {str(e)}")
         traceback.print_exc()
         return _fallback_response(pair, [], str(e))
+
+
+def check_endpoint_availability():
+    """
+    SageMakerエンドポイントの存在と状態を確認
+    
+    Returns:
+        'ready': エンドポイントが存在し利用可能
+        'not_ready': エンドポイントは存在するが利用不可
+        'not_found': エンドポイントが存在しない
+        'permission_error': 権限不足（直接invoke試行）
+    """
+    try:
+        response = sagemaker_client.describe_endpoint(EndpointName=SAGEMAKER_ENDPOINT)
+        status = response.get('EndpointStatus', 'Unknown')
+        
+        if status == 'InService':
+            return 'ready'
+        else:
+            print(f"[WARN] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' status: {status}")
+            return 'not_ready'
+            
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', '')
+        
+        if error_code == 'ValidationException' or 'not found' in str(e).lower():
+            print(f"[INFO] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not found")
+            return 'not_found'
+        elif error_code == 'AccessDeniedException':
+            print(f"[WARN] SageMaker describe_endpoint permission missing for '{SAGEMAKER_ENDPOINT}', will try invoke directly")
+            return 'permission_error'  # 権限不足の場合は直接invoke試行
+        else:
+            print(f"[WARN] Failed to check endpoint '{SAGEMAKER_ENDPOINT}': {error_code}")
+            return 'permission_error'  # その他のエラーも直接invoke試行
+            
+    except Exception as e:
+        print(f"[ERROR] Failed to check endpoint '{SAGEMAKER_ENDPOINT}': {str(e)}")
+        return 'permission_error'
 
 
 def _fallback_response(pair: str, prices: list, reason: str) -> dict:
@@ -192,12 +240,10 @@ def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_s
                     raise
             elif error_code in ['ValidationException', 'ValidationError'] or "not found" in error_message.lower():
                 # エンドポイントが存在しない場合は即座に諦める（リトライしない）
-                print(f"[WARN] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not found: {error_code}")
-                print(f"[WARN] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not available, using fallback")
+                print(f"[ERROR] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not found: {error_code}")
                 raise
             elif error_code == 'AccessDeniedException':
-                print(f"[WARN] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not accessible: {error_code}")
-                print(f"[WARN] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not available, using fallback")
+                print(f"[ERROR] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not accessible: {error_code}")
                 raise
             else:
                 # その他のエラーは即座に再発生
@@ -209,8 +255,7 @@ def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_s
             error_message = str(e).lower()
             if "not found" in error_message or "validation" in error_message:
                 # エンドポイント関連のエラーは即座に諦める
-                print(f"[WARN] SageMaker endpoint validation error: {str(e)}")
-                print(f"[WARN] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not available, using fallback")
+                print(f"[ERROR] SageMaker endpoint validation error: {str(e)}")
                 raise
             else:
                 # その他のエラーは再発生
