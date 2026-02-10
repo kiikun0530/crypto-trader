@@ -23,7 +23,8 @@ from botocore.config import Config
 sagemaker_config = Config(
     retries={
         'max_attempts': 3,
-        'mode': 'adaptive'
+        'mode': 'adaptive',
+        'total_max_attempts': 5
     },
     read_timeout=60,
     connect_timeout=10
