@@ -145,6 +145,7 @@ DynamoDB から価格履歴を読み取り、テクニカル指標を計算し�
 |---|---|---|
 | RSI | 14期間 | <30: 買い、>70: 売り |
 | MACD | (12,26,9) | シグナルクロスで判定 |
+| MACD histogram slope | 直近3本 | 正→縮小(slope<-0.3)で減速検知 |
 | SMA | 20, 200 | ゴールデン/デッドクロス |
 | Bollinger | (20,2) | バンド位置で判定 |
 
@@ -309,6 +310,7 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
    - `vol_ratio = avg_bb_width / baseline(0.03)` → クランプ 0.67〜2.0
    - `buy_threshold = 0.28 × vol_ratio`, `sell_threshold = -0.15 × vol_ratio`
    - F&G連動補正: F&G≤20 → `buy_threshold × 1.35`, F&G≥80 → `buy_threshold × 1.20` (SELL不変)
+3. モメンタム減速チェック: 保有中通貨のMACDヒストグラムが正→縮小中(slope<-0.3)なら、SELL閾値を50%緩和して早期利確
 3. 全通貨のシグナルを DynamoDB に保存（動的閾値・BB幅・market_context_scoreも記録）
 4. 全通貨をスコア降順でランキング
 5. 全通貨のアクティブポジションを取得（複数保有対応）
@@ -407,17 +409,24 @@ Coincheck 取引所の通貨別最小注文数量・小数点以下桁数に基�
 | トリガー | EventBridge (5分間隔) |
 | メモリ | 256MB |
 | タイムアウト | 60秒 |
-| DynamoDB | positions (R) |
+| DynamoDB | positions (R/W) |
 | 外部API | Coincheck (価格取得) |
 
 ### 処理フロー
 
 1. `TRADING_PAIRS_CONFIG` の全通貨についてアクティブポジションを検索
 2. ポジションがあれば Coincheck API で現在価格を取得
-3. SL/TP 判定:
-   - 現在価格 <= ストップロス(参入-5%) → 売り指示
+3. **ピーク価格追跡**: `highest_price` を更新し DynamoDB に永続化
+4. **連続トレーリングストップ**:
+   - ピーク利益 3-5% → ピークから 2.0% 下でSL
+   - ピーク利益 5-8% → ピークから 1.5% 下でSL
+   - ピーク利益 8-12% → ピークから 1.2% 下でSL
+   - ピーク利益 12%+ → ピークから 1.0% 下でSL
+   - 3%以上到達後は必ず建値以上を保証
+5. SL/TP 判定:
+   - 現在価格 <= ストップロス(参入-5%、またはトレーリングSL) → 売り指示
    - 現在価格 >= テイクプロフィット(参入+10%) → 売り指示
-4. 売り指示は SQS 経由で order-executor に送信
+6. 売り指示は SQS 経由で order-executor に送信
 
 ---
 

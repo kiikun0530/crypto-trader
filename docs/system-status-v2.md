@@ -352,6 +352,13 @@ Compress-Archive -Path "services/chronos-caller/*" -DestinationPath "chronos.zip
 | order_idなしfill取得 | 101ゴミtrades + 39ゴミpositions | 修正済(既存) | DynamoDB分析 |
 | Extreme Fear時AI高スコア | ETH/XRP ¥-3,162損失 | `bb5cfa2` | 02/10トレード分析 |
 
+### Phase 5 (SELL判断改善)
+
+| # | 改善内容 | コミット | Lambda |
+|---|---------|---------|--------|
+| 28 | 連続トレーリングストップ (ピーク追跡, 適応型トレール) | `#NEXT` | position-monitor |
+| 29 | モメンタム減速検知 (MACD histogram slope) | `#NEXT` | technical, aggregator |
+
 ---
 
 ## 🔍 既知の制約・今後の検討事項

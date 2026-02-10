@@ -54,6 +54,7 @@ def handler(event, context):
         
         rsi = calculate_rsi(close_prices, 14)
         macd, signal, histogram = calculate_macd(close_prices)
+        macd_histogram_slope = calculate_macd_histogram_slope(close_prices)
         sma_20 = calculate_sma(close_prices, 20)
         sma_200 = calculate_sma(close_prices, 200) if len(close_prices) >= 200 else None
         bb_upper, bb_lower = calculate_bollinger_bands(close_prices, 20, 2)
@@ -83,6 +84,7 @@ def handler(event, context):
             'macd': round(macd, 4),
             'macd_signal': round(signal, 4),
             'macd_histogram': round(histogram, 4),
+            'macd_histogram_slope': round(macd_histogram_slope, 4),
             'sma_20': round(sma_20, 2),
             'bb_upper': round(bb_upper, 2),
             'bb_lower': round(bb_lower, 2),
@@ -451,6 +453,67 @@ def calculate_adx(prices: list, period: int = 14, highs: list = None, lows: list
         return adx
     else:
         return sum(dx_list) / len(dx_list)
+
+
+def calculate_macd_histogram_slope(prices: list, fast: int = 12, slow: int = 26,
+                                    signal_period: int = 9, lookback: int = 3) -> float:
+    """
+    MACDヒストグラムの傾き（モメンタム変化率）を計算
+    
+    ヒストグラムが正から縮小 → モメンタム減速（反転の前兆）
+    ヒストグラムが負から拡大 → 下降モメンタム加速
+    
+    Returns:
+        正: モメンタム加速（上昇方向）
+        負: モメンタム減速（下降方向）
+        範囲: 概ね -1.0 ~ +1.0
+    """
+    if len(prices) < slow + signal_period + lookback:
+        return 0.0
+    
+    # MACD系列全体を計算
+    macd_series = calculate_macd_series(prices, fast, slow)
+    if len(macd_series) < signal_period + lookback:
+        return 0.0
+    
+    # シグナルラインのEMA系列を算出
+    signal_series = []
+    if len(macd_series) >= signal_period:
+        multiplier = 2 / (signal_period + 1)
+        ema = sum(macd_series[:signal_period]) / signal_period
+        signal_series.append(ema)
+        for val in macd_series[signal_period:]:
+            ema = (val - ema) * multiplier + ema
+            signal_series.append(ema)
+    
+    if len(signal_series) < lookback + 1:
+        return 0.0
+    
+    # ヒストグラム系列の直近 lookback+1 本
+    # macd_series と signal_series のアライメント
+    offset = len(macd_series) - len(signal_series)
+    hist_series = []
+    for i in range(len(signal_series)):
+        hist_series.append(macd_series[offset + i] - signal_series[i])
+    
+    if len(hist_series) < lookback + 1:
+        return 0.0
+    
+    # 直近 lookback 本のヒストグラム変化の平均
+    recent = hist_series[-(lookback + 1):]
+    changes = [recent[i+1] - recent[i] for i in range(len(recent) - 1)]
+    avg_change = sum(changes) / len(changes)
+    
+    # 価格で正規化してスケーリング
+    current_price = prices[-1]
+    if current_price <= 0:
+        return 0.0
+    
+    # 正規化: ヒストグラム変化を価格比で表現し、±0.05%で±1.0にスケール
+    norm_change = avg_change / current_price * 100
+    slope = max(-1.0, min(1.0, norm_change / 0.05))
+    
+    return slope
 
 
 def calculate_volume_signal(volumes: list, period: int = 20) -> float:

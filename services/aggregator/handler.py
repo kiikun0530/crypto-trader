@@ -217,6 +217,10 @@ def score_pair(pair: str, result: dict, market_context: dict = None) -> dict:
     # ボラティリティ情報を抽出（BB幅 = (上限-下限)/中央値）
     bb_width = extract_bb_width(technical_result)
 
+    # モメンタム変化率を抽出（MACDヒストグラムの傾き）
+    macd_histogram_slope = extract_indicator(technical_result, 'macd_histogram_slope', 0.0)
+    macd_histogram = extract_indicator(technical_result, 'macd_histogram', 0.0)
+
     return {
         'pair': pair,
         'total_score': total_score,
@@ -227,6 +231,8 @@ def score_pair(pair: str, result: dict, market_context: dict = None) -> dict:
             'market_context': round(market_context_normalized, 3)
         },
         'market_context_detail': market_context_detail,
+        'macd_histogram_slope': round(macd_histogram_slope, 4),
+        'macd_histogram': round(macd_histogram, 4),
         # ⚠️ この価格はBinance USDT建て（例: ETH ~$2,100）
         # Coincheck JPY建てのポジション価格と比較してはいけない
         # P/L計算にはget_current_price()でJPY価格を別途取得すること
@@ -256,6 +262,21 @@ def extract_bb_width(technical_result: dict) -> float:
         print(f"BB width extraction error: {e}")
 
     return BASELINE_BB_WIDTH  # デフォルト
+
+
+def extract_indicator(technical_result: dict, key: str, default: float = 0.0) -> float:
+    """テクニカル結果から任意のindicator値を抽出"""
+    try:
+        indicators = {}
+        if isinstance(technical_result, dict):
+            if 'body' in technical_result:
+                body = json.loads(technical_result['body']) if isinstance(technical_result['body'], str) else technical_result['body']
+                indicators = body.get('indicators', {})
+            else:
+                indicators = technical_result.get('indicators', {})
+        return float(indicators.get(key, default))
+    except Exception:
+        return default
 
 
 def fetch_market_context() -> dict:
@@ -393,7 +414,26 @@ def decide_action(scored_pairs: list, active_positions: list,
 
             if analysis_pair:
                 pair_data = next((s for s in scored_pairs if s['pair'] == analysis_pair), None)
-                if pair_data and pair_data['total_score'] <= sell_threshold:
+                if not pair_data:
+                    continue
+
+                # --- モメンタム減速SELL ---
+                # MACDヒストグラムが正→縮小中（利確方向へバイアス）
+                # ヒストグラムが正 = まだ上昇トレンド中だが、傾き < -0.3 = 勢い減速
+                # → SELL閾値を緩和してより早くSELLを発動
+                histogram_slope = pair_data.get('macd_histogram_slope', 0)
+                histogram_val = pair_data.get('macd_histogram', 0)
+                effective_sell_threshold = sell_threshold
+
+                # モメンタム減速条件: ヒストグラム正 + 傾き強い負
+                # この場合、SELL閾値を50%緩和（0になりやすく）
+                if histogram_val > 0 and histogram_slope < -0.3 and hold_elapsed >= MIN_HOLD_SECONDS:
+                    effective_sell_threshold = sell_threshold * 0.5  # 例: -0.10 → -0.05
+                    print(f"  ⚡ Momentum deceleration for {position_pair}: "
+                          f"MACD hist=+{histogram_val:.4f} slope={histogram_slope:+.3f} "
+                          f"→ sell_th relaxed to {effective_sell_threshold:+.3f}")
+
+                if pair_data['total_score'] <= effective_sell_threshold:
                     if hold_elapsed < MIN_HOLD_SECONDS:
                         remaining = MIN_HOLD_SECONDS - hold_elapsed
                         hold_skipped.append((position_pair, pair_data['total_score'], remaining))
@@ -401,13 +441,15 @@ def decide_action(scored_pairs: list, active_positions: list,
                               f"but hold period active (elapsed={hold_elapsed}s, "
                               f"remaining={remaining}s / {remaining/60:.0f}min)")
                     else:
-                        sell_candidates.append((position_pair, pair_data['total_score']))
+                        reason = 'momentum_decel' if effective_sell_threshold != sell_threshold else 'threshold'
+                        sell_candidates.append((position_pair, pair_data['total_score'], reason))
 
         if sell_candidates:
             sell_candidates.sort(key=lambda x: x[1])
-            target_pair, target_score = sell_candidates[0]
+            target_pair, target_score, sell_reason = sell_candidates[0]
+            reason_text = ' [momentum deceleration]' if sell_reason == 'momentum_decel' else ''
             print(f"SELL signal for {target_pair}: score={target_score:.4f} "
-                  f"(threshold: {sell_threshold:.3f})")
+                  f"(threshold: {sell_threshold:.3f}){reason_text}")
             return 'SELL', target_pair, target_score
 
         if hold_skipped:

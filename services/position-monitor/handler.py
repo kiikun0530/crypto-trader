@@ -2,11 +2,11 @@
 ポジション監視 Lambda
 5分間隔で全通貨のアクティブポジションを監視し、SL/TP判定
 
-トレーリングストップ:
-- 含み益+3%以上: SLを建値に引き上げ（損失ゼロ保証）
-- 含み益+5%以上: SLを+3%に引き上げ
-- 含み益+8%以上: SLを+6%に引き上げ
-- DynamoDBのstop_lossを実際に更新（永続化）
+連続トレーリングストップ:
+- ピーク価格をDynamoDBに永続化
+- ピークからの下落率でSLを動的に設定
+- 利益が大きいほどトレーリング幅を狭める（利益防衛）
+- 0-3%: 固定SL (-5%), 3%+: 連続トレーリング開始
 """
 import json
 import os
@@ -100,8 +100,20 @@ def handler(event, context):
                 trigger_sell(coincheck_pair, config['name'], 'take_profit', current_price, entry_price)
 
             else:
-                # トレーリングストップ: 含み益に応じてSLを引き上げ
-                new_sl = calculate_trailing_stop(entry_price, current_price, stop_loss)
+                # 連続トレーリングストップ: ピーク価格を追跡し、動的SLを算出
+                highest_price = float(position.get('highest_price', entry_price))
+
+                # ピーク更新チェック
+                if current_price > highest_price:
+                    old_peak = highest_price
+                    highest_price = current_price
+                    update_highest_price(position, highest_price)
+                    peak_pnl = (highest_price - entry_price) / entry_price * 100
+                    print(f"  🏔️ New peak for {config['name']}: "
+                          f"¥{old_peak:,.0f} → ¥{highest_price:,.0f} (+{peak_pnl:.1f}%)")
+
+                # 連続トレーリングストップ計算
+                new_sl = calculate_trailing_stop(entry_price, current_price, stop_loss, highest_price)
                 if new_sl and new_sl > stop_loss:
                     old_sl = stop_loss
                     stop_loss = new_sl
@@ -110,12 +122,13 @@ def handler(event, context):
                     update_stop_loss(position, new_sl)
                     pnl_pct = (current_price - entry_price) / entry_price * 100
                     sl_pct = (new_sl - entry_price) / entry_price * 100
+                    peak_pct = (highest_price - entry_price) / entry_price * 100
                     print(f"  📈 Trailing stop raised for {config['name']}: "
                           f"SL ¥{old_sl:,.0f} → ¥{new_sl:,.0f} "
-                          f"(entry+{sl_pct:.1f}%, current P/L: {pnl_pct:+.1f}%)")
+                          f"(SL={sl_pct:+.1f}%, peak={peak_pct:+.1f}%, current={pnl_pct:+.1f}%)")
                     # Slack通知
                     notify_trailing_stop(config['name'], coincheck_pair,
-                                       old_sl, new_sl, entry_price, current_price)
+                                       old_sl, new_sl, entry_price, current_price, highest_price)
 
             # P/L計算
             amount = float(position.get('amount', 0))
@@ -223,38 +236,52 @@ def trigger_sell(pair: str, name: str, reason: str, current_price: float, entry_
             print(f"Slack notification failed: {e}")
 
 
-def calculate_trailing_stop(entry_price: float, current_price: float, current_sl: float) -> float:
+def calculate_trailing_stop(entry_price: float, current_price: float,
+                            current_sl: float, highest_price: float) -> float:
     """
-    トレーリングストップ計算
+    連続トレーリングストップ計算
     
-    含み益に応じて段階的にSLを引き上げ:
-    - +3%以上: SL = 建値 (損失ゼロ保証)
-    - +5%以上: SL = entry + 3%
-    - +8%以上: SL = entry + 6%
+    ピーク価格からの下落率で動的にSLを設定。
+    利益が大きいほどトレーリング幅を狭める（利益防衛を強化）。
+    
+    トレーリング幅:
+    - 含み益 3-5%:  ピークから2.0%下にSL（広め、まだ成長余地あり）
+    - 含み益 5-8%:  ピークから1.5%下にSL（中間）
+    - 含み益 8-12%: ピークから1.2%下にSL（狭め、利益防衛優先）
+    - 含み益 12%+:  ピークから1.0%下にSL（最狭、大利確保）
     
     Returns: 新しいSL価格 (引き上げ不要ならNone)
     """
-    if entry_price <= 0:
+    if entry_price <= 0 or highest_price <= 0:
         return None
     
-    pnl_pct = (current_price - entry_price) / entry_price * 100
+    # ピークからの含み益（%）
+    peak_pnl_pct = (highest_price - entry_price) / entry_price * 100
     
-    # トレーリングストップの段階
-    # (含み益の閾値%, SLをentryの何%に設定するか)
-    TRAILING_LEVELS = [
-        (8.0, 6.0),   # +8%以上 → SL = entry + 6%
-        (5.0, 3.0),   # +5%以上 → SL = entry + 3%
-        (3.0, 0.0),   # +3%以上 → SL = entry (建値)
-    ]
+    # 含み益3%未満はトレーリング非適用（固定SLのまま）
+    if peak_pnl_pct < 3.0:
+        return None
     
-    new_sl = None
-    for threshold, sl_offset in TRAILING_LEVELS:
-        if pnl_pct >= threshold:
-            new_sl = entry_price * (1 + sl_offset / 100)
-            break
+    # 利益水準に応じたトレーリング幅（%）
+    # 利益が大きいほど幅を狭めて利益を守る
+    if peak_pnl_pct >= 12.0:
+        trail_pct = 1.0   # ピークから1.0%でSL
+    elif peak_pnl_pct >= 8.0:
+        trail_pct = 1.2   # ピークから1.2%でSL
+    elif peak_pnl_pct >= 5.0:
+        trail_pct = 1.5   # ピークから1.5%でSL
+    else:
+        trail_pct = 2.0   # ピークから2.0%でSL（3-5%帯）
+    
+    # SL = ピーク価格 × (1 - trail幅)
+    new_sl = highest_price * (1 - trail_pct / 100)
+    
+    # 最低でも建値以上を保証（含み益3%以上に到達した場合）
+    breakeven = entry_price * 1.001  # わずかに建値の上（手数料分）
+    new_sl = max(new_sl, breakeven)
     
     # 現在のSLより高い場合のみ更新（SLは上がるだけ、下がらない）
-    if new_sl and new_sl > current_sl:
+    if new_sl > current_sl:
         return new_sl
     return None
 
@@ -278,19 +305,44 @@ def update_stop_loss(position: dict, new_sl: float):
         print(f"Failed to update stop_loss in DB: {e}")
 
 
+def update_highest_price(position: dict, highest_price: float):
+    """DynamoDBのhighest_priceを更新（ピーク価格追跡）"""
+    from decimal import Decimal
+    table = dynamodb.Table(POSITIONS_TABLE)
+    try:
+        table.update_item(
+            Key={
+                'pair': position['pair'],
+                'position_id': position['position_id']
+            },
+            UpdateExpression='SET highest_price = :hp',
+            ExpressionAttributeValues={
+                ':hp': Decimal(str(round(highest_price, 2)))
+            }
+        )
+    except Exception as e:
+        print(f"Failed to update highest_price in DB: {e}")
+
+
 def notify_trailing_stop(name: str, pair: str, old_sl: float, new_sl: float,
-                         entry_price: float, current_price: float):
+                         entry_price: float, current_price: float,
+                         highest_price: float = None):
     """トレーリングストップ引き上げのSlack通知"""
     if not SLACK_WEBHOOK_URL:
         return
     try:
         pnl_pct = (current_price - entry_price) / entry_price * 100
         sl_pct = (new_sl - entry_price) / entry_price * 100
+        peak_text = ""
+        if highest_price and highest_price > 0:
+            peak_pct = (highest_price - entry_price) / entry_price * 100
+            trail_width = (highest_price - new_sl) / highest_price * 100
+            peak_text = f"\nピーク: ¥{highest_price:,.0f} (+{peak_pct:.1f}%), トレール幅: {trail_width:.1f}%"
         message = (
             f"📈 {name} トレーリングストップ引き上げ\n"
             f"通貨: {pair}\n"
-            f"SL: ¥{old_sl:,.0f} → ¥{new_sl:,.0f} (entry+{sl_pct:.1f}%)\n"
-            f"現在: ¥{current_price:,.0f} (P/L: {pnl_pct:+.1f}%)"
+            f"SL: ¥{old_sl:,.0f} → ¥{new_sl:,.0f} (entry{sl_pct:+.1f}%)\n"
+            f"現在: ¥{current_price:,.0f} (P/L: {pnl_pct:+.1f}%){peak_text}"
         )
         payload = {"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": message}}]}
         req = urllib.request.Request(
