@@ -32,6 +32,32 @@ IGNORE_PATTERNS = [
     'Task timed out',  # タイムアウトはMetric Alarmで検知
 ]
 
+# エラーとして認識するパターン（これらを含むログのみアラート対象）
+ERROR_INDICATORS = [
+    '[ERROR]',
+    'Traceback',
+    'raise Exception',
+    'Error:',
+    'Exception:',
+    'CRITICAL',
+    'FATAL',
+]
+
+# 成功を示すパターン（これらを含むログはエラーから除外）
+SUCCESS_PATTERNS = [
+    'SageMaker inference OK',
+    'inference OK',
+    'Successfully saved',
+    'Successfully fetched',
+    'Slack notification sent',
+    'HOLD:',
+    'BUY signal',
+    'SELL signal',
+    'Analysis workflow successfully started',
+    'Price collection completed',
+    'completed successfully',
+]
+
 
 def handler(event, context):
     """CloudWatch Logs Subscription Filter イベント処理"""
@@ -104,7 +130,12 @@ def extract_function_name(log_group: str) -> str:
 
 
 def collect_error_messages(log_events: list) -> list:
-    """ログイベントからアクショナブルなエラーメッセージを抽出"""
+    """ログイベントから実際のエラーメッセージのみを抽出
+    
+    CloudWatch Subscription Filter はバッチ単位でイベントを転送するため、
+    正常なログ行も含まれる可能性がある。
+    実際にエラーを示すログ行のみを抽出し、成功ログを除外する。
+    """
     errors = []
     for event in log_events:
         message = event.get('message', '').strip()
@@ -114,7 +145,12 @@ def collect_error_messages(log_events: list) -> list:
         # 空行やREPORTスキップ
         if not message or message.startswith('REPORT') or message.startswith('END'):
             continue
-        errors.append(message)
+        # 成功パターンを含むログは除外
+        if any(pat in message for pat in SUCCESS_PATTERNS):
+            continue
+        # エラーインジケータを含むログのみ収集
+        if any(pat in message for pat in ERROR_INDICATORS):
+            errors.append(message)
     return errors
 
 

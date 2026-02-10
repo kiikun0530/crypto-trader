@@ -144,7 +144,6 @@ def check_endpoint_availability():
             return 'not_found'
         elif error_code == 'AccessDeniedException':
             print(f"[WARN] Access denied when checking endpoint '{SAGEMAKER_ENDPOINT}': {str(e)}")
-            print(f"[DEBUG] Endpoint status check result: ready")
             return 'permission_error'
         else:
             print(f"[WARN] Failed to check endpoint '{SAGEMAKER_ENDPOINT}': {error_code}")
@@ -246,7 +245,7 @@ def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12) -> di
                     raise
             elif error_code in ['ValidationException', 'ValidationError'] or "not found" in error_message.lower():
                 # エンドポイントが存在しない場合は即座に諦める（リトライしない）
-                print(f"[ERROR] SageMaker error (non-throttling): {error_code} - An error occurred ({error_code}) when calling the InvokeEndpoint operation: Endpoint {SAGEMAKER_ENDPOINT} of account 652679684315 not found.")
+                print(f"[ERROR] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not found: {error_code}")
                 raise
             elif error_code == 'AccessDeniedException':
                 print(f"[ERROR] Failed to check endpoint '{SAGEMAKER_ENDPOINT}': AccessDeniedException")
@@ -261,7 +260,7 @@ def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12) -> di
             error_message = str(e).lower()
             if "not found" in error_message or "validation" in error_message:
                 # エンドポイント関連のエラーは即座に諦める
-                print(f"[ERROR] SageMaker error (non-throttling): ValidationError - An error occurred (ValidationError) when calling the InvokeEndpoint operation: Endpoint {SAGEMAKER_ENDPOINT} of account 652679684315 not found.")
+                print(f"[ERROR] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not found: {str(e)}")
                 raise
             else:
                 # その他のエラーは再発生
