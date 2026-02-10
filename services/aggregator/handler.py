@@ -120,12 +120,13 @@ def handler(event, context):
                 }
             analysis_context['buy_threshold'] = round(buy_threshold, 4)
             analysis_context['sell_threshold'] = round(sell_threshold, 4)
-            analysis_context['weights'] = {
+            analysis_context['weights'] = target_scored.get('weights', {
                 'technical': TECHNICAL_WEIGHT,
                 'chronos': CHRONOS_WEIGHT,
                 'sentiment': SENTIMENT_WEIGHT,
                 'market_context': MARKET_CONTEXT_WEIGHT
-            }
+            })
+            analysis_context['chronos_confidence'] = target_scored.get('chronos_confidence', 0.5)
             send_order_message(target_pair, signal, target_score,
                              int(time.time()), analysis_context)
 
@@ -165,7 +166,7 @@ def handler(event, context):
 
 
 def score_pair(pair: str, result: dict, market_context: dict = None) -> dict:
-    """通貨ペアのスコアを計算（4コンポーネント）"""
+    """通貨ペアのスコアを計算（4コンポーネント + 確信度ベース動的重み）"""
     technical_result = result.get('technical', {})
     chronos_result = result.get('chronos', {})
     sentiment_result = result.get('sentiment', {})
@@ -173,6 +174,15 @@ def score_pair(pair: str, result: dict, market_context: dict = None) -> dict:
     technical_score = extract_score(technical_result, 'technical_score', 0.5)
     chronos_score = extract_score(chronos_result, 'chronos_score', 0.5)
     sentiment_score = extract_score(sentiment_result, 'sentiment_score', 0.5)
+
+    # Chronos確信度を取得 (SageMaker版で追加)
+    chronos_confidence = 0.5  # デフォルト
+    if isinstance(chronos_result, dict):
+        if 'body' in chronos_result:
+            body = json.loads(chronos_result['body']) if isinstance(chronos_result['body'], str) else chronos_result['body']
+            chronos_confidence = float(body.get('confidence', 0.5))
+        else:
+            chronos_confidence = float(chronos_result.get('confidence', 0.5))
 
     # -1〜1スケールに正規化
     technical_normalized = technical_score  # 既に-1〜1
@@ -205,10 +215,25 @@ def score_pair(pair: str, result: dict, market_context: dict = None) -> dict:
         elif btc_dom < 40:
             alt_dominance_adjustment = 0.05
 
-    # 4成分加重平均
+    # === 確信度ベース動的重み ===
+    # 高確信度 → Chronos重み増加 (最大0.35), Tech重み減少
+    # 低確信度 → Chronos重み減少 (最小0.10), Tech重み増加
+    # 中間 (0.5) → ベース値通り (0.25)
+    base_chronos_w = CHRONOS_WEIGHT  # 0.25
+    base_tech_w = TECHNICAL_WEIGHT   # 0.45
+
+    # confidence: 0.0~1.0 → weight_shift: -0.15 ~ +0.10
+    # confidence=0.0 → shift=-0.15 (Chronos: 0.10), confidence=1.0 → shift=+0.10 (Chronos: 0.35)
+    weight_shift = (chronos_confidence - 0.5) * 0.30  # ±0.15 range, centered at 0.5
+    weight_shift = max(-0.15, min(0.10, weight_shift))
+
+    effective_chronos_w = base_chronos_w + weight_shift
+    effective_tech_w = base_tech_w - weight_shift  # Techで相殺
+
+    # 4成分加重平均 (確信度ベース動的重み)
     total_score = (
-        technical_normalized * TECHNICAL_WEIGHT +
-        chronos_normalized * CHRONOS_WEIGHT +
+        technical_normalized * effective_tech_w +
+        chronos_normalized * effective_chronos_w +
         sentiment_normalized * SENTIMENT_WEIGHT +
         market_context_normalized * MARKET_CONTEXT_WEIGHT +
         alt_dominance_adjustment
@@ -230,6 +255,13 @@ def score_pair(pair: str, result: dict, market_context: dict = None) -> dict:
             'sentiment': round(sentiment_normalized, 3),
             'market_context': round(market_context_normalized, 3)
         },
+        'weights': {
+            'technical': round(effective_tech_w, 3),
+            'chronos': round(effective_chronos_w, 3),
+            'sentiment': SENTIMENT_WEIGHT,
+            'market_context': MARKET_CONTEXT_WEIGHT,
+        },
+        'chronos_confidence': round(chronos_confidence, 3),
         'market_context_detail': market_context_detail,
         'macd_histogram_slope': round(macd_histogram_slope, 4),
         'macd_histogram': round(macd_histogram, 4),
@@ -598,10 +630,13 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
         for i, s in enumerate(scored_pairs):
             name = TRADING_PAIRS.get(s['pair'], {}).get('name', s['pair'])
             medal = ['🥇', '🥈', '🥉'][i] if i < 3 else f'{i+1}.'
+            conf = s.get('chronos_confidence', 0.5)
+            conf_bar = '🟢' if conf >= 0.7 else '🟡' if conf >= 0.4 else '🔴'
+            weights = s.get('weights', {})
             ranking_text += (
                 f"{medal} *{name}*: `{s['total_score']:+.4f}` {score_bar(s['total_score'])}\n"
-                f"    Tech: `{s['components']['technical']:+.3f}` | "
-                f"AI: `{s['components']['chronos']:+.3f}` | "
+                f"    Tech: `{s['components']['technical']:+.3f}`({weights.get('technical', TECHNICAL_WEIGHT):.2f}) | "
+                f"AI: `{s['components']['chronos']:+.3f}`({weights.get('chronos', CHRONOS_WEIGHT):.2f}){conf_bar} | "
                 f"Sent: `{s['components']['sentiment']:+.3f}` | "
                 f"Mkt: `{s['components'].get('market_context', 0):+.3f}`\n"
             )
@@ -720,7 +755,7 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
                 "type": "context",
                 "elements": [
                     {"type": "mrkdwn", "text": f"BUY閾値: `{buy_threshold:+.3f}` / SELL閾値: `{sell_threshold:+.3f}` | "
-                                                f"重み: Tech={TECHNICAL_WEIGHT} AI={CHRONOS_WEIGHT} Sent={SENTIMENT_WEIGHT} Mkt={MARKET_CONTEXT_WEIGHT}"
+                                                f"基準重み: Tech={TECHNICAL_WEIGHT} AI={CHRONOS_WEIGHT}(確信度で±0.15変動) Sent={SENTIMENT_WEIGHT} Mkt={MARKET_CONTEXT_WEIGHT}"
                                                 + (f" | ⚠️ F&G補正あり" if buy_threshold > BASE_BUY_THRESHOLD * 1.3 else "")}
                 ]
             }

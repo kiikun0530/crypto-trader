@@ -122,7 +122,7 @@ resource "aws_iam_role_policy" "lambda_custom" {
           "arn:aws:states:${var.aws_region}:${local.account_id}:stateMachine:${local.name_prefix}-*"
         ]
       },
-      # S3: ONNXモデル読み取り (Chronos AI価格予測)
+      # S3: ONNXモデル読み取り (Chronos AI価格予測) + モデルアーティファクト
       {
         Effect = "Allow"
         Action = [
@@ -132,6 +132,16 @@ resource "aws_iam_role_policy" "lambda_custom" {
         Resource = [
           "arn:aws:s3:::${local.name_prefix}-sagemaker-models-${local.account_id}",
           "arn:aws:s3:::${local.name_prefix}-sagemaker-models-${local.account_id}/*"
+        ]
+      },
+      # SageMaker: Chronos-Base エンドポイント呼び出し
+      {
+        Effect = "Allow"
+        Action = [
+          "sagemaker:InvokeEndpoint"
+        ]
+        Resource = [
+          "arn:aws:sagemaker:${var.aws_region}:${local.account_id}:endpoint/${local.name_prefix}-chronos-*"
         ]
       },
       # S3: 日次レポート保存 (Daily Reporter)

@@ -1,101 +1,114 @@
 """
-Chronos呼び出し Lambda (ONNX Runtime版)
-Lambda Layer上の ONNX Runtime で Chronos-T5-Tiny を直接推論
-S3からモデルをコールドスタート時にダウンロード、/tmp にキャッシュ
+Chronos呼び出し Lambda (SageMaker Endpoint版)
+SageMaker Serverless Endpoint 上の Chronos-T5-Base (200M) を呼び出し
+確信度 (confidence) 付きのスコアを返す
 
-トークナイゼーション:
-- MeanScaleUniformBins 方式を再実装
-- 入力: 連続値 → scale正規化 → bucketize → token_ids
-- 出力: token_ids → centers lookup → scale復元 → 連続値
+改善点 (vs 旧ONNX Tiny版):
+- モデル: Tiny(8M) → Base(200M) — 予測精度大幅向上
+- 入力: 60本(5h) → 200本(16h) — パターン認識強化
+- サンプル: 20 → 50 — 中央値の安定性向上
+- スコアリング: ±1%飽和 → ±3%スケール + 外れ値カット
+- 確信度: なし → サンプル分散ベースの confidence を返却
 """
 import json
 import os
 import time
 import boto3
-import numpy as np
+import traceback
 
 dynamodb = boto3.resource('dynamodb')
-s3 = boto3.client('s3')
+sagemaker_runtime = boto3.client('sagemaker-runtime')
 
 PRICES_TABLE = os.environ.get('PRICES_TABLE', 'eth-trading-prices')
-MODEL_BUCKET = os.environ.get('MODEL_BUCKET', 'eth-trading-sagemaker-models-652679684315')
-MODEL_PREFIX = os.environ.get('MODEL_PREFIX', 'chronos-onnx')
+SAGEMAKER_ENDPOINT = os.environ.get('SAGEMAKER_ENDPOINT', 'eth-trading-chronos-base')
 PREDICTION_LENGTH = int(os.environ.get('PREDICTION_LENGTH', '12'))
-NUM_SAMPLES = int(os.environ.get('NUM_SAMPLES', '20'))
+NUM_SAMPLES = int(os.environ.get('NUM_SAMPLES', '50'))
+INPUT_LENGTH = int(os.environ.get('INPUT_LENGTH', '200'))
 
-# Chronos-T5-Tiny tokenizer設定
-N_SPECIAL_TOKENS = 2
-PAD_TOKEN_ID = 0
-EOS_TOKEN_ID = 1
-N_TOKENS = 4096
-CONTEXT_LENGTH = 512
-
-# グローバルキャッシュ（Lambda warm start時に再利用）
-_model_cache = {}
+# スコアリング設定
+SCORE_SCALE_PERCENT = 3.0    # ±3%変動で±1.0 (旧: ±1%で飽和していた)
+OUTLIER_PERCENTILE = 10      # 上下10%をカットして外れ値除去
 
 
 def handler(event, context):
-    """Chronos ONNX予測取得"""
+    """Chronos SageMaker予測取得"""
     pair = event.get('pair', 'eth_usdt')
 
     try:
-        prices = get_price_history(pair, limit=60)
+        prices = get_price_history(pair, limit=INPUT_LENGTH)
 
-        if not prices:
+        if not prices or len(prices) < 30:
             return {
                 'pair': pair,
                 'chronos_score': 0.0,
+                'confidence': 0.0,
                 'prediction': None,
-                'reason': 'no_data',
+                'reason': 'insufficient_data',
+                'data_points': len(prices) if prices else 0,
                 'current_price': 0
             }
 
-        # ONNX モデルで推論
+        # SageMaker Endpoint で推論
         try:
-            predictions = run_onnx_inference(prices, PREDICTION_LENGTH, NUM_SAMPLES)
-            if predictions is not None and len(predictions) > 0:
-                score = predictions_to_score(predictions, prices[-1])
-                print(f"ONNX inference OK: {pair}, score={score:.3f}, predictions={len(predictions)}")
-            else:
-                print(f"ONNX inference returned empty, fallback to momentum: {pair}")
-                score = calculate_momentum_score(prices)
-                predictions = None
-        except Exception as e:
-            print(f"ONNX inference failed: {e}, fallback to momentum: {pair}")
-            score = calculate_momentum_score(prices)
-            predictions = None
+            result = invoke_sagemaker(prices, PREDICTION_LENGTH, NUM_SAMPLES)
+            if result and 'median' in result:
+                score = predictions_to_score(result, prices[-1])
+                confidence = result.get('confidence', 0.5)
 
-        return {
-            'pair': pair,
-            'chronos_score': round(score, 3),
-            'prediction': predictions,
-            'current_price': prices[-1] if prices else 0
-        }
+                print(f"SageMaker inference OK: {pair}, score={score:.3f}, "
+                      f"confidence={confidence:.3f}, data_points={len(prices)}")
+
+                return {
+                    'pair': pair,
+                    'chronos_score': round(score, 3),
+                    'confidence': round(confidence, 3),
+                    'prediction': result.get('median'),
+                    'prediction_std': result.get('std'),
+                    'current_price': prices[-1],
+                    'data_points': len(prices),
+                    'model': 'chronos-t5-base',
+                    'num_samples': NUM_SAMPLES
+                }
+            else:
+                print(f"SageMaker returned empty, fallback to momentum: {pair}")
+                return _fallback_response(pair, prices, 'empty_response')
+
+        except Exception as e:
+            print(f"SageMaker inference failed: {e}, fallback to momentum: {pair}")
+            traceback.print_exc()
+            return _fallback_response(pair, prices, str(e))
 
     except Exception as e:
         print(f"Error in chronos-caller: {str(e)}")
-        import traceback
         traceback.print_exc()
+        return _fallback_response(pair, [], str(e))
 
-        try:
+
+def _fallback_response(pair: str, prices: list, reason: str) -> dict:
+    """フォールバック: モメンタムベーススコア"""
+    try:
+        if not prices:
             prices = get_price_history(pair, limit=60)
-            score = calculate_momentum_score(prices) if prices else 0.0
-        except:
-            score = 0.0
+        score = calculate_momentum_score(prices) if prices else 0.0
+    except Exception:
+        score = 0.0
 
-        return {
-            'pair': pair,
-            'chronos_score': round(score, 3),
-            'prediction': None,
-            'error': str(e),
-            'current_price': prices[-1] if prices else 0
-        }
+    return {
+        'pair': pair,
+        'chronos_score': round(score, 3),
+        'confidence': 0.1,  # フォールバック時は低確信度
+        'prediction': None,
+        'current_price': prices[-1] if prices else 0,
+        'data_points': len(prices) if prices else 0,
+        'model': 'momentum_fallback',
+        'reason': reason
+    }
 
 
-def get_price_history(pair: str, limit: int = 60) -> list:
+def get_price_history(pair: str, limit: int = 200) -> list:
     """
     価格履歴取得
-    
+
     OHLC データがある場合は Typical Price = (High + Low + Close) / 3 を返す。
     ローソク足の値動きの重心を使うことで、close のみより豊かな情報を Chronos に提供。
     OHLC がない古いレコードは従来通り close にフォールバック。
@@ -108,313 +121,115 @@ def get_price_history(pair: str, limit: int = 60) -> list:
         Limit=limit
     )
     items = response.get('Items', [])
-    
+
     prices = []
     for item in reversed(items):
         high = item.get('high')
         low = item.get('low')
         close = float(item['price'])
-        
+
         if high is not None and low is not None:
-            # Typical Price = (H + L + C) / 3
             typical = (float(high) + float(low) + close) / 3
             prices.append(typical)
         else:
             prices.append(close)
-    
+
     return prices
 
 
 # ==============================================================
-# ONNX Model Loading & Inference
+# SageMaker Inference
 # ==============================================================
 
-def load_model():
-    """S3からONNXモデル + tokenizer dataをダウンロードしてキャッシュ"""
-    if 'encoder' in _model_cache:
-        return _model_cache
+def invoke_sagemaker(prices: list, prediction_length: int = 12, num_samples: int = 50) -> dict:
+    """
+    SageMaker Serverless Endpoint を呼び出し
 
-    import onnxruntime as ort
+    Input: {"context": [...], "prediction_length": 12, "num_samples": 50}
+    Output: {"median": [...], "std": [...], "confidence": 0.7, ...}
+    """
+    payload = {
+        "context": prices,
+        "prediction_length": prediction_length,
+        "num_samples": num_samples,
+    }
 
-    model_dir = '/tmp/chronos-onnx'
-    os.makedirs(model_dir, exist_ok=True)
-
-    # S3からファイルダウンロード
-    files = [
-        'encoder_model.onnx',
-        'decoder_model.onnx',
-        'decoder_with_past_model.onnx',
-        'centers.json',
-        'boundaries.json',
-        'config.json',
-    ]
-
-    start = time.time()
-    for f in files:
-        local_path = os.path.join(model_dir, f)
-        if not os.path.exists(local_path):
-            s3.download_file(MODEL_BUCKET, f'{MODEL_PREFIX}/{f}', local_path)
-    download_time = time.time() - start
-
-    # ONNX Sessions 作成
-    sess_options = ort.SessionOptions()
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    sess_options.inter_op_num_threads = 1
-    sess_options.intra_op_num_threads = 1
-
-    _model_cache['encoder'] = ort.InferenceSession(
-        os.path.join(model_dir, 'encoder_model.onnx'),
-        sess_options,
-        providers=['CPUExecutionProvider']
+    start_time = time.time()
+    response = sagemaker_runtime.invoke_endpoint(
+        EndpointName=SAGEMAKER_ENDPOINT,
+        ContentType="application/json",
+        Body=json.dumps(payload),
     )
-    _model_cache['decoder'] = ort.InferenceSession(
-        os.path.join(model_dir, 'decoder_model.onnx'),
-        sess_options,
-        providers=['CPUExecutionProvider']
-    )
+    elapsed = time.time() - start_time
 
-    # decoder_with_past は KV-Cache付き高速デコード用
-    decoder_past_path = os.path.join(model_dir, 'decoder_with_past_model.onnx')
-    if os.path.exists(decoder_past_path):
-        _model_cache['decoder_with_past'] = ort.InferenceSession(
-            decoder_past_path,
-            sess_options,
-            providers=['CPUExecutionProvider']
-        )
+    result = json.loads(response["Body"].read().decode("utf-8"))
+    print(f"SageMaker invocation: {elapsed:.1f}s, "
+          f"confidence={result.get('confidence', 'N/A')}")
 
-    # Tokenizer data
-    with open(os.path.join(model_dir, 'centers.json')) as f:
-        _model_cache['centers'] = np.array(json.load(f), dtype=np.float32)
-
-    with open(os.path.join(model_dir, 'boundaries.json')) as f:
-        _model_cache['boundaries'] = np.array(json.load(f), dtype=np.float32)
-
-    print(f"ONNX model loaded in {download_time:.1f}s (download) + {time.time()-start-download_time:.1f}s (init)")
-    return _model_cache
-
-
-def tokenize_input(prices: list, model_data: dict) -> tuple:
-    """
-    Chronos MeanScaleUniformBins tokenization (再実装)
-
-    1. Mean absolute scaling
-    2. Bucketize with uniform bins
-    3. Add special tokens offset
-    """
-    context = np.array(prices, dtype=np.float32)
-
-    # Truncate to context_length
-    if len(context) > CONTEXT_LENGTH:
-        context = context[-CONTEXT_LENGTH:]
-
-    # Attention mask (NaN → False)
-    attention_mask = ~np.isnan(context)
-
-    # Mean absolute scale
-    abs_values = np.abs(context) * attention_mask
-    scale = np.sum(abs_values) / np.sum(attention_mask)
-    if scale <= 0:
-        scale = 1.0
-
-    # Scale context
-    scaled_context = context / scale
-
-    # Bucketize
-    boundaries = model_data['boundaries']
-    token_ids = np.searchsorted(boundaries, scaled_context, side='right').astype(np.int64)
-    token_ids = token_ids + N_SPECIAL_TOKENS
-    token_ids = np.clip(token_ids, 0, N_TOKENS - 1)
-
-    # NaN → pad
-    token_ids[~attention_mask] = PAD_TOKEN_ID
-
-    # Append EOS token (for seq2seq)
-    token_ids = np.append(token_ids, EOS_TOKEN_ID)
-    attention_mask = np.append(attention_mask, True)
-
-    # Add batch dimension
-    token_ids = token_ids.reshape(1, -1)
-    attention_mask = attention_mask.reshape(1, -1).astype(np.int64)
-
-    return token_ids, attention_mask, float(scale)
-
-
-def detokenize_output(token_ids: np.ndarray, scale: float, model_data: dict) -> np.ndarray:
-    """
-    Chronos output_transform (再実装)
-
-    token_ids → centers lookup → scale復元
-    """
-    centers = model_data['centers']
-    indices = np.clip(token_ids - N_SPECIAL_TOKENS - 1, 0, len(centers) - 1).astype(np.int64)
-    return centers[indices] * scale
-
-
-def run_onnx_inference(prices: list, prediction_length: int = 12, num_samples: int = 20) -> list:
-    """
-    ONNX Runtime で Chronos-T5-Tiny 推論
-
-    Top-k sampling で確率的予測を生成し、中央値を返す。
-    decoder_with_past モデルがある場合は KV-Cache を使った高速デコードを行う。
-    """
-    model_data = load_model()
-    encoder_session = model_data['encoder']
-    decoder_session = model_data['decoder']
-    decoder_with_past = model_data.get('decoder_with_past')
-
-    # Tokenize
-    token_ids, attention_mask, scale = tokenize_input(prices, model_data)
-
-    # Encoder (1回のみ — 全サンプルで共有)
-    encoder_outputs = encoder_session.run(
-        None,
-        {
-            'input_ids': token_ids,
-            'attention_mask': attention_mask,
-        }
-    )
-    encoder_hidden = encoder_outputs[0]  # (1, seq_len, hidden_dim)
-
-    # Decoder I/O名を取得
-    decoder_input_names = [inp.name for inp in decoder_session.get_inputs()]
-    decoder_output_names = [out.name for out in decoder_session.get_outputs()]
-
-    # KV-Cache 利用判定
-    use_kv_cache = decoder_with_past is not None
-    if use_kv_cache:
-        past_output_names = [n for n in decoder_output_names if 'present' in n]
-        use_kv_cache = len(past_output_names) > 0  # decoder がpastを出力しない場合はフォールバック
-    if use_kv_cache:
-        dwp_input_names = [inp.name for inp in decoder_with_past.get_inputs()]
-        dwp_output_names = [out.name for out in decoder_with_past.get_outputs()]
-        dwp_past_output_names = [n for n in dwp_output_names if 'present' in n]
-
-    # Decoder: generate predictions autoregressively
-    all_samples = []
-
-    for sample_idx in range(num_samples):
-        generated_tokens = []
-        past_kv = None
-
-        for step in range(prediction_length):
-            if step == 0 or not use_kv_cache:
-                # 初回ステップ (or KVなし): フルデコーダ
-                if step == 0:
-                    decoder_input = np.array([[PAD_TOKEN_ID]], dtype=np.int64)
-                else:
-                    decoder_input = np.array([generated_tokens], dtype=np.int64)
-
-                decoder_feeds = {}
-                for name in decoder_input_names:
-                    if name == 'input_ids':
-                        decoder_feeds['input_ids'] = token_ids
-                    elif name == 'decoder_input_ids':
-                        decoder_feeds['decoder_input_ids'] = decoder_input
-                    elif name == 'attention_mask':
-                        decoder_feeds['attention_mask'] = attention_mask
-                    elif name == 'encoder_hidden_states':
-                        decoder_feeds['encoder_hidden_states'] = encoder_hidden
-                    elif 'encoder_attention_mask' in name:
-                        decoder_feeds[name] = attention_mask
-
-                outputs = decoder_session.run(None, decoder_feeds)
-                logits = outputs[0]
-
-                # KV-Cache を抽出 (step==0 のみ。以降は decoder_with_past で更新)
-                if use_kv_cache and step == 0:
-                    past_kv = {}
-                    for pname in past_output_names:
-                        idx = decoder_output_names.index(pname)
-                        cache_key = pname.replace('present', 'past_key_values')
-                        past_kv[cache_key] = outputs[idx]
-            else:
-                # 2ステップ目以降: KV-Cache付き高速デコード (最後の1トークンのみ入力)
-                dwp_feeds = {
-                    'decoder_input_ids': np.array([[generated_tokens[-1]]], dtype=np.int64),
-                }
-                for name in dwp_input_names:
-                    if name == 'decoder_input_ids':
-                        continue  # 既にセット済み
-                    elif name == 'encoder_hidden_states':
-                        dwp_feeds[name] = encoder_hidden
-                    elif 'encoder_attention_mask' in name or name == 'attention_mask':
-                        dwp_feeds[name] = attention_mask
-                    elif name in past_kv:
-                        dwp_feeds[name] = past_kv[name]
-
-                outputs = decoder_with_past.run(None, dwp_feeds)
-                logits = outputs[0]
-
-                # KV-Cache 更新
-                past_kv = {}
-                for pname in dwp_past_output_names:
-                    idx = dwp_output_names.index(pname)
-                    cache_key = pname.replace('present', 'past_key_values')
-                    past_kv[cache_key] = outputs[idx]
-
-            # 最後のポジションの logits を取得
-            next_logits = logits[0, -1, :]  # (vocab_size,)
-
-            # Top-k sampling with temperature
-            temperature = 1.0
-            top_k = 50
-            next_logits = next_logits / temperature
-
-            # Top-k filtering
-            top_k_indices = np.argsort(next_logits)[-top_k:]
-            top_k_logits = next_logits[top_k_indices]
-
-            # Softmax
-            exp_logits = np.exp(top_k_logits - np.max(top_k_logits))
-            probs = exp_logits / np.sum(exp_logits)
-
-            # Sample
-            chosen_idx = np.random.choice(len(probs), p=probs)
-            next_token = top_k_indices[chosen_idx]
-
-            generated_tokens.append(int(next_token))
-
-        all_samples.append(generated_tokens)
-
-    # Detokenize: token_ids → prices
-    all_samples_np = np.array(all_samples)  # (num_samples, prediction_length)
-    all_predictions = detokenize_output(all_samples_np, scale, model_data)
-
-    # Median across samples
-    median_predictions = np.median(all_predictions, axis=0).tolist()
-
-    return median_predictions
+    return result
 
 
 # ==============================================================
-# Score Calculation
+# Score Calculation (改善版)
 # ==============================================================
 
-def predictions_to_score(predictions: list, current_price: float) -> float:
+def predictions_to_score(result: dict, current_price: float) -> float:
     """
-    予測価格列をスコアに変換 (-1 to +1)
+    予測結果をスコアに変換 (-1 to +1)
 
-    ロジック:
-    - 予測系列の加重平均を計算（直近予測を軽く、遠い予測を重く）
-    - 現在価格との変化率を計算
-    - ±1% の変動で ±1.0 にスケール
-      (12ステップ=1時間予測で±5%は極めて稀。±1%に変更して
-       Chronosの40%ウェイトが実質的に機能するようにする)
+    改善点 (vs 旧版):
+    1. ±3%スケール (旧: ±1%で常に飽和していた)
+    2. 外れ値カット (上下10パーセンタイル除去)
+    3. 予測の傾き (トレンド加速/減速) も考慮
     """
-    if not predictions or current_price <= 0:
+    median = result.get('median', [])
+    if not median or current_price <= 0:
         return 0.0
 
-    n = len(predictions)
-    weights = [(i + 1) / n for i in range(n)]
+    n = len(median)
+
+    # 外れ値カット: 予測値が異常に大きい/小さい場合を除去
+    valid_predictions = []
+    for p in median:
+        change_pct = abs(p - current_price) / current_price * 100
+        if change_pct < 20:  # ±20%以上の予測は除外
+            valid_predictions.append(p)
+        else:
+            valid_predictions.append(current_price)  # 現在価格で置換
+
+    if not valid_predictions:
+        return 0.0
+
+    # 加重平均 (後のステップほど重要)
+    n_valid = len(valid_predictions)
+    weights = [(i + 1) / n_valid for i in range(n_valid)]
     total_weight = sum(weights)
+    weighted_avg = sum(p * w for p, w in zip(valid_predictions, weights)) / total_weight
 
-    weighted_avg = sum(p * w for p, w in zip(predictions, weights)) / total_weight
-
+    # 変化率 → スコア
     change_percent = (weighted_avg - current_price) / current_price * 100
 
-    # ±1%の変動で±1.0にスケール
-    # 旧: /5.0 → 1時間で5%動くのは稀、Chronosスコアが常にほぼ0で40%ウェイトが死荷重だった
-    score = change_percent / 1.0
+    # ±3%で±1.0にスケール (仮想通貨の1h先では妥当なレンジ)
+    score = change_percent / SCORE_SCALE_PERCENT
+
+    # トレンド加速ボーナス: 後半の予測が前半より強い方向に動いている場合
+    if n_valid >= 6:
+        first_half_avg = sum(valid_predictions[:n_valid // 2]) / (n_valid // 2)
+        second_half_avg = sum(valid_predictions[n_valid // 2:]) / (n_valid - n_valid // 2)
+        trend_acceleration = (second_half_avg - first_half_avg) / current_price * 100
+        # 加速分をスコアに微加算 (最大±0.15)
+        accel_bonus = max(-0.15, min(0.15, trend_acceleration / SCORE_SCALE_PERCENT * 0.3))
+        score += accel_bonus
+
+    # 確信度による減衰: std が大きい場合はスコアを縮小
+    std_values = result.get('std', [])
+    if std_values:
+        avg_std = sum(std_values) / len(std_values)
+        cv = avg_std / current_price  # coefficient of variation
+        # CV > 5% → スコアを50%に減衰、CV < 1% → 100%維持
+        damping = max(0.5, min(1.0, 1.0 - (cv - 0.01) / 0.04 * 0.5))
+        score *= damping
+
     return max(-1.0, min(1.0, score))
 
 

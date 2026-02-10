@@ -64,9 +64,9 @@ locals {
       handler     = "handler.handler"
     }
     chronos-caller = {
-      description = "Chronos AI予測 (ONNX Runtime)"
-      timeout     = 120
-      memory      = 1536
+      description = "Chronos AI予測 (SageMaker Base)"
+      timeout     = 180
+      memory      = 256
       handler     = "handler.handler"
     }
     sentiment-getter = {
@@ -137,6 +137,7 @@ locals {
     TRADING_PAIRS_CONFIG   = trimspace(var.trading_pairs_config)
     MODEL_BUCKET           = "${local.name_prefix}-sagemaker-models-${local.account_id}"
     MODEL_PREFIX           = "chronos-onnx"
+    SAGEMAKER_ENDPOINT     = "${local.name_prefix}-chronos-base"
     IMPROVEMENTS_TABLE     = aws_dynamodb_table.improvements.name
     REPORT_BUCKET          = "${local.name_prefix}-daily-reports-${local.account_id}"
     GITHUB_TOKEN_SECRET_ARN = "arn:aws:secretsmanager:${var.aws_region}:${local.account_id}:secret:github/auto-fix-token"
@@ -175,10 +176,9 @@ resource "aws_lambda_function" "functions" {
     variables = local.lambda_environment
   }
 
-  # Lambda Layer設定 (共通 + chronos-caller用ONNX Runtime)
+  # Lambda Layer設定 (共通レイヤーのみ。chronos-callerはSageMaker経由のため ONNX Runtime Layer 不要)
   layers = compact(concat(
     length(aws_lambda_layer_version.common) > 0 ? [aws_lambda_layer_version.common[0].arn] : [],
-    each.key == "chronos-caller" ? ["arn:aws:lambda:${var.aws_region}:${local.account_id}:layer:${local.name_prefix}-onnxruntime:2"] : []
   ))
 
   depends_on = [
