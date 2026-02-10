@@ -171,7 +171,7 @@ def get_current_price(binance_symbol: str, retries: int = 2) -> tuple:
                 # Binance kline format: [open_time, open, high, low, close, volume, ...]
                 try:
                     open_time_ms = int(candle[0])
-                    candle_time = int(open_time_ms // 1000)  # ミリ秒を秒に変換（整数除算）
+                    candle_time = int(open_time_ms / 1000)  # ミリ秒を秒に変換
                     
                     open_price = float(candle[1])
                     high_price = float(candle[2])
@@ -248,14 +248,14 @@ def save_price(pair: str, timestamp: int, price: float, candle_data: dict = None
             item = {
                 'pair': pair,
                 'timestamp': timestamp,
-                'price': Decimal(str(price)),
+                'price': Decimal(str(round(price, 8))),  # 精度を8桁に制限
                 'ttl': timestamp + 1209600  # 14日後に削除
             }
             if candle_data:
-                item['open'] = Decimal(str(candle_data['open']))
-                item['high'] = Decimal(str(candle_data['high']))
-                item['low'] = Decimal(str(candle_data['low']))
-                item['volume'] = Decimal(str(candle_data['volume']))
+                item['open'] = Decimal(str(round(candle_data['open'], 8)))
+                item['high'] = Decimal(str(round(candle_data['high'], 8)))
+                item['low'] = Decimal(str(round(candle_data['low'], 8)))
+                item['volume'] = Decimal(str(round(candle_data['volume'], 2)))
             
             print(f"Saving to DynamoDB table {PRICES_TABLE}: pair={pair}, timestamp={timestamp}, price={price}")
             table.put_item(Item=item)
@@ -320,6 +320,7 @@ def get_price_at(pair: str, target_time: int) -> float:
         return None
     except Exception as e:
         print(f"Failed to get historical price for {pair}: {str(e)}")
+        print(f"Historical price query error trace for {pair}: {traceback.format_exc()}")
         return None
 
 
@@ -355,6 +356,7 @@ def check_analysis_trigger(pair: str, current_time: int, change_percent: float) 
         return False, 'error'
     except Exception as e:
         print(f"Failed to check analysis trigger for {pair}: {str(e)}")
+        print(f"Analysis trigger check error trace for {pair}: {traceback.format_exc()}")
         return False, 'error'
 
 
@@ -406,4 +408,5 @@ def start_analysis(pairs: list, timestamp: int, triggered: list):
         raise Exception(f"Step Functions execution failed: {error_code} - {error_msg}")
     except Exception as e:
         print(f"Failed to start analysis workflow: {str(e)}")
+        print(f"Start analysis error trace: {traceback.format_exc()}")
         raise e
