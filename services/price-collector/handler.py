@@ -148,56 +148,96 @@ def get_current_price(binance_symbol: str, retries: int = 2) -> tuple:
                 if response.status != 200:
                     raise urllib.error.HTTPError(url, response.status, f"HTTP {response.status}", response.headers, None)
                 
-                data = json.loads(response.read().decode())
+                raw_data = response.read().decode()
+                print(f"API raw response length for {binance_symbol}: {len(raw_data)} chars")
+                
+                data = json.loads(raw_data)
                 print(f"API response received for {binance_symbol}")
                 
-                # データ検証
-                if not data or not isinstance(data, list) or len(data) == 0:
-                    raise ValueError(f"Invalid response data from Binance API: {data}")
+                # データ検証を強化
+                if not data:
+                    raise ValueError(f"Empty response data from Binance API for {binance_symbol}")
+                
+                if not isinstance(data, list):
+                    raise ValueError(f"Invalid response format from Binance API for {binance_symbol}: expected list, got {type(data)}")
+                
+                if len(data) == 0:
+                    raise ValueError(f"No candle data returned from Binance API for {binance_symbol}")
                 
                 candle = data[0]
-                if len(candle) < 6:
-                    raise ValueError(f"Invalid candle data format: {candle}")
+                if not isinstance(candle, list) or len(candle) < 6:
+                    raise ValueError(f"Invalid candle data format for {binance_symbol}: expected list with 6+ elements, got {type(candle)} with {len(candle) if isinstance(candle, list) else 'N/A'} elements")
                 
                 # Binance kline format: [open_time, open, high, low, close, volume, ...]
-                close_price = float(candle[4])
-                candle_time = int(candle[0] / 1000)
+                try:
+                    open_time_ms = int(candle[0])
+                    candle_time = int(open_time_ms // 1000)  # ミリ秒を秒に変換（整数除算）
+                    
+                    open_price = float(candle[1])
+                    high_price = float(candle[2])
+                    low_price = float(candle[3])
+                    close_price = float(candle[4])
+                    volume = float(candle[5])
+                    
+                except (ValueError, TypeError) as e:
+                    raise ValueError(f"Failed to parse numeric values from candle data for {binance_symbol}: {str(e)}")
+                
+                # 価格データ検証を強化
+                if close_price <= 0:
+                    raise ValueError(f"Invalid close price for {binance_symbol}: {close_price}")
+                
+                if high_price < low_price:
+                    raise ValueError(f"Invalid OHLC data for {binance_symbol}: high ({high_price}) < low ({low_price})")
+                
+                if not (low_price <= close_price <= high_price):
+                    raise ValueError(f"Close price out of range for {binance_symbol}: close={close_price}, high={high_price}, low={low_price}")
+                
                 candle_data = {
-                    'open': float(candle[1]),
-                    'high': float(candle[2]),
-                    'low': float(candle[3]),
+                    'open': open_price,
+                    'high': high_price,
+                    'low': low_price,
                     'close': close_price,
-                    'volume': float(candle[5])
+                    'volume': volume
                 }
                 
-                # 価格データ検証
-                if close_price <= 0:
-                    raise ValueError(f"Invalid price data: {close_price}")
-                
-                print(f"Successfully parsed price data for {binance_symbol}: ${close_price:,.2f}")
+                print(f"Successfully parsed price data for {binance_symbol}: ${close_price:,.2f} (timestamp: {candle_time})")
                 return close_price, candle_time, candle_data
                 
         except urllib.error.HTTPError as e:
+            error_msg = f"HTTP error for {binance_symbol}: {e.code} {e.reason}"
             if attempt < retries:
-                print(f"HTTP error attempt {attempt + 1} failed for {binance_symbol}: {e.code} {e.reason}, retrying...")
+                print(f"Attempt {attempt + 1}/{retries + 1} failed - {error_msg}, retrying in 1 second...")
                 time.sleep(1)
             else:
-                print(f"All HTTP attempts failed for {binance_symbol}: {e.code} {e.reason}")
-                raise e
+                print(f"All {retries + 1} attempts failed for {binance_symbol}: {error_msg}")
+                raise Exception(f"HTTP error after {retries + 1} attempts: {error_msg}")
+                
         except urllib.error.URLError as e:
+            error_msg = f"URL error for {binance_symbol}: {str(e)}"
             if attempt < retries:
-                print(f"URL error attempt {attempt + 1} failed for {binance_symbol}: {str(e)}, retrying...")
+                print(f"Attempt {attempt + 1}/{retries + 1} failed - {error_msg}, retrying in 1 second...")
                 time.sleep(1)
             else:
-                print(f"All URL attempts failed for {binance_symbol}: {str(e)}")
-                raise e
+                print(f"All {retries + 1} attempts failed for {binance_symbol}: {error_msg}")
+                raise Exception(f"URL error after {retries + 1} attempts: {error_msg}")
+                
+        except json.JSONDecodeError as e:
+            error_msg = f"JSON decode error for {binance_symbol}: {str(e)}"
+            if attempt < retries:
+                print(f"Attempt {attempt + 1}/{retries + 1} failed - {error_msg}, retrying in 1 second...")
+                time.sleep(1)
+            else:
+                print(f"All {retries + 1} attempts failed for {binance_symbol}: {error_msg}")
+                raise Exception(f"JSON decode error after {retries + 1} attempts: {error_msg}")
+                
         except Exception as e:
+            error_msg = f"Unexpected error for {binance_symbol}: {str(e)}"
             if attempt < retries:
-                print(f"API call attempt {attempt + 1} failed for {binance_symbol}, retrying: {str(e)}")
+                print(f"Attempt {attempt + 1}/{retries + 1} failed - {error_msg}, retrying in 1 second...")
                 time.sleep(1)
             else:
-                print(f"All API call attempts failed for {binance_symbol}: {str(e)}")
-                raise e
+                print(f"All {retries + 1} attempts failed for {binance_symbol}: {error_msg}")
+                raise Exception(f"API call failed after {retries + 1} attempts: {error_msg}")
 
 
 def save_price(pair: str, timestamp: int, price: float, candle_data: dict = None, retries: int = 2):
@@ -217,31 +257,38 @@ def save_price(pair: str, timestamp: int, price: float, candle_data: dict = None
                 item['low'] = Decimal(str(candle_data['low']))
                 item['volume'] = Decimal(str(candle_data['volume']))
             
+            print(f"Saving to DynamoDB table {PRICES_TABLE}: pair={pair}, timestamp={timestamp}, price={price}")
             table.put_item(Item=item)
             print(f"Price data saved to DynamoDB for {pair}")
             return
             
         except ClientError as e:
             error_code = e.response['Error']['Code']
+            error_msg = e.response['Error']['Message']
             if attempt < retries and error_code in ['ProvisionedThroughputExceededException', 'ThrottlingException']:
-                print(f"DynamoDB throttling for {pair}, attempt {attempt + 1}, retrying...")
-                time.sleep(2 ** attempt)  # Exponential backoff
+                wait_time = 2 ** attempt
+                print(f"DynamoDB throttling for {pair} (attempt {attempt + 1}/{retries + 1}): {error_code} - {error_msg}, retrying in {wait_time}s...")
+                time.sleep(wait_time)
             else:
-                print(f"DynamoDB ClientError for {pair}: {error_code} - {e.response['Error']['Message']}")
-                raise e
+                print(f"DynamoDB ClientError for {pair} after {attempt + 1} attempts: {error_code} - {error_msg}")
+                raise Exception(f"DynamoDB save failed after {retries + 1} attempts: {error_code} - {error_msg}")
+                
         except Exception as e:
+            error_msg = f"Unexpected DynamoDB error for {pair}: {str(e)}"
             if attempt < retries:
-                print(f"DynamoDB save attempt {attempt + 1} failed for {pair}: {str(e)}, retrying...")
+                print(f"DynamoDB save attempt {attempt + 1}/{retries + 1} failed - {error_msg}, retrying in 1 second...")
                 time.sleep(1)
             else:
-                print(f"All DynamoDB save attempts failed for {pair}: {str(e)}")
-                raise e
+                print(f"All {retries + 1} DynamoDB save attempts failed for {pair}: {error_msg}")
+                raise Exception(f"DynamoDB save failed after {retries + 1} attempts: {error_msg}")
 
 
 def get_price_at(pair: str, target_time: int) -> float:
     """指定時刻付近の価格取得（5分足のキャンドル境界に対応するため±300秒）"""
     try:
         table = dynamodb.Table(PRICES_TABLE)
+        print(f"Querying historical price for {pair} around timestamp {target_time}")
+        
         response = table.query(
             KeyConditionExpression='pair = :pair AND #ts BETWEEN :start AND :end',
             ExpressionAttributeNames={'#ts': 'timestamp'},
@@ -253,18 +300,23 @@ def get_price_at(pair: str, target_time: int) -> float:
             ScanIndexForward=False,
             Limit=1
         )
+        
         items = response.get('Items', [])
+        print(f"Historical price query returned {len(items)} items for {pair}")
+        
         if items and 'price' in items[0]:
             historical_price = float(items[0]['price'])
-            print(f"Found historical price for {pair}: ${historical_price:.2f}")
+            found_timestamp = items[0].get('timestamp', 'unknown')
+            print(f"Found historical price for {pair}: ${historical_price:.2f} at timestamp {found_timestamp}")
             return historical_price
         else:
             print(f"No historical price found for {pair} around timestamp {target_time}")
-        return None
-        
+            return None
+            
     except ClientError as e:
         error_code = e.response['Error']['Code']
-        print(f"DynamoDB ClientError getting historical price for {pair}: {error_code} - {e.response['Error']['Message']}")
+        error_msg = e.response['Error']['Message']
+        print(f"DynamoDB ClientError getting historical price for {pair}: {error_code} - {error_msg}")
         return None
     except Exception as e:
         print(f"Failed to get historical price for {pair}: {str(e)}")
@@ -281,21 +333,25 @@ def check_analysis_trigger(pair: str, current_time: int, change_percent: float) 
 
         # 1時間経過で定期分析
         table = dynamodb.Table(ANALYSIS_STATE_TABLE)
+        print(f"Checking last analysis time for {pair}")
+        
         response = table.get_item(Key={'pair': pair})
         last_analysis = response.get('Item', {}).get('last_analysis_time', 0)
         
         time_since_last = current_time - last_analysis
-        print(f"Time since last analysis for {pair}: {time_since_last}s")
+        print(f"Time since last analysis for {pair}: {time_since_last}s (last: {last_analysis}, current: {current_time})")
 
         if time_since_last >= 3600:
             print(f"Periodic trigger activated for {pair}: {time_since_last}s >= 3600s")
             return True, 'periodic'
 
+        print(f"No trigger for {pair}: change={change_percent:.3f}% < {VOLATILITY_THRESHOLD}%, time={time_since_last}s < 3600s")
         return False, 'skip'
         
     except ClientError as e:
         error_code = e.response['Error']['Code']
-        print(f"DynamoDB ClientError checking analysis trigger for {pair}: {error_code} - {e.response['Error']['Message']}")
+        error_msg = e.response['Error']['Message']
+        print(f"DynamoDB ClientError checking analysis trigger for {pair}: {error_code} - {error_msg}")
         return False, 'error'
     except Exception as e:
         print(f"Failed to check analysis trigger for {pair}: {str(e)}")
@@ -308,6 +364,8 @@ def start_analysis(pairs: list, timestamp: int, triggered: list):
         print(f"Updating analysis state for {len(pairs)} pairs...")
         # 分析状態を全通貨分更新
         table = dynamodb.Table(ANALYSIS_STATE_TABLE)
+        successful_updates = 0
+        
         for pair in pairs:
             try:
                 table.put_item(Item={
@@ -315,9 +373,12 @@ def start_analysis(pairs: list, timestamp: int, triggered: list):
                     'last_analysis_time': timestamp
                 })
                 print(f"Updated analysis state for {pair}")
+                successful_updates += 1
             except Exception as e:
                 print(f"Failed to update analysis state for {pair}: {str(e)}")
                 # 個別エラーは警告として扱い、継続
+
+        print(f"Successfully updated analysis state for {successful_updates}/{len(pairs)} pairs")
 
         # Step Functions実行（全通貨リストを渡す）
         reasons = list(set([t['reason'] for t in triggered]))
@@ -340,8 +401,9 @@ def start_analysis(pairs: list, timestamp: int, triggered: list):
         
     except ClientError as e:
         error_code = e.response['Error']['Code']
-        print(f"Step Functions ClientError: {error_code} - {e.response['Error']['Message']}")
-        raise e
+        error_msg = e.response['Error']['Message']
+        print(f"Step Functions ClientError: {error_code} - {error_msg}")
+        raise Exception(f"Step Functions execution failed: {error_code} - {error_msg}")
     except Exception as e:
         print(f"Failed to start analysis workflow: {str(e)}")
         raise e

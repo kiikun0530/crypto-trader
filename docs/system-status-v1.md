@@ -150,7 +150,7 @@
 
 | 関数名 | 主要機能 | 最終デプロイ |
 |--------|---------|------------|
-| `eth-trading-price-collector` | 6通貨価格収集 (Binance) + OHLCV保存 | 2026-02-09 |
+| `price-collector` | 6通貨価格収集 (Binance) + OHLCV保存 + APIレスポンス検証強化 | **2026-02-10** |
 | `eth-trading-technical` | RSI(Wilder's)/MACD(グラデーション)/SMA/BB/ADX(OHLC)/ATR(OHLC)/Volume | 2026-02-09 |
 | `eth-trading-chronos-caller` | SageMaker Chronos-T5-Base 予測 (リトライ強化+Typical Price) | 2026-02-10 |
 | `eth-trading-sentiment-getter` | CryptoPanic センチメント | - |
@@ -220,6 +220,7 @@
 | #7 レジーム | regime別の勝率 | signals テーブルの regime フィールド |
 | #10 サーキットブレーカー | (OFF中は不要) | ON時: トリップ回数 |
 | chronos-caller リトライ | ThrottlingException発生率 | CloudWatch Logs "ThrottlingException" |
+| price-collector 安定性 | APIエラー発生率の低下 | CloudWatch Logs APIエラー頻度 |
 
 ### データ取得スクリプト
 
@@ -298,6 +299,7 @@ IMPROVEMENT_DEPLOY_TIMESTAMP = 1739064731  # 2025-02-09T02:12:11Z
 ## 📝 改善実装の全コミット履歴
 
 ```
+2026-02-10 feat: Price Collector APIレスポンス検証強化 + エラーハンドリング改善
 2026-02-10 feat: SageMaker Chronos リトライ強化 - ThrottlingException 指数バックオフ対応
 a986c13 feat: implement circuit breaker (#10) - default OFF, toggleable via env var
 5c12caa feat: implement trading improvements #3,5,6,7,8,9
