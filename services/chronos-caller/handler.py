@@ -37,7 +37,7 @@ PRICES_TABLE = os.environ.get('PRICES_TABLE', 'eth-trading-prices')
 SAGEMAKER_ENDPOINT = os.environ.get('SAGEMAKER_ENDPOINT', 'eth-trading-chronos-base')
 PREDICTION_LENGTH = int(os.environ.get('PREDICTION_LENGTH', '12'))
 NUM_SAMPLES = int(os.environ.get('NUM_SAMPLES', '50'))
-INPUT_LENGTH = int(os.environ.get('INPUT_LENGTH', '200'))
+INPUT_LENGTH = int(os.environ.get('INPUT_LENGTH', '336'))  # 336 × 5min = 28h (日次サイクル1周+α)
 
 # スコアリング設定
 SCORE_SCALE_PERCENT = 3.0    # ±3%変動で±1.0 (旧: ±1%で飽和していた)
@@ -222,7 +222,14 @@ def invoke_sagemaker(prices: list, prediction_length: int = 12, num_samples: int
     )
     elapsed = time.time() - start_time
 
-    result = json.loads(response["Body"].read().decode("utf-8"))
+    raw = json.loads(response["Body"].read().decode("utf-8"))
+
+    # HuggingFace DLC wraps output_fn tuple as [json_string, content_type]
+    if isinstance(raw, list) and len(raw) >= 1 and isinstance(raw[0], str):
+        result = json.loads(raw[0])
+    else:
+        result = raw
+
     print(f"SageMaker invocation: {elapsed:.1f}s, "
           f"confidence={result.get('confidence', 'N/A')}")
 

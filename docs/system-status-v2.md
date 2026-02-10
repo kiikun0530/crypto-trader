@@ -1,9 +1,9 @@
-# システム現状ステータス v3 — Phase 4.5 Data Quality + F&G BUY抑制後チェックポイント
+# システム現状ステータス v4 — Phase 6 AI/Chronos SageMaker Base化後チェックポイント
 
-**スナップショット日時**: 2026-02-11 JST  
-**前回スナップショット**: v2 (`8b5f2a4`, Phase 3 Market Context + 閾値調整後)  
-**最新コミット**: `bb5cfa2` (main) — F&G連動BUY閾値抑制  
-**目的**: Phase 4 (Self-Improving Pipeline) + Phase 4.5 (Data Quality & F&G BUY抑制) の状態記録。
+**スナップショット日時**: 2026-02-12 JST  
+**前回スナップショット**: v3 (`bb5cfa2`, Phase 4.5 Data Quality + F&G BUY抑制)  
+**最新コミット**: `#NEXT` (main) — Phase 6 Chronos SageMaker Base化 + 確信度動的ウェイト  
+**目的**: Phase 5 (SELL判断改善) + Phase 6 (AI/Chronosアップグレード) の状態記録。
 
 ---
 
@@ -180,15 +180,33 @@ if F&G ≥ 80: BUY_threshold × 1.20
 | レジーム検知 | **ADX判定** (>25:トレンド, <20:レンジ) | なし | `5c12caa` |
 | レジーム別ウェイト | トレンド: MACD/SMA=0.35, RSI/BB=0.15 | 均等 0.25 | `5c12caa` |
 
-### Chronos Caller (`services/chronos-caller/handler.py`, ~433行)
+### Chronos Caller (`services/chronos-caller/handler.py`)
 
 | パラメータ | 現在値 | 改善前 | 変更理由 |
-|-----------|--------|--------|---------|
-| スコア変換スケール | **±1% = ±1.0** | ±5% = ±1.0 | #4 機能化 |
+|-----------|--------|--------|--------|
+| モデル | **Chronos-T5-Base (200M)** | Tiny (8M) | #30 SageMaker化 |
+| 推論方式 | **SageMaker Serverless Endpoint** | ONNX Runtime (Lambda内) | #30 |
+| スコア変換スケール | **±3% = ±1.0** | ±1% = ±1.0 | #30 飽和解消 |
 | 入力データ | **Typical Price (H+L+C)/3** | closeのみ | ローソク足重心 |
-| デコード | **KVキャッシュ付き** | フルデコード | #16 高速化 |
+| 入力長 | **336本 (28h)** | 60本 (5h) | #30 日次サイクル捕捉 |
 | 予測ステップ | 12 | 12 | - |
-| サンプル数 | 20 | 20 | - |
+| サンプル数 | **50** | 20 | #30 中央値安定化 |
+| 確信度 | **サンプル分散ベース (0.0-1.0)** | なし | #30 |
+| フォールバック | **モメンタム (confidence=0.1)** | モメンタム | #30 |
+| Lambdaメモリ | **256MB** | 1536MB | SageMaker呼び出しのみ |
+| Lambdaタイムアウト | **180秒** | 120秒 | コールドスタート対応 |
+
+### SageMaker構成 (Phase 6 新規)
+
+| 項目 | 値 |
+|------|-----|
+| エンドポイント名 | `eth-trading-chronos-base` |
+| タイプ | Serverless (6144MB, max_concurrency=2) |
+| DLC Image | `huggingface-pytorch-inference:2.1.0-transformers4.37.0-cpu-py310` |
+| モデル格納 | `s3://eth-trading-sagemaker-models-652679684315/chronos-base/model.tar.gz` |
+| モデルサイズ | 717.7MB (safetensors) |
+| 依存ピン | `chronos-forecasting==1.3.0` (❗ torch 2.1.0互換に必須) |
+| IAMロール | `eth-trading-sagemaker-execution-role` |
 
 ### Position Monitor (`services/position-monitor/handler.py`)
 
@@ -270,6 +288,20 @@ if F&G ≥ 80: BUY_threshold × 1.20
 | 26 | F&G連動BUY閾値抑制 | `bb5cfa2` | aggregator |
 | 27 | ゴミデータクリーンアップ | - | trades 101件 + positions 39件手動削除 |
 
+### Phase 5 (SELL判断改善)
+
+| # | 改善内容 | コミット | Lambda |
+|---|---------|---------|--------|
+| 28 | 連続トレーリングストップ (ピーク追跡, 適応型トレール) | `ce37e58` | position-monitor |
+| 29 | モメンタム減速検知 (MACD histogram slope) | `ce37e58` | technical, aggregator |
+
+### Phase 6 (AI/Chronosアップグレード)
+
+| # | 改善内容 | コミット | Lambda/インフラ |
+|---|---------|---------|---|
+| 30 | Chronos SageMaker Serverless化 (Tiny→Base, 8M→200M) | `372722f` | chronos-caller, terraform |
+| 31 | 確信度ベース動的Chronosウェイト (0.10-0.35) | `372722f` | aggregator |
+
 ---
 
 ## 🏗️ システム構成
@@ -280,10 +312,10 @@ if F&G ≥ 80: BUY_threshold × 1.20
 |--------|---------|------------|------|
 | `eth-trading-price-collector` | 6通貨価格収集 (Binance OHLCV) | 2026-02-09 | ~180 |
 | `eth-trading-technical` | RSI/MACD/SMA/BB/ADX/ATR/Volume | 2026-02-09 | ~488 |
-| `eth-trading-chronos-caller` | ONNX Chronos-T5-Tiny (KVキャッシュ+Typical Price) | 2026-02-09 | ~433 |
+| `eth-trading-chronos-caller` | **SageMaker Chronos-T5-Base (200M) + 確信度** | 2026-02-12 | ~260 |
 | `eth-trading-sentiment-getter` | CryptoPanic センチメント | - | - |
 | `eth-trading-news-collector` | ニュース収集 + BTC相関 + NLPセンチメント | 2026-02-09 | ~370+ |
-| `eth-trading-aggregator` | 4成分統合スコアリング + 売買判定 + F&G BUY抑制 | 2026-02-10 | ~710 |
+| `eth-trading-aggregator` | 4成分統合 + 確信度動的ウェイト + F&G BUY抑制 | 2026-02-12 | ~750 |
 | `eth-trading-order-executor` | Coincheck 成行注文 + CB + context保存 | 2026-02-09 | ~1027 |
 | `eth-trading-position-monitor` | SL/TP/トレーリング (5分間隔) | 2026-02-09 | - |
 | `eth-trading-market-context` | F&G/Funding/BTC Dom収集 (30分間隔) | 2026-02-10 | ~300 |
@@ -384,7 +416,7 @@ Compress-Archive -Path "services/chronos-caller/*" -DestinationPath "chronos.zip
 | トレーリングストップ段階追加 | 中 | 利確パターン分析 |
 | ポーリング間隔短縮 (5分→1分) | 中 | コスト試算 |
 | 時間帯別ウェイト調整 | 低 | 時間帯別勝率データ |
-| Chronosモデルサイズ拡大 | 低 | 精度実測データ |
+| ~~Chronosモデルサイズ拡大~~ | ~~低~~ | ✅ Phase 6でSageMaker Base(200M)に移行済 |
 | ML/統計モデルによる閾値最適化 | 低 | 100件+のトレードデータ |
 
 ---
@@ -392,6 +424,9 @@ Compress-Archive -Path "services/chronos-caller/*" -DestinationPath "chronos.zip
 ## 📝 コミット履歴（全件）
 
 ```
+372722f feat: Chronos SageMaker Base upgrade + confidence-based dynamic weights (Phase 6)
+ce37e58 feat: continuous trailing stop + momentum deceleration detection (Phase 5)
+e683082 docs: update Phase 4.5 documentation
 bb5cfa2 feat: F&G-linked BUY threshold suppression (Fear×1.35, Greed×1.20)
 2b7022d feat: data quality gate + auto-improve pre-check (Phase 4.5)
 57fa17b fix: daily-reporter deployment fix
