@@ -83,8 +83,8 @@ def handler(event, context):
             scored = score_pair(pair, result, market_context)
             scored_pairs.append(scored)
 
-        # 2. ボラティリティ適応型閾値を計算
-        buy_threshold, sell_threshold = calculate_dynamic_thresholds(scored_pairs)
+        # 2. ボラティリティ適応型閾値を計算（F&G連動補正付き）
+        buy_threshold, sell_threshold = calculate_dynamic_thresholds(scored_pairs, market_context)
 
         # 3. シグナル保存（動的閾値を使用）
         for scored in scored_pairs:
@@ -294,15 +294,29 @@ def fetch_market_context() -> dict:
         return {}
 
 
-def calculate_dynamic_thresholds(scored_pairs: list) -> tuple:
+# Fear & Greed 連動 BUY閾値補正
+# Extreme Fear (F&G < 20) ではBUY閾値を引き上げ、安易な逆張りを抑制
+# Extreme Greed (F&G > 80) でもBUY閾値を引き上げ、天井掴みを防止
+FNG_FEAR_THRESHOLD = 20    # これ以下で BUY 閾値引き上げ
+FNG_GREED_THRESHOLD = 80   # これ以上で BUY 閾値引き上げ
+FNG_BUY_MULTIPLIER_FEAR = 1.35   # Extreme Fear: BUY閾値を1.35倍（例: 0.28→0.378）
+FNG_BUY_MULTIPLIER_GREED = 1.20  # Extreme Greed: BUY閾値を1.20倍
+
+
+def calculate_dynamic_thresholds(scored_pairs: list, market_context: dict = None) -> tuple:
     """
-    ボラティリティ適応型閾値を計算
+    ボラティリティ適応型閾値を計算（Fear & Greed 連動補正付き）
 
     ロジック:
-    - 全通貨の平均BB幅（ボラティリティ指標）を算出
-    - 基準BB幅(3%)と比較して補正係数を計算
-    - 高ボラ時: 閾値を厳しく（ノイズに反応しない）
-    - 低ボラ時: 閾値を緩く（小さな確実なシグナルを拾う）
+    1. 全通貨の平均BB幅（ボラティリティ指標）から基本補正
+       - 高ボラ時: 閾値を厳しく（ノイズに反応しない）
+       - 低ボラ時: 閾値を緩く（小さな確実なシグナルを拾う）
+    2. Fear & Greed Index による BUY 閾値補正
+       - Extreme Fear (< 20): BUY閾値を1.35倍に引き上げ
+         → 恐怖相場での安易な逆張りを抑制
+       - Extreme Greed (> 80): BUY閾値を1.20倍に引き上げ
+         → 過熱相場での天井掴みを防止
+       - SELL閾値は変更しない（損切りは市場環境に関わらず実行すべき）
     """
     if not scored_pairs:
         return BASE_BUY_THRESHOLD, BASE_SELL_THRESHOLD
@@ -316,8 +330,23 @@ def calculate_dynamic_thresholds(scored_pairs: list) -> tuple:
     buy_threshold = BASE_BUY_THRESHOLD * vol_ratio
     sell_threshold = BASE_SELL_THRESHOLD * vol_ratio
 
+    # --- Fear & Greed 連動 BUY閾値補正 ---
+    fng_multiplier = 1.0
+    fng_reason = ''
+    if market_context:
+        fng_value = int(market_context.get('fng_value', 50))
+        if fng_value <= FNG_FEAR_THRESHOLD:
+            fng_multiplier = FNG_BUY_MULTIPLIER_FEAR
+            fng_reason = f'ExtremeFear(F&G={fng_value}<=20)'
+        elif fng_value >= FNG_GREED_THRESHOLD:
+            fng_multiplier = FNG_BUY_MULTIPLIER_GREED
+            fng_reason = f'ExtremeGreed(F&G={fng_value}>=80)'
+
+    buy_threshold *= fng_multiplier
+
+    fng_info = f", fng_mult={fng_multiplier:.2f} [{fng_reason}]" if fng_reason else ''
     print(f"Dynamic thresholds: BUY={buy_threshold:+.3f} SELL={sell_threshold:+.3f} "
-          f"(avg_bb_width={avg_bb_width:.4f}, vol_ratio={vol_ratio:.2f})")
+          f"(avg_bb_width={avg_bb_width:.4f}, vol_ratio={vol_ratio:.2f}{fng_info})")
 
     return buy_threshold, sell_threshold
 
@@ -649,7 +678,8 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
                 "type": "context",
                 "elements": [
                     {"type": "mrkdwn", "text": f"BUY閾値: `{buy_threshold:+.3f}` / SELL閾値: `{sell_threshold:+.3f}` | "
-                                                f"重み: Tech={TECHNICAL_WEIGHT} AI={CHRONOS_WEIGHT} Sent={SENTIMENT_WEIGHT} Mkt={MARKET_CONTEXT_WEIGHT}"}
+                                                f"重み: Tech={TECHNICAL_WEIGHT} AI={CHRONOS_WEIGHT} Sent={SENTIMENT_WEIGHT} Mkt={MARKET_CONTEXT_WEIGHT}"
+                                                + (f" | ⚠️ F&G補正あり" if buy_threshold > BASE_BUY_THRESHOLD * 1.3 else "")}
                 ]
             }
         ]
