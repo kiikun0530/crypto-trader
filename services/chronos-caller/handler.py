@@ -66,11 +66,6 @@ def handler(event, context):
                 'current_price': 0
             }
 
-        # まずエンドポイントの存在確認
-        if not check_endpoint_exists(SAGEMAKER_ENDPOINT):
-            print(f"[WARN] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not available, using fallback")
-            return _fallback_response(pair, prices, 'endpoint_not_available')
-
         # SageMaker Endpoint で推論（リトライ機能付き）
         try:
             result = invoke_sagemaker_with_retry(prices, PREDICTION_LENGTH, NUM_SAMPLES)
@@ -164,46 +159,12 @@ def get_price_history(pair: str, limit: int = 200) -> list:
 # SageMaker Inference (リトライ機能強化)
 # ==============================================================
 
-def check_endpoint_exists(endpoint_name: str) -> bool:
-    """SageMaker Endpointの存在確認"""
-    try:
-        sagemaker_client = boto3.client('sagemaker')
-        response = sagemaker_client.describe_endpoint(EndpointName=endpoint_name)
-        status = response.get('EndpointStatus', '')
-        is_available = status == 'InService'
-        
-        if is_available:
-            print(f"[INFO] SageMaker endpoint '{endpoint_name}' is available (status: {status})")
-        else:
-            print(f"[WARN] SageMaker endpoint '{endpoint_name}' status: {status} (not InService)")
-            
-        return is_available
-        
-    except ClientError as e:
-        error_code = e.response.get('Error', {}).get('Code', '')
-        if error_code in ['ValidationException', 'ResourceNotFound']:
-            print(f"[WARN] SageMaker endpoint '{endpoint_name}' not found: {error_code}")
-            return False
-        elif error_code == 'AccessDeniedException':
-            print(f"[WARN] SageMaker describe_endpoint permission missing, assuming endpoint exists")
-            # 権限がない場合は存在すると仮定してリクエストを試行
-            # 実際に存在しない場合はinvoke時にValidationExceptionが発生する
-            return True
-        else:
-            # その他のエラー（一時的な問題の可能性）
-            print(f"[WARN] Failed to check endpoint '{endpoint_name}': {error_code}, assuming exists")
-            return True
-            
-    except Exception as e:
-        print(f"[WARN] Failed to check endpoint '{endpoint_name}': {str(e)}, assuming exists")
-        return True
-
-
 def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_samples: int = 50) -> dict:
     """
     SageMaker Serverless Endpoint を呼び出し（ThrottlingException対応リトライ付き）
     
     ThrottlingExceptionに対して指数バックオフでリトライを実行
+    ValidationException/ValidationErrorの場合は即座に例外を再発生（エンドポイント不存在）
     SageMaker Serverlessは同時実行制限があるため、Throttlingは想定内の動作
     """
     for attempt in range(MAX_RETRIES):
@@ -212,6 +173,7 @@ def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_s
             
         except ClientError as e:
             error_code = e.response.get('Error', {}).get('Code', '')
+            error_message = str(e)
             
             if error_code == 'ThrottlingException':
                 if attempt < MAX_RETRIES - 1:
@@ -228,9 +190,14 @@ def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_s
                 else:
                     print(f"[WARN] SageMaker throttling persisted after {MAX_RETRIES} retries, using fallback")
                     raise
-            elif error_code in ['ValidationException', 'ValidationError']:
-                # エンドポイントが存在しない場合は即座に諦める
-                print(f"[ERROR] SageMaker error (non-throttling): {error_code} - {str(e)}")
+            elif error_code in ['ValidationException', 'ValidationError'] or "not found" in error_message.lower():
+                # エンドポイントが存在しない場合は即座に諦める（リトライしない）
+                print(f"[WARN] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not found: {error_code}")
+                print(f"[WARN] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not available, using fallback")
+                raise
+            elif error_code == 'AccessDeniedException':
+                print(f"[WARN] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not accessible: {error_code}")
+                print(f"[WARN] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not available, using fallback")
                 raise
             else:
                 # その他のエラーは即座に再発生
@@ -239,9 +206,11 @@ def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_s
                 
         except Exception as e:
             # その他の例外（ネットワークエラー等）
-            if "not found" in str(e).lower() or "validation" in str(e).lower():
+            error_message = str(e).lower()
+            if "not found" in error_message or "validation" in error_message:
                 # エンドポイント関連のエラーは即座に諦める
-                print(f"[ERROR] SageMaker error (non-throttling): ValidationError - {str(e)}")
+                print(f"[WARN] SageMaker endpoint validation error: {str(e)}")
+                print(f"[WARN] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not available, using fallback")
                 raise
             else:
                 # その他のエラーは再発生
