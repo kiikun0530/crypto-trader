@@ -134,11 +134,12 @@ resource "aws_iam_role_policy" "lambda_custom" {
           "arn:aws:s3:::${local.name_prefix}-sagemaker-models-${local.account_id}/*"
         ]
       },
-      # SageMaker: Chronos-Base エンドポイント呼び出し
+      # SageMaker: Chronos エンドポイント呼び出し + 状態確認
       {
         Effect = "Allow"
         Action = [
-          "sagemaker:InvokeEndpoint"
+          "sagemaker:InvokeEndpoint",
+          "sagemaker:DescribeEndpoint"
         ]
         Resource = [
           "arn:aws:sagemaker:${var.aws_region}:${local.account_id}:endpoint/${local.name_prefix}-chronos-*"
