@@ -205,14 +205,65 @@ AWSクォータ (10) ≥ エンドポイント MaxConcurrency (8) ≥ Step Funct
 | 予測ステップ | 12 (= 1h先) | `PREDICTION_LENGTH` |
 | スコアスケール | ±3% = ±1.0 | `SCORE_SCALE_PERCENT` |
 
-### 予測 → スコア変換
+### Chronos-2 推論パラメータ詳細
 
-予測系列の加重平均（遠い将来ほど重みが大きい）と現在価格の変化率から算出:
-- `change_percent = (weighted_avg - current_price) / current_price × 100`
-- ±3% の変動予測で ±1.0 にスケール
-- 外れ値カット: ±20%超の予測を現在価格で置換
-- トレンド加速ボーナス: 後半予測 > 前半予測で最大±0.15加算
-- std減衰: CV > 5%でスコアを50%まで減衰
+#### Lambda側 → SageMaker (リクエスト)
+
+Lambda (`chronos-caller`) から SageMaker エンドポイントに送信される JSON ペイロード:
+
+```json
+{
+  "context": [2350.1, 2352.3, 2348.7, ...],
+  "prediction_length": 12
+}
+```
+
+| パラメータ | 型 | 値 | 説明 |
+|---|---|---|---|
+| `context` | `float[]` | 336要素 | 価格履歴 (Typical Price = (High+Low+Close)/3)。OHLCがない古いレコードはCloseにフォールバック |
+| `prediction_length` | `int` | 12 | 5分足×12ステップ = 1時間先を予測 |
+
+#### SageMaker推論コード (`inference.py`) の内部パラメータ
+
+`scripts/deploy_sagemaker_chronos.py` 内で生成される `inference.py` が使用するパラメータ:
+
+| パラメータ | 値 | 説明 |
+|---|---|---|
+| モデル | `amazon/chronos-2` | HuggingFace Hub から自動ダウンロード (初回起動時) |
+| Pipeline | `BaseChronosPipeline` | Chronos-2 の分位数直接出力パイプライン (サンプリング不要) |
+| `device_map` | `"cpu"` | CPU推論 (Serverless は GPU 非対応) |
+| `torch_dtype` | `torch.float32` | 精度 (CPU なので float32) |
+| `quantile_levels` | `[0.1, 0.5, 0.9]` | 出力する分位数レベル (10th, 50th, 90th パーセンタイル) |
+| `limit_prediction_length` | `False` | 予測長の制限を無効化 |
+| 入力テンソル形状 | `(1, 1, T)` | (batch=1, variates=1, time=336) — univariate 時系列 |
+
+#### SageMaker → Lambda (レスポンス)
+
+`predict_quantiles()` の出力を変換して返却:
+
+| フィールド | 型 | 算出方法 |
+|---|---|---|
+| `median` | `float[]` | 50th パーセンタイル (`q[:, 1]`) |
+| `mean` | `float[]` | `mean_list` から取得 |
+| `std` | `float[]` | `abs(q90 - q10) / 2.56` (正規分布近似: q90-q10 ≈ 2.56σ) |
+| `q10` | `float[]` | 10th パーセンタイル (`q[:, 0]`) — 悲観シナリオ |
+| `q90` | `float[]` | 90th パーセンタイル (`q[:, 2]`) — 楽観シナリオ |
+| `confidence` | `float` | 各ステップの `1/(1 + cv*10)` の平均 (`cv = std/|median|`) |
+| `confidence_per_step` | `float[]` | 各予測ステップごとの確信度 |
+| `model` | `str` | `"chronos-2"` |
+
+#### Lambda側スコアリング (`predictions_to_score`)
+
+SageMaker レスポンスの `median` をトレーディングスコア (-1.0 〜 +1.0) に変換:
+
+| 処理 | 詳細 |
+|---|---|
+| 外れ値カット | ±20%超の予測値を現在価格に置換 |
+| 加重平均 | 重み `w[i] = (i+1)/n` — 遠い将来ほど重い |
+| スケーリング | `score = change_percent / 3.0` (±3%変動 = ±1.0) |
+| トレンド加速ボーナス | 後半予測 > 前半予測で最大±0.15加算 (予測点6以上の場合) |
+| std 減衰 | CV>5%でスコアを50%まで減衰、CV<1%は100%維持 |
+| クリッピング | 最終スコアを `[-1.0, +1.0]` に制限 |
 
 ### リトライ設定
 
