@@ -75,6 +75,9 @@ def handler(event, context):
         elif endpoint_status == 'not_ready':
             print(f"[INFO] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not ready, using fallback")
             return _fallback_response(pair, prices, 'endpoint_not_ready')
+        elif endpoint_status == 'permission_error':
+            print(f"[INFO] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' permission error, using fallback")
+            return _fallback_response(pair, prices, 'permission_error')
 
         # SageMaker Endpoint で推論（リトライ機能付き）
         try:
@@ -139,11 +142,11 @@ def check_endpoint_availability():
             print(f"[INFO] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not found")
             return 'not_found'
         elif error_code == 'AccessDeniedException':
-            print(f"[WARN] SageMaker describe_endpoint permission missing for '{SAGEMAKER_ENDPOINT}', will try invoke directly")
-            return 'permission_error'  # 権限不足の場合は直接invoke試行
+            print(f"[WARN] SageMaker describe_endpoint permission missing for '{SAGEMAKER_ENDPOINT}', will use fallback")
+            return 'permission_error'  # 権限不足の場合は直接フォールバック
         else:
             print(f"[WARN] Failed to check endpoint '{SAGEMAKER_ENDPOINT}': {error_code}")
-            return 'permission_error'  # その他のエラーも直接invoke試行
+            return 'permission_error'  # その他のエラーも直接フォールバック
             
     except Exception as e:
         print(f"[ERROR] Failed to check endpoint '{SAGEMAKER_ENDPOINT}': {str(e)}")
