@@ -19,7 +19,7 @@ import traceback
 from botocore.exceptions import ClientError
 from botocore.config import Config
 
-# SageMaker用のリトライ設定を修正（不正なretry_delayパラメータを削除）
+# SageMaker用のリトライ設定を修正（無効なパラメータを削除）
 sagemaker_config = Config(
     retries={
         'max_attempts': 3,
