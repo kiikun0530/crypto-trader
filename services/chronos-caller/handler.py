@@ -13,11 +13,24 @@ SageMaker Serverless Endpoint 上の Chronos-T5-Base (200M) を呼び出し
 import json
 import os
 import time
+import random
 import boto3
 import traceback
+from botocore.exceptions import ClientError
+from botocore.config import Config
+
+# SageMaker用のリトライ設定を強化
+sagemaker_config = Config(
+    retries={
+        'max_attempts': 3,
+        'mode': 'adaptive'
+    },
+    read_timeout=60,
+    connect_timeout=10
+)
 
 dynamodb = boto3.resource('dynamodb')
-sagemaker_runtime = boto3.client('sagemaker-runtime')
+sagemaker_runtime = boto3.client('sagemaker-runtime', config=sagemaker_config)
 
 PRICES_TABLE = os.environ.get('PRICES_TABLE', 'eth-trading-prices')
 SAGEMAKER_ENDPOINT = os.environ.get('SAGEMAKER_ENDPOINT', 'eth-trading-chronos-base')
@@ -28,6 +41,11 @@ INPUT_LENGTH = int(os.environ.get('INPUT_LENGTH', '200'))
 # スコアリング設定
 SCORE_SCALE_PERCENT = 3.0    # ±3%変動で±1.0 (旧: ±1%で飽和していた)
 OUTLIER_PERCENTILE = 10      # 上下10%をカットして外れ値除去
+
+# リトライ設定
+MAX_RETRIES = 5
+BASE_DELAY = 2.0  # 基本待機時間（秒）
+MAX_DELAY = 30.0  # 最大待機時間（秒）
 
 
 def handler(event, context):
@@ -48,9 +66,9 @@ def handler(event, context):
                 'current_price': 0
             }
 
-        # SageMaker Endpoint で推論
+        # SageMaker Endpoint で推論（リトライ機能付き）
         try:
-            result = invoke_sagemaker(prices, PREDICTION_LENGTH, NUM_SAMPLES)
+            result = invoke_sagemaker_with_retry(prices, PREDICTION_LENGTH, NUM_SAMPLES)
             if result and 'median' in result:
                 score = predictions_to_score(result, prices[-1])
                 confidence = result.get('confidence', 0.5)
@@ -138,8 +156,47 @@ def get_price_history(pair: str, limit: int = 200) -> list:
 
 
 # ==============================================================
-# SageMaker Inference
+# SageMaker Inference (リトライ機能強化)
 # ==============================================================
+
+def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_samples: int = 50) -> dict:
+    """
+    SageMaker Serverless Endpoint を呼び出し（ThrottlingException対応リトライ付き）
+    
+    ThrottlingExceptionに対して指数バックオフでリトライを実行
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            return invoke_sagemaker(prices, prediction_length, num_samples)
+            
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+            
+            if error_code == 'ThrottlingException':
+                if attempt < MAX_RETRIES - 1:
+                    # 指数バックオフ + jitter
+                    delay = min(BASE_DELAY * (2 ** attempt), MAX_DELAY)
+                    jitter = random.uniform(0.1, 0.3) * delay
+                    total_delay = delay + jitter
+                    
+                    print(f"ThrottlingException (attempt {attempt + 1}/{MAX_RETRIES}), "
+                          f"waiting {total_delay:.1f}s...")
+                    time.sleep(total_delay)
+                    continue
+                else:
+                    print(f"Max retries exceeded for ThrottlingException")
+                    raise
+            else:
+                # ThrottlingException以外のエラーは即座に再発生
+                raise
+                
+        except Exception as e:
+            # その他の例外（ネットワークエラー等）も再発生
+            raise
+    
+    # ここには到達しないはずだが、安全のため
+    raise Exception("Unexpected error in retry loop")
+
 
 def invoke_sagemaker(prices: list, prediction_length: int = 12, num_samples: int = 50) -> dict:
     """

@@ -94,9 +94,13 @@
 |-----------|--------|--------|---------|
 | スコア変換スケール | **±1% = ±1.0** | ±5% = ±1.0 | #4 Chronos実質機能化 |
 | 予測ステップ | 12 | 12 | 変更なし |
-| サンプル数 | 20 | 20 | 変更なし |
+| サンプル数 | 50 | 20 | モデル精度向上 |
 | 入力データ | **Typical Price (H+L+C)/3** | closeのみ | ローソク足の重心を反映 |
 | デコード | **KVキャッシュ付き** (decoder_with_past) | フルデコード | #16 O(n²)→O(n) |
+| SageMakerリトライ | **MAX_RETRIES=5** | リトライなし | ThrottlingException対応 |
+| リトライ設定 | **BASE_DELAY=2.0s, MAX_DELAY=30.0s** | - | 指数バックオフ + jitter |
+| boto3リトライ設定 | **max_attempts=3, mode=adaptive** | デフォルト | クライアントレベル強化 |
+| タイムアウト設定 | **read_timeout=60s, connect_timeout=10s** | デフォルト | SageMaker Serverless対応 |
 
 ### Position Monitor (`services/position-monitor/handler.py`)
 
@@ -148,7 +152,7 @@
 |--------|---------|------------|
 | `eth-trading-price-collector` | 6通貨価格収集 (Binance) + OHLCV保存 | 2026-02-09 |
 | `eth-trading-technical` | RSI(Wilder's)/MACD(グラデーション)/SMA/BB/ADX(OHLC)/ATR(OHLC)/Volume | 2026-02-09 |
-| `eth-trading-chronos-caller` | ONNX Chronos-T5-Tiny 予測 (KVキャッシュ+Typical Price) | 2026-02-09 |
+| `eth-trading-chronos-caller` | SageMaker Chronos-T5-Base 予測 (リトライ強化+Typical Price) | 2026-02-10 |
 | `eth-trading-sentiment-getter` | CryptoPanic センチメント | - |
 | `eth-trading-aggregator` | 統合スコアリング (0.55/0.30/0.15) + 売買判定 + analysis_context | 2026-02-09 |
 | `eth-trading-order-executor` | Coincheck 成行注文 + サーキットブレーカー + トレードコンテキスト保存 | 2026-02-09 |
@@ -215,6 +219,7 @@
 | #5 トレーリングストップ | SL引上げ回数 | CloudWatch Logs "Trailing stop raised" |
 | #7 レジーム | regime別の勝率 | signals テーブルの regime フィールド |
 | #10 サーキットブレーカー | (OFF中は不要) | ON時: トリップ回数 |
+| chronos-caller リトライ | ThrottlingException発生率 | CloudWatch Logs "ThrottlingException" |
 
 ### データ取得スクリプト
 
@@ -268,6 +273,7 @@ IMPROVEMENT_DEPLOY_TIMESTAMP = 1739064731  # 2025-02-09T02:12:11Z
 | 16 | KVキャッシュデコード (decoder_with_past) | `8211ac1` | chronos-caller |
 | 17 | NLPセンチメント高度化 (3段階+否定語+フレーズ) | `8211ac1` | news-collector |
 | 18 | トレードコンテキスト保存 (analysis_context) | `8211ac1` | aggregator, order-executor |
+| 19 | SageMaker Chronos Base モデル + リトライ強化 | `2026-02-10` | chronos-caller |
 | - | Chronos Typical Price (H+L+C)/3 | `90684dc` | chronos-caller |
 
 ### 新規設定値 (Phase 2 で変更)
@@ -282,6 +288,8 @@ IMPROVEMENT_DEPLOY_TIMESTAMP = 1739064731  # 2025-02-09T02:12:11Z
 | Volume | 未使用 | **1.0-1.3x乗数** | 20本平均比1.5x以上で増幅 |
 | Chronos入力 | close | **Typical Price** | (H+L+C)/3 で値動きの重心を反映 |
 | Chronosデコード | フルデコード | **KVキャッシュ** | O(n²)→O(n) 推論高速化 |
+| Chronosモデル | ONNX Tiny(8M) | **SageMaker Base(200M)** | 予測精度大幅向上 |
+| SageMakerリトライ | なし | **指数バックオフ(5回)** | ThrottlingException対応 |
 | NLPセンチメント | 60語キーワード | **3段階強度+否定語+20+フレーズ** | ±0.3→±0.4範囲 |
 | トレード記録 | 価格・数量のみ | **+分析コンテキスト** | component scores/weights/thresholds |
 
@@ -290,10 +298,10 @@ IMPROVEMENT_DEPLOY_TIMESTAMP = 1739064731  # 2025-02-09T02:12:11Z
 ## 📝 改善実装の全コミット履歴
 
 ```
+2026-02-10 feat: SageMaker Chronos リトライ強化 - ThrottlingException 指数バックオフ対応
 a986c13 feat: implement circuit breaker (#10) - default OFF, toggleable via env var
 5c12caa feat: implement trading improvements #3,5,6,7,8,9
 95ef463 feat: fix MACD signal line (EMA9) + Chronos score scale 5%→1%
 8e582d0 feat: minimum hold period (30min) to prevent BUY->instant SELL loop
 f6c29db fix(news-collector): fix panic_score scale (0-100 not 0-4), remove dead v1 sentiment field
 45642e7 fix(critical): get_market_buy_fill order_id filter + entry_price sanity check
-```
