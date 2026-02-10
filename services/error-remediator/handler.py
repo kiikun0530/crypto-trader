@@ -1,12 +1,11 @@
 """
 Error Remediator Lambda
 CloudWatch Logs Subscription Filter からエラーログを受信し、
-① Slack通知（即時アラート）
-② GitHub Actions 自動修復ワークフローをトリガー
+Slack通知（即時アラート）を送信する
 
 デバウンス機能:
-- 同一Lambda関数のエラーは COOLDOWN_MINUTES 間隔で1回のみトリガー
-- 連続エラーによるCI爆発を防止
+- 同一Lambda関数のエラーは COOLDOWN_MINUTES 間隔で1回のみ通知
+- 連続エラーによるアラート爆発を防止
 """
 import json
 import os
@@ -14,15 +13,11 @@ import base64
 import gzip
 import urllib.request
 import time
-import hashlib
 import boto3
 
 SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL', '')
-GITHUB_TOKEN_SECRET_ARN = os.environ.get('GITHUB_TOKEN_SECRET_ARN', '')
-GITHUB_REPO = os.environ.get('GITHUB_REPO', '')
 COOLDOWN_MINUTES = int(os.environ.get('COOLDOWN_MINUTES', '30'))
 
-secrets = boto3.client('secretsmanager')
 dynamodb = boto3.resource('dynamodb')
 
 # クールダウン管理用テーブル（DynamoDB）
@@ -73,11 +68,8 @@ def handler(event, context):
         error_summary = '\n'.join(error_messages[:10])  # 最大10行
         print(f"Error detected in {function_name}: {error_summary[:500]}")
 
-        # ① Slack通知
+        # Slack通知
         send_slack_alert(function_name, error_summary, log_stream)
-
-        # ② GitHub Actions トリガー
-        trigger_auto_fix(function_name, error_summary, log_group, log_stream)
 
         return {'statusCode': 200, 'body': 'Processed'}
 
@@ -200,7 +192,7 @@ def send_slack_alert(function_name: str, error_summary: str, log_stream: str):
                 "elements": [
                     {
                         "type": "mrkdwn",
-                        "text": "🤖 Auto-fix ワークフローをトリガーしています..."
+                        "text": "📋 CloudWatch Logs で詳細を確認してください"
                     }
                 ]
             }
@@ -217,94 +209,3 @@ def send_slack_alert(function_name: str, error_summary: str, log_stream: str):
         print(f"Slack alert sent (status: {response.status})")
     except Exception as e:
         print(f"Slack alert failed: {e}")
-
-
-def get_github_token() -> str:
-    """Secrets Manager から GitHub PAT を取得"""
-    if not GITHUB_TOKEN_SECRET_ARN:
-        return ''
-    try:
-        response = secrets.get_secret_value(SecretId=GITHUB_TOKEN_SECRET_ARN)
-        secret = json.loads(response['SecretString'])
-        return secret.get('token', '')
-    except Exception as e:
-        print(f"Failed to get GitHub token: {e}")
-        return ''
-
-
-def trigger_auto_fix(function_name: str, error_summary: str, log_group: str, log_stream: str):
-    """GitHub Actions の repository_dispatch をトリガー"""
-    token = get_github_token()
-    if not token:
-        print("No GitHub token available, skipping auto-fix trigger")
-        return
-
-    if not GITHUB_REPO:
-        print("GITHUB_REPO not set")
-        return
-
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/dispatches"
-
-    payload = {
-        "event_type": "lambda-error",
-        "client_payload": {
-            "function_name": function_name,
-            "error_summary": error_summary[:3000],  # GitHub API payload制限
-            "log_group": log_group,
-            "log_stream": log_stream,
-            "timestamp": int(time.time()),
-            "service_dir": f"services/{function_name}/handler.py"
-        }
-    }
-
-    try:
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode('utf-8'),
-            headers={
-                'Authorization': f'token {token}',
-                'Accept': 'application/vnd.github.v3+json',
-                'Content-Type': 'application/json',
-                'User-Agent': 'eth-trading-error-remediator'
-            },
-            method='POST'
-        )
-        response = urllib.request.urlopen(req, timeout=10)
-        print(f"GitHub Actions triggered (status: {response.status})")
-    except Exception as e:
-        print(f"GitHub Actions trigger failed: {e}")
-        # Slackにフォールバック通知
-        send_slack_fallback(function_name, str(e))
-
-
-def send_slack_fallback(function_name: str, error: str):
-    """GitHub Actions トリガー失敗時のSlack通知"""
-    if not SLACK_WEBHOOK_URL:
-        return
-
-    payload = {
-        "blocks": [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"⚠️ *Auto-fix トリガー失敗*\n"
-                        f"関数: `{function_name}`\n"
-                        f"エラー: {error}\n"
-                        f"手動での確認が必要です。"
-                    )
-                }
-            }
-        ]
-    }
-
-    try:
-        req = urllib.request.Request(
-            SLACK_WEBHOOK_URL,
-            data=json.dumps(payload).encode('utf-8'),
-            headers={'Content-Type': 'application/json'}
-        )
-        urllib.request.urlopen(req, timeout=5)
-    except Exception:
-        pass

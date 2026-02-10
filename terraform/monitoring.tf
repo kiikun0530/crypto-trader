@@ -89,7 +89,7 @@ resource "aws_cloudwatch_log_subscription_filter" "error_filter" {
 
 # -----------------------------------------------------------------------------
 # Error Remediator Lambda
-# エラーログ受信 → Slack通知 + GitHub Actions自動修復トリガー
+# エラーログ受信 → Slack通知
 # -----------------------------------------------------------------------------
 resource "aws_cloudwatch_log_group" "error_remediator" {
   name              = "/aws/lambda/${local.name_prefix}-error-remediator"
@@ -108,7 +108,7 @@ data "archive_file" "error_remediator" {
 
 resource "aws_lambda_function" "error_remediator" {
   function_name    = "${local.name_prefix}-error-remediator"
-  description      = "エラーログ検知 → Slack通知 + GitHub Auto-Fix トリガー"
+  description      = "エラーログ検知 → Slack通知"
   role             = aws_iam_role.lambda_execution.arn
   handler          = "handler.handler"
   runtime          = "python3.11"
@@ -120,8 +120,6 @@ resource "aws_lambda_function" "error_remediator" {
   environment {
     variables = {
       SLACK_WEBHOOK_URL        = var.slack_webhook_url
-      GITHUB_TOKEN_SECRET_ARN  = "arn:aws:secretsmanager:${var.aws_region}:${local.account_id}:secret:github/auto-fix-token"
-      GITHUB_REPO              = var.github_repo
       COOLDOWN_MINUTES         = "30"
     }
   }

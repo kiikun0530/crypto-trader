@@ -140,8 +140,6 @@ locals {
     SAGEMAKER_ENDPOINT     = "${local.name_prefix}-chronos-base"
     IMPROVEMENTS_TABLE     = aws_dynamodb_table.improvements.name
     REPORT_BUCKET          = "${local.name_prefix}-daily-reports-${local.account_id}"
-    GITHUB_TOKEN_SECRET_ARN = "arn:aws:secretsmanager:${var.aws_region}:${local.account_id}:secret:github/auto-fix-token"
-    GITHUB_REPO            = var.github_repo
   }
 }
 
