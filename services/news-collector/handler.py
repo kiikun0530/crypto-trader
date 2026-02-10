@@ -17,6 +17,7 @@ import os
 import time
 import urllib.request
 import boto3
+import traceback
 from decimal import Decimal
 
 dynamodb = boto3.resource('dynamodb')
@@ -46,73 +47,98 @@ MARKET_NEWS_WEIGHT = 0.3
 def handler(event, context):
     """全通貨のニュース収集 + 通貨別センチメント分析"""
     timestamp = int(time.time())
+    print(f"Starting news collection for {len(TRADING_PAIRS)} pairs at {timestamp}")
 
     try:
         # 1. 対象通貨のニュースを一括取得（1 API call）
         target_currencies = list(set([c['news'] for c in TRADING_PAIRS.values()]))
+        print(f"Fetching news for currencies: {','.join(target_currencies)}")
+        
         currency_news = fetch_news(currencies=','.join(target_currencies), limit=NEWS_LIMIT)
-        print(f"Fetched {len(currency_news)} articles for {','.join(target_currencies)}")
+        print(f"Successfully fetched {len(currency_news)} articles for {','.join(target_currencies)}")
 
         # 2. 全体市場ニュース取得（1 API call）
+        print("Fetching market-wide news...")
         market_news = fetch_news(currencies=None, limit=20)
-        print(f"Fetched {len(market_news)} market-wide articles")
+        print(f"Successfully fetched {len(market_news)} market-wide articles")
 
         # 3. 通貨別にセンチメント計算・保存
         results = {}
+        failed_pairs = []
+        
         for pair, config in TRADING_PAIRS.items():
-            currency = config['news']
+            try:
+                print(f"Processing {pair} ({config['name']})...")
+                currency = config['news']
 
-            # この通貨に直接関連するニュース
-            direct_news = [a for a in currency_news if is_about_currency(a, currency)]
+                # この通貨に直接関連するニュース
+                direct_news = [a for a in currency_news if is_about_currency(a, currency)]
 
-            # BTC相関ニュース（BTC以外の通貨）
-            btc_news = []
-            if currency != 'BTC':
-                btc_news = [a for a in currency_news if is_about_currency(a, 'BTC')]
+                # BTC相関ニュース（BTC以外の通貨）
+                btc_news = []
+                if currency != 'BTC':
+                    btc_news = [a for a in currency_news if is_about_currency(a, 'BTC')]
 
-            # 重み付けして結合
-            weighted_articles = []
-            seen_ids = set()
+                # 重み付けして結合
+                weighted_articles = []
+                seen_ids = set()
 
-            for article in direct_news:
-                a = dict(article)
-                a['_currency_weight'] = 1.0
-                a['_source_currency'] = currency
-                weighted_articles.append(a)
-                seen_ids.add(article.get('id'))
-
-            for article in btc_news:
-                if article.get('id') not in seen_ids:
+                for article in direct_news:
                     a = dict(article)
-                    a['_currency_weight'] = BTC_CORRELATION_WEIGHT
-                    a['_source_currency'] = 'BTC'
+                    a['_currency_weight'] = 1.0
+                    a['_source_currency'] = currency
                     weighted_articles.append(a)
                     seen_ids.add(article.get('id'))
 
-            for article in market_news:
-                a = dict(article)
-                a['_currency_weight'] = MARKET_NEWS_WEIGHT
-                a['_source_currency'] = 'ALL'
-                weighted_articles.append(a)
+                for article in btc_news:
+                    if article.get('id') not in seen_ids:
+                        a = dict(article)
+                        a['_currency_weight'] = BTC_CORRELATION_WEIGHT
+                        a['_source_currency'] = 'BTC'
+                        weighted_articles.append(a)
+                        seen_ids.add(article.get('id'))
 
-            # センチメント分析
-            score, fresh_count, stats = analyze_sentiment_weighted(weighted_articles)
-            save_sentiment(pair, timestamp, score, len(weighted_articles), fresh_count)
+                for article in market_news:
+                    a = dict(article)
+                    a['_currency_weight'] = MARKET_NEWS_WEIGHT
+                    a['_source_currency'] = 'ALL'
+                    weighted_articles.append(a)
 
-            results[pair] = {
-                'score': round(score, 3),
-                'direct': len(direct_news),
-                'btc_context': len(btc_news),
-                'market': len(market_news),
-                'total': len(weighted_articles)
-            }
-            print(f"  {config['name']} ({pair}): score={score:.3f} "
-                  f"(direct={len(direct_news)}, btc={len(btc_news)}, market={len(market_news)})")
+                # センチメント分析
+                print(f"Analyzing sentiment for {pair} with {len(weighted_articles)} articles...")
+                score, fresh_count, stats = analyze_sentiment_weighted(weighted_articles)
+                
+                print(f"Saving sentiment for {pair}...")
+                save_sentiment(pair, timestamp, score, len(weighted_articles), fresh_count)
+
+                results[pair] = {
+                    'score': round(score, 3),
+                    'direct': len(direct_news),
+                    'btc_context': len(btc_news),
+                    'market': len(market_news),
+                    'total': len(weighted_articles)
+                }
+                
+                print(f"Successfully saved sentiment for {pair}")
+                print(f"  {config['name']} ({pair}): score={score:.3f} "
+                      f"(direct={len(direct_news)}, btc={len(btc_news)}, market={len(market_news)})")
+
+            except Exception as pair_error:
+                print(f"Error processing pair {pair}: {str(pair_error)}")
+                print(f"Traceback for {pair}: {traceback.format_exc()}")
+                failed_pairs.append(pair)
+                continue
+
+        print(f"Completed processing. Successful: {len(results)}, Failed: {len(failed_pairs)}")
+        if failed_pairs:
+            print(f"Failed pairs: {failed_pairs}")
 
         return {
             'statusCode': 200,
             'body': json.dumps({
                 'pairs_analyzed': len(results),
+                'pairs_failed': len(failed_pairs),
+                'failed_pairs': failed_pairs,
                 'results': results,
                 'api_calls': 2,
                 'timestamp': timestamp
@@ -120,26 +146,31 @@ def handler(event, context):
         }
 
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Critical error in handler: {str(e)}")
+        print(f"Full traceback: {traceback.format_exc()}")
         return {
             'statusCode': 500,
-            'body': json.dumps({'error': str(e)})
+            'body': json.dumps({'error': str(e), 'traceback': traceback.format_exc()})
         }
 
 
 def is_about_currency(article: dict, currency: str) -> bool:
     """記事が特定の通貨に関連するかチェック"""
-    # CryptoPanic API v2 では 'instruments' フィールドに通貨情報がある
-    # v1 の 'currencies' フィールドもフォールバックで対応
-    for field in ['instruments', 'currencies']:
-        items = article.get(field, [])
-        if isinstance(items, list):
-            for c in items:
-                if isinstance(c, dict) and c.get('code', '').upper() == currency.upper():
-                    return True
-                elif isinstance(c, str) and c.upper() == currency.upper():
-                    return True
-    return False
+    try:
+        # CryptoPanic API v2 では 'instruments' フィールドに通貨情報がある
+        # v1 の 'currencies' フィールドもフォールバックで対応
+        for field in ['instruments', 'currencies']:
+            items = article.get(field, [])
+            if isinstance(items, list):
+                for c in items:
+                    if isinstance(c, dict) and c.get('code', '').upper() == currency.upper():
+                        return True
+                    elif isinstance(c, str) and c.upper() == currency.upper():
+                        return True
+        return False
+    except Exception as e:
+        print(f"Error checking currency {currency} for article: {str(e)}")
+        return False
 
 
 def fetch_news(currencies: str = None, limit: int = 50) -> list:
@@ -154,19 +185,29 @@ def fetch_news(currencies: str = None, limit: int = 50) -> list:
     if currencies:
         params += f'&currencies={currencies}'
 
-    try:
-        url = base_url + params
-        label = currencies or 'ALL'
-        req = urllib.request.Request(url)
-        req.add_header('User-Agent', 'CryptoTrader-Bot/1.0')
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            url = base_url + params
+            label = currencies or 'ALL'
+            print(f"API call attempt {attempt + 1}/{max_retries} for {label}")
+            
+            req = urllib.request.Request(url)
+            req.add_header('User-Agent', 'CryptoTrader-Bot/1.0')
 
-        with urllib.request.urlopen(req, timeout=30) as response:
-            data = json.loads(response.read().decode())
-            results = data.get('results', [])[:limit]
-            return results
-    except Exception as e:
-        print(f"Error fetching news ({currencies or 'ALL'}): {str(e)}")
-        return []
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = json.loads(response.read().decode())
+                results = data.get('results', [])[:limit]
+                print(f"API call successful for {label}, got {len(results)} articles")
+                return results
+                
+        except Exception as e:
+            print(f"Error fetching news ({currencies or 'ALL'}), attempt {attempt + 1}: {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+            else:
+                print(f"Failed to fetch news after {max_retries} attempts")
+                return []
 
 
 def analyze_sentiment_weighted(news: list) -> tuple:
@@ -183,52 +224,57 @@ def analyze_sentiment_weighted(news: list) -> tuple:
     vote_unreliable_count = 0
 
     for article in news:
-        # 記事の新鮮さ
-        published = article.get('published_at', '')
-        article_age_hours = get_article_age_hours(published)
+        try:
+            # 記事の新鮮さ
+            published = article.get('published_at', '')
+            article_age_hours = get_article_age_hours(published)
 
-        if article_age_hours <= NEWS_FRESHNESS_HOURS:
-            fresh_count += 1
+            if article_age_hours <= NEWS_FRESHNESS_HOURS:
+                fresh_count += 1
 
-        # 時間減衰: 新しいほど重み大（1時間以内=1.0、24時間=0.1）
-        time_weight = max(0.1, 1.0 - (article_age_hours / 24))
+            # 時間減衰: 新しいほど重み大（1時間以内=1.0、24時間=0.1）
+            time_weight = max(0.1, 1.0 - (article_age_hours / 24))
 
-        # 通貨別重み
-        currency_weight = article.get('_currency_weight', 1.0)
+            # 通貨別重み
+            currency_weight = article.get('_currency_weight', 1.0)
 
-        # 投票データ
-        votes = article.get('votes', {})
-        positive = votes.get('positive', 0) + votes.get('important', 0) * 1.5
-        negative = votes.get('negative', 0) + votes.get('toxic', 0) * 1.5
-        liked = votes.get('liked', 0)
-        disliked = votes.get('disliked', 0)
-        total_votes = positive + negative + liked + disliked
+            # 投票データ
+            votes = article.get('votes', {})
+            positive = votes.get('positive', 0) + votes.get('important', 0) * 1.5
+            negative = votes.get('negative', 0) + votes.get('toxic', 0) * 1.5
+            liked = votes.get('liked', 0)
+            disliked = votes.get('disliked', 0)
+            total_votes = positive + negative + liked + disliked
 
-        if total_votes >= MIN_RELIABLE_VOTES:
-            vote_reliable_count += 1
-            article_score = (positive + liked) / total_votes
-            vote_confidence = min(
-                (total_votes - MIN_RELIABLE_VOTES) / (VOTE_CONFIDENCE_CAP - MIN_RELIABLE_VOTES),
-                1.0
-            )
-            article_score = 0.5 + (article_score - 0.5) * vote_confidence
-        else:
-            vote_unreliable_count += 1
-            # 投票データ不足時はタイトルベースの簡易センチメント
-            article_score = estimate_sentiment_from_title(article.get('title', ''))
+            if total_votes >= MIN_RELIABLE_VOTES:
+                vote_reliable_count += 1
+                article_score = (positive + liked) / total_votes
+                vote_confidence = min(
+                    (total_votes - MIN_RELIABLE_VOTES) / (VOTE_CONFIDENCE_CAP - MIN_RELIABLE_VOTES),
+                    1.0
+                )
+                article_score = 0.5 + (article_score - 0.5) * vote_confidence
+            else:
+                vote_unreliable_count += 1
+                # 投票データ不足時はタイトルベースの簡易センチメント
+                article_score = estimate_sentiment_from_title(article.get('title', ''))
 
-        # panic_score があれば補助的に使用
-        # API v2: panic_score は 0〜100 の整数（市場重要度/インパクト）
-        # ※ Growth Plan では panic_period パラメータ非対応のため通常 null
-        panic_score = article.get('panic_score')
-        if panic_score is not None and isinstance(panic_score, (int, float)):
-            # 0-100スケール → 50を中立とし、±0.10 の微調整
-            panic_adjustment = (panic_score - 50) / 500  # 0→-0.10, 50→0, 100→+0.10
-            article_score = max(0.0, min(1.0, article_score + panic_adjustment))
+            # panic_score があれば補助的に使用
+            # API v2: panic_score は 0〜100 の整数（市場重要度/インパクト）
+            # ※ Growth Plan では panic_period パラメータ非対応のため通常 null
+            panic_score = article.get('panic_score')
+            if panic_score is not None and isinstance(panic_score, (int, float)):
+                # 0-100スケール → 50を中立とし、±0.10 の微調整
+                panic_adjustment = (panic_score - 50) / 500  # 0→-0.10, 50→0, 100→+0.10
+                article_score = max(0.0, min(1.0, article_score + panic_adjustment))
 
-        weight = time_weight * currency_weight
-        total_weighted_score += article_score * weight
-        total_weight += weight
+            weight = time_weight * currency_weight
+            total_weighted_score += article_score * weight
+            total_weight += weight
+
+        except Exception as e:
+            print(f"Error analyzing article sentiment: {str(e)}")
+            continue
 
     if total_weight == 0:
         return 0.5, fresh_count, {}
@@ -255,7 +301,8 @@ def get_article_age_hours(published_at: str) -> float:
         now = datetime.now(published.tzinfo)
         age_seconds = (now - published).total_seconds()
         return max(0, age_seconds / 3600)
-    except:
+    except Exception as e:
+        print(f"Error parsing published_at '{published_at}': {str(e)}")
         return 24
 
 
@@ -273,138 +320,147 @@ def estimate_sentiment_from_title(title: str) -> float:
     if not title:
         return 0.5
 
-    title_lower = title.lower()
-    words = title_lower.split()
+    try:
+        title_lower = title.lower()
+        words = title_lower.split()
 
-    # ===== フレーズマッチング (バイグラム/トリグラム優先) =====
-    bullish_phrases = {
-        # strong (+0.25)
-        'all-time high': 0.25, 'all time high': 0.25, 'new ath': 0.25,
-        'etf approved': 0.25, 'etf approval': 0.25, 'mass adoption': 0.25,
-        'short squeeze': 0.25, 'whale accumulation': 0.20,
-        'institutional buying': 0.20, 'record inflow': 0.20,
-        # moderate (+0.15)
-        'golden cross': 0.15, 'breaks out': 0.15, 'breaks above': 0.15,
-        'price target': 0.15, 'buy signal': 0.15, 'strong support': 0.15,
-        'higher high': 0.15, 'bullish divergence': 0.15,
-        'network upgrade': 0.12, 'strategic reserve': 0.12,
-        # contextual bullish (bearish word in bullish context)
-        'buy the dip': 0.15, 'buying the dip': 0.15, 'bought the dip': 0.15,
-        'buys the dip': 0.15, 'accumulate on dip': 0.12,
-        'whales buy': 0.12, 'whales buying': 0.12, 'whale buying': 0.12,
-        'bottom is in': 0.15, 'found support': 0.12, 'holds support': 0.12,
-        'signs of recovery': 0.15, 'showing strength': 0.12,
-    }
-    bearish_phrases = {
-        # strong (-0.25)
-        'death cross': 0.25, 'bank run': 0.25, 'rug pull': 0.25,
-        'ponzi scheme': 0.25, 'sec lawsuit': 0.25, 'exchange hack': 0.25,
-        'mass liquidation': 0.25, 'flash crash': 0.25,
-        # moderate (-0.15)
-        'breaks below': 0.15, 'sell signal': 0.15, 'lower low': 0.15,
-        'bearish divergence': 0.15, 'key support': 0.15, 'lost support': 0.15,
-        'whale dump': 0.15, 'record outflow': 0.15, 'under investigation': 0.15,
-        'class action': 0.15, 'security breach': 0.15,
-    }
+        # ===== フレーズマッチング (バイグラム/トリグラム優先) =====
+        bullish_phrases = {
+            # strong (+0.25)
+            'all-time high': 0.25, 'all time high': 0.25, 'new ath': 0.25,
+            'etf approved': 0.25, 'etf approval': 0.25, 'mass adoption': 0.25,
+            'short squeeze': 0.25, 'whale accumulation': 0.20,
+            'institutional buying': 0.20, 'record inflow': 0.20,
+            # moderate (+0.15)
+            'golden cross': 0.15, 'breaks out': 0.15, 'breaks above': 0.15,
+            'price target': 0.15, 'buy signal': 0.15, 'strong support': 0.15,
+            'higher high': 0.15, 'bullish divergence': 0.15,
+            'network upgrade': 0.12, 'strategic reserve': 0.12,
+            # contextual bullish (bearish word in bullish context)
+            'buy the dip': 0.15, 'buying the dip': 0.15, 'bought the dip': 0.15,
+            'buys the dip': 0.15, 'accumulate on dip': 0.12,
+            'whales buy': 0.12, 'whales buying': 0.12, 'whale buying': 0.12,
+            'bottom is in': 0.15, 'found support': 0.12, 'holds support': 0.12,
+            'signs of recovery': 0.15, 'showing strength': 0.12,
+        }
+        bearish_phrases = {
+            # strong (-0.25)
+            'death cross': 0.25, 'bank run': 0.25, 'rug pull': 0.25,
+            'ponzi scheme': 0.25, 'sec lawsuit': 0.25, 'exchange hack': 0.25,
+            'mass liquidation': 0.25, 'flash crash': 0.25,
+            # moderate (-0.15)
+            'breaks below': 0.15, 'sell signal': 0.15, 'lower low': 0.15,
+            'bearish divergence': 0.15, 'key support': 0.15, 'lost support': 0.15,
+            'whale dump': 0.15, 'record outflow': 0.15, 'under investigation': 0.15,
+            'class action': 0.15, 'security breach': 0.15,
+        }
 
-    phrase_score = 0.0
-    matched_phrase = False
-    for phrase, weight in bullish_phrases.items():
-        if phrase in title_lower:
-            phrase_score += weight
-            matched_phrase = True
-    for phrase, weight in bearish_phrases.items():
-        if phrase in title_lower:
-            phrase_score -= weight
-            matched_phrase = True
+        phrase_score = 0.0
+        matched_phrase = False
+        for phrase, weight in bullish_phrases.items():
+            if phrase in title_lower:
+                phrase_score += weight
+                matched_phrase = True
+        for phrase, weight in bearish_phrases.items():
+            if phrase in title_lower:
+                phrase_score -= weight
+                matched_phrase = True
 
-    # ===== 単語レベル (強度別) =====
-    strong_bullish = [
-        'surge', 'soar', 'skyrocket', 'explode', 'moon', 'parabolic',
-    ]
-    moderate_bullish = [
-        'rally', 'breakout', 'bullish', 'pump', 'gain', 'jump', 'boost',
-        'adoption', 'partnership', 'upgrade', 'approval', 'inflow',
-        'accumulate', 'outperform', 'momentum', 'recovery', 'rebound',
-        'reclaim', 'optimistic', 'milestone', 'halving',
-    ]
-    mild_bullish = [
-        'rise', 'climb', 'advance', 'positive', 'support', 'buying',
-        'uptrend', 'upside', 'opportunity', 'growth', 'strengthen',
-    ]
+        # ===== 単語レベル (強度別) =====
+        strong_bullish = [
+            'surge', 'soar', 'skyrocket', 'explode', 'moon', 'parabolic',
+        ]
+        moderate_bullish = [
+            'rally', 'breakout', 'bullish', 'pump', 'gain', 'jump', 'boost',
+            'adoption', 'partnership', 'upgrade', 'approval', 'inflow',
+            'accumulate', 'outperform', 'momentum', 'recovery', 'rebound',
+            'reclaim', 'optimistic', 'milestone', 'halving',
+        ]
+        mild_bullish = [
+            'rise', 'climb', 'advance', 'positive', 'support', 'buying',
+            'uptrend', 'upside', 'opportunity', 'growth', 'strengthen',
+        ]
 
-    strong_bearish = [
-        'crash', 'plunge', 'collapse', 'tank', 'devastate', 'implode',
-    ]
-    moderate_bearish = [
-        'dump', 'bearish', 'selloff', 'sell-off', 'decline', 'drop',
-        'slump', 'hack', 'exploit', 'vulnerability', 'fraud', 'scam',
-        'ban', 'crackdown', 'lawsuit', 'outflow', 'liquidat',
-        'panic', 'warning', 'bubble', 'overvalued', 'correction',
-        'bankrupt', 'insolvent', 'delisted',
-    ]
-    mild_bearish = [
-        'fall', 'dip', 'slide', 'weak', 'fear', 'risk', 'concern',
-        'uncertain', 'volatile', 'downtrend', 'resistance', 'struggle',
-        'caution', 'fud', 'restriction',
-    ]
+        strong_bearish = [
+            'crash', 'plunge', 'collapse', 'tank', 'devastate', 'implode',
+        ]
+        moderate_bearish = [
+            'dump', 'bearish', 'selloff', 'sell-off', 'decline', 'drop',
+            'slump', 'hack', 'exploit', 'vulnerability', 'fraud', 'scam',
+            'ban', 'crackdown', 'lawsuit', 'outflow', 'liquidat',
+            'panic', 'warning', 'bubble', 'overvalued', 'correction',
+            'bankrupt', 'insolvent', 'delisted',
+        ]
+        mild_bearish = [
+            'fall', 'dip', 'slide', 'weak', 'fear', 'risk', 'concern',
+            'uncertain', 'volatile', 'downtrend', 'resistance', 'struggle',
+            'caution', 'fud', 'restriction',
+        ]
 
-    # 否定語リスト
-    negation_words = {'not', 'no', 'never', "n't", 'without', 'fails',
-                      'failed', 'unlikely', 'hardly', 'barely', 'neither'}
+        # 否定語リスト
+        negation_words = {'not', 'no', 'never', "n't", 'without', 'fails',
+                          'failed', 'unlikely', 'hardly', 'barely', 'neither'}
 
-    def is_negated(word_idx: int) -> bool:
-        """指定位置の単語が直前3語以内の否定語に修飾されているか"""
-        for j in range(max(0, word_idx - 3), word_idx):
-            w = words[j].rstrip('.,!?:;')
-            if w in negation_words or w.endswith("n't"):
-                return True
-        return False
+        def is_negated(word_idx: int) -> bool:
+            """指定位置の単語が直前3語以内の否定語に修飾されているか"""
+            for j in range(max(0, word_idx - 3), word_idx):
+                w = words[j].rstrip('.,!?:;')
+                if w in negation_words or w.endswith("n't"):
+                    return True
+            return False
 
-    word_score = 0.0
-    weights = {
-        'strong_bullish': 0.20, 'moderate_bullish': 0.12, 'mild_bullish': 0.06,
-        'strong_bearish': 0.20, 'moderate_bearish': 0.12, 'mild_bearish': 0.06,
-    }
+        word_score = 0.0
+        weights = {
+            'strong_bullish': 0.20, 'moderate_bullish': 0.12, 'mild_bullish': 0.06,
+            'strong_bearish': 0.20, 'moderate_bearish': 0.12, 'mild_bearish': 0.06,
+        }
 
-    for i, word in enumerate(words):
-        w = word.rstrip('.,!?:;')
-        negated = is_negated(i)
+        for i, word in enumerate(words):
+            w = word.rstrip('.,!?:;')
+            negated = is_negated(i)
 
-        if w in strong_bullish:
-            delta = weights['strong_bullish'] * (-1 if negated else 1)
-            word_score += delta
-        elif w in moderate_bullish:
-            delta = weights['moderate_bullish'] * (-1 if negated else 1)
-            word_score += delta
-        elif w in mild_bullish:
-            delta = weights['mild_bullish'] * (-1 if negated else 1)
-            word_score += delta
-        elif w in strong_bearish:
-            delta = weights['strong_bearish'] * (-1 if negated else 1)
-            word_score -= delta
-        elif w in moderate_bearish:
-            delta = weights['moderate_bearish'] * (-1 if negated else 1)
-            word_score -= delta
-        elif w in mild_bearish:
-            delta = weights['mild_bearish'] * (-1 if negated else 1)
-            word_score -= delta
+            if w in strong_bullish:
+                delta = weights['strong_bullish'] * (-1 if negated else 1)
+                word_score += delta
+            elif w in moderate_bullish:
+                delta = weights['moderate_bullish'] * (-1 if negated else 1)
+                word_score += delta
+            elif w in mild_bullish:
+                delta = weights['mild_bullish'] * (-1 if negated else 1)
+                word_score += delta
+            elif w in strong_bearish:
+                delta = weights['strong_bearish'] * (-1 if negated else 1)
+                word_score -= delta
+            elif w in moderate_bearish:
+                delta = weights['moderate_bearish'] * (-1 if negated else 1)
+                word_score -= delta
+            elif w in mild_bearish:
+                delta = weights['mild_bearish'] * (-1 if negated else 1)
+                word_score -= delta
 
-    # ===== 最終スコア: フレーズ + 単語、上限 ±0.4 =====
-    net_score = phrase_score + word_score
-    net_score = max(-0.4, min(0.4, net_score))
-    return 0.5 + net_score
+        # ===== 最終スコア: フレーズ + 単語、上限 ±0.4 =====
+        net_score = phrase_score + word_score
+        net_score = max(-0.4, min(0.4, net_score))
+        return 0.5 + net_score
+
+    except Exception as e:
+        print(f"Error estimating sentiment from title '{title}': {str(e)}")
+        return 0.5
 
 
 def save_sentiment(pair: str, timestamp: int, score: float, news_count: int, fresh_count: int):
     """センチメント保存"""
-    table = dynamodb.Table(SENTIMENT_TABLE)
-    table.put_item(Item={
-        'pair': pair,
-        'timestamp': timestamp,
-        'score': Decimal(str(round(score, 4))),
-        'news_count': news_count,
-        'fresh_news_count': fresh_count,
-        'source': 'cryptopanic',
-        'ttl': timestamp + 1209600  # 14日後に削除
-    })
+    try:
+        table = dynamodb.Table(SENTIMENT_TABLE)
+        table.put_item(Item={
+            'pair': pair,
+            'timestamp': timestamp,
+            'score': Decimal(str(round(score, 4))),
+            'news_count': news_count,
+            'fresh_news_count': fresh_count,
+            'source': 'cryptopanic',
+            'ttl': timestamp + 1209600  # 14日後に削除
+        })
+    except Exception as e:
+        print(f"Error saving sentiment for {pair}: {str(e)}")
+        raise
