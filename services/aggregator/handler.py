@@ -15,7 +15,7 @@ import json
 import os
 import time
 import boto3
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 import urllib.request
 
 dynamodb = boto3.resource('dynamodb')
@@ -125,8 +125,8 @@ def handler(event, context):
                 'chronos': CHRONOS_WEIGHT,
                 'sentiment': SENTIMENT_WEIGHT,
                 'market_context': MARKET_CONTEXT_WEIGHT
-            })
-            analysis_context['chronos_confidence'] = target_scored.get('chronos_confidence', 0.5)
+            }) if target_scored else {}
+            analysis_context['chronos_confidence'] = target_scored.get('chronos_confidence', 0.5) if target_scored else 0.5
             send_order_message(target_pair, signal, target_score,
                              int(time.time()), analysis_context)
 
@@ -155,7 +155,7 @@ def handler(event, context):
         return result
 
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Error in handler: {str(e)}")
         import traceback
         traceback.print_exc()
         return {
@@ -307,7 +307,8 @@ def extract_indicator(technical_result: dict, key: str, default: float = 0.0) ->
             else:
                 indicators = technical_result.get('indicators', {})
         return float(indicators.get(key, default))
-    except Exception:
+    except Exception as e:
+        print(f"Indicator extraction error for {key}: {e}")
         return default
 
 
@@ -344,6 +345,8 @@ def fetch_market_context() -> dict:
             return {}
     except Exception as e:
         print(f"Error fetching market context: {e}")
+        import traceback
+        traceback.print_exc()
         return {}
 
 
@@ -549,59 +552,79 @@ def get_current_price(pair: str) -> float:
 
 def extract_score(result: dict, key: str, default: float) -> float:
     """結果からスコアを抽出"""
-    if isinstance(result, dict):
-        if 'body' in result:
-            try:
-                body = json.loads(result['body']) if isinstance(result['body'], str) else result['body']
-                return float(body.get(key, default))
-            except:
-                pass
-        return float(result.get(key, default))
-    return default
+    try:
+        if isinstance(result, dict):
+            if 'body' in result:
+                try:
+                    body = json.loads(result['body']) if isinstance(result['body'], str) else result['body']
+                    return float(body.get(key, default))
+                except:
+                    pass
+            return float(result.get(key, default))
+        return default
+    except Exception as e:
+        print(f"Error extracting score for {key}: {e}")
+        return default
+
+
+def safe_decimal(value: float, precision: int = 4) -> Decimal:
+    """安全なDecimal変換（精度誤差対策）"""
+    try:
+        return Decimal(str(round(value, precision)))
+    except Exception as e:
+        print(f"Decimal conversion error for {value}: {e}")
+        return Decimal('0')
 
 
 def save_signal(scored: dict, buy_threshold: float, sell_threshold: float):
     """全通貨のシグナルを保存（分析履歴・動的閾値対応）"""
-    table = dynamodb.Table(SIGNALS_TABLE)
-    timestamp = int(time.time())
+    try:
+        table = dynamodb.Table(SIGNALS_TABLE)
+        timestamp = int(time.time())
 
-    signal = 'HOLD'
-    if scored['total_score'] >= buy_threshold:
-        signal = 'BUY'
-    elif scored['total_score'] <= sell_threshold:
-        signal = 'SELL'
+        signal = 'HOLD'
+        if scored['total_score'] >= buy_threshold:
+            signal = 'BUY'
+        elif scored['total_score'] <= sell_threshold:
+            signal = 'SELL'
 
-    table.put_item(Item={
-        'pair': scored['pair'],
-        'timestamp': timestamp,
-        'score': Decimal(str(round(scored['total_score'], 4))),
-        'signal': signal,
-        'technical_score': Decimal(str(round(scored['components']['technical'], 4))),
-        'chronos_score': Decimal(str(round(scored['components']['chronos'], 4))),
-        'sentiment_score': Decimal(str(round(scored['components']['sentiment'], 4))),
-        'market_context_score': Decimal(str(round(scored['components'].get('market_context', 0), 4))),
-        'buy_threshold': Decimal(str(round(buy_threshold, 4))),
-        'sell_threshold': Decimal(str(round(sell_threshold, 4))),
-        'bb_width': Decimal(str(round(scored.get('bb_width', BASELINE_BB_WIDTH), 6))),
-        'ttl': timestamp + 7776000  # 90日後に削除
-    })
+        table.put_item(Item={
+            'pair': scored['pair'],
+            'timestamp': timestamp,
+            'score': safe_decimal(scored['total_score']),
+            'signal': signal,
+            'technical_score': safe_decimal(scored['components']['technical']),
+            'chronos_score': safe_decimal(scored['components']['chronos']),
+            'sentiment_score': safe_decimal(scored['components']['sentiment']),
+            'market_context_score': safe_decimal(scored['components'].get('market_context', 0)),
+            'buy_threshold': safe_decimal(buy_threshold),
+            'sell_threshold': safe_decimal(sell_threshold),
+            'bb_width': safe_decimal(scored.get('bb_width', BASELINE_BB_WIDTH), 6),
+            'ttl': timestamp + 7776000  # 90日後に削除
+        })
+    except Exception as e:
+        print(f"Error saving signal for {scored.get('pair', 'unknown')}: {e}")
 
 
 def send_order_message(pair: str, signal: str, score: float, timestamp: int,
                        analysis_context: dict = None):
     """​SQSに注文メッセージ送信（分析コンテキスト付き）"""
-    message = {
-        'pair': pair,
-        'signal': signal,
-        'score': score,
-        'timestamp': timestamp
-    }
-    if analysis_context:
-        message['analysis_context'] = analysis_context
-    sqs.send_message(
-        QueueUrl=ORDER_QUEUE_URL,
-        MessageBody=json.dumps(message)
-    )
+    try:
+        message = {
+            'pair': pair,
+            'signal': signal,
+            'score': score,
+            'timestamp': timestamp
+        }
+        if analysis_context:
+            message['analysis_context'] = analysis_context
+        sqs.send_message(
+            QueueUrl=ORDER_QUEUE_URL,
+            MessageBody=json.dumps(message)
+        )
+        print(f"Order message sent to SQS: {signal} {pair}")
+    except Exception as e:
+        print(f"Error sending order message: {e}")
 
 
 def notify_slack(result: dict, scored_pairs: list, active_positions: list,
@@ -777,7 +800,7 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
             data=json.dumps(message).encode('utf-8'),
             headers={'Content-Type': 'application/json'}
         )
-        response = urllib.request.urlopen(req, timeout=5)
+        response = urllib.request.urlopen(req, timeout=10)
         print(f"Slack notification sent (status: {response.status})")
 
     except Exception as e:
