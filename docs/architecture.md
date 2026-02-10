@@ -307,19 +307,22 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
 
 ```
 EventBridge (23:00 JST) → daily-reporter Lambda
+                              ├→ データ品質ゲート (Wilson CI + min trades + cooldown)
                               ├→ S3にJSON日次レポート保存 (90日保持)
                               ├→ Slackに日次サマリー通知
-                              └→ GitHub Actions (repository_dispatch)
+                              └→ GitHub Actions (repository_dispatch) ※品質ゲート通過時のみ
                                     └→ auto-improve.yml
+                                          └→ Pre-Check ゲート (trades≥3, confidence要件)
                                           └→ Claude AI がデータ分析
                                                 ├→ NO_ACTION: 変更不要
-                                                ├→ PARAM_TUNE: パラメータ微調整
-                                                └→ CODE_CHANGE: ロジック変更
+                                                ├→ PARAM_TUNE: パラメータ微調整 (conf≥0.5)
+                                                └→ CODE_CHANGE: ロジック変更 (conf≥0.6)
                                                       → 自動デプロイ → docs更新 → git push
                                                       → DynamoDB improvements テーブルに記録
 ```
 
 - **安全制約**: ウェイト±0.05/回、閾値±0.03/回、2週間以内の再変更抑止
+- **データ品質ゲート**: Wilson信頼区間95%、最低3トレード、クールダウン2週間
 - **コスト**: ~$0.01/日 (Claude API + Lambda)
 
 ### DynamoDB
@@ -345,9 +348,10 @@ EventBridge (23:00 JST) → daily-reporter Lambda
 | sentiment | pair (S) | timestamp (N) | 14日 | 通貨別センチメントスコア |
 | signals | pair (S) | timestamp (N) | 90日 | 分析シグナル履歴 |
 | positions | pair (S) | position_id (S) | - | ポジション管理 |
-| trades | pair (S) | timestamp (N) | - | 取引履歴（永続・税務対応） |
+| trades | pair (S) | timestamp (N) | 90日 | 取引履歴 |
 | analysis_state | pair (S) | - | - | 通貨別の最終分析時刻 |
 | market-context | context_type (S) | timestamp (N) | 14日 | マクロ市場環境指標 |
+| improvements | improvement_id (S) | - | 180日 | 自動改善履歴 (Phase 4) |
 
 ### TTL 設計の根拠
 
@@ -357,8 +361,9 @@ EventBridge (23:00 JST) → daily-reporter Lambda
 | sentiment | 14日 | ニュース相関分析に2週間分必要 |
 | signals | 90日 | パフォーマンス分析用に長めに保持 |
 | positions | なし | 取引履歴は永続保存（税務対応） |
-| trades | なし | 取引履歴は永続保存（税務対応） |
+| trades | 90日 | 自動クリーンアップ (Phase 4で追加) |
 | market-context | 14日 | マクロ指標は短期分のみ必要 |
+| improvements | 180日 | 自動改善の効果追跡用 |
 
 ---
 

@@ -12,6 +12,8 @@
 3. [SQS バッチ処理と raise 禁止ルール](#3-sqs-バッチ処理と-raise-禁止ルール)
 4. [BUY→即SELL 問題](#4-buy即sell-問題)
 5. [インシデント全体タイムライン](#5-インシデント全体タイムライン)
+6. [02/09 ゴミデータ事件（order_id未指定フォールバック）](#6-0209-ゴミデータ事件order_id未指定フォールバック)
+7. [02/10 Extreme Fear損失とF&G BUY抑制](#7-0210-extreme-fear損失とfg-buy抑制)
 
 ---
 
@@ -294,3 +296,101 @@ def process_order(order):
 | **handler()でraiseしない** | エラーはログ+Slack通知。SQSバッチ再配信=二重注文のリスク |
 | **同一バッチBUY→SELL防止** | `_just_bought_pairs` で同一Lambda実行内の即売りをブロック |
 | **Decimalに渡す前にNoneチェック** | `float(x) if x else 0` + try/except で防御 |
+
+---
+
+## 6. 02/09 ゴミデータ事件（order_id未指定フォールバック）
+
+### 概要
+
+2026-02-09、`get_market_buy_fill()` が `order_id` なしで Coincheck `/api/exchange/orders/transactions` を呼び出すフォールバックパスが存在した。このパスでは直近の全トランザクション（他通貨含む）が混入し、約定レートが異常に膨張した。
+
+### 影響
+
+| テーブル | ゴミレコード数 | 特徴 |
+|----------|----------------|------|
+| eth-trading-trades | 101件 | score=0, threshold=0, rate=BTC 520M JPY (実勢14M) |
+| eth-trading-positions | 39件 | 全closed, entry_price=BTC 520M / ETH 6.8M |
+
+### 根本原因
+
+```python
+# ❌ BAD: order_idなしのフォールバック — 全通貨の直近トランザクションが返る
+if not order_id:
+    result = call_coincheck_api('/api/exchange/orders/transactions?limit=100', ...)
+
+# ✅ GOOD: 修正済 — 必ずorder_idを指定
+result = call_coincheck_api(f'/api/exchange/orders/transactions?order_id={order_id}&limit=100', ...)
+```
+
+加えて、50%乖離チェックが追加済み:
+```python
+# fill取得後のサニティチェック
+if abs(avg_rate - ticker_rate) / ticker_rate > 0.50:
+    raise ValueError(f"Fill rate {avg_rate} deviates >50% from ticker {ticker_rate}")
+```
+
+### クリーンアップ
+
+手動スクリプトで異常レコードを削除:
+- trades: 101件削除 → 12件の正常レコードが残存
+- positions: 39件削除 → 19件残存 (1 open: sol_jpy)
+- 判定基準: `MAX_SANE_PRICE` (btc=25M, eth=600K, xrp=500, sol=50K, doge=100, avax=10K) を超える `entry_price` / `rate`
+
+### 再発防止
+
+- `order_id` フィルタ必須 (修正済)
+- 50%乖離チェック (修正済)
+- `score=0 && threshold=0` のレコードは本来生成されないため、今後は不要
+
+---
+
+## 7. 02/10 Extreme Fear損失とF&G BUY抑制
+
+### 概要
+
+2026-02-10、Fear & Greed Index = 14 (Extreme Fear) の市場環境で、Chronos AIが異常に高いスコア (AI=+1.000) を出し、2件のトレードで合計 ¥3,162 の損失が発生。
+
+### 損失詳細
+
+| 通貨 | BUY Rate | SELL Rate | 損益 | 損失率 | AI Score |
+|------|----------|-----------|------|--------|----------|
+| ETH | ¥327,793 | ¥321,612 | ¥-1,661 | -1.89% | +1.000 |
+| XRP | ¥225.4 | ¥220.2 | ¥-1,501 | -2.32% | 高スコア |
+
+### 根本原因
+
+- Chronos AI は過去の価格パターンのみで予測するため、市場全体のセンチメントを考慮しない
+- Extreme Fear 市場では「反発」を予測するが、実際にはさらに下落するケースが多い
+- 既存のBUY閾値はマクロ環境を考慮していなかった
+
+### 修正: F&G連動BUY閾値抑制 (`bb5cfa2`)
+
+`calculate_dynamic_thresholds()` に Market Context パラメータを追加:
+
+```python
+# F&G連動BUY閾値補正
+FNG_FEAR_THRESHOLD = 20
+FNG_GREED_THRESHOLD = 80
+FNG_BUY_MULTIPLIER_FEAR = 1.35   # Extreme Fear: BUY閾値を35%引き上げ
+FNG_BUY_MULTIPLIER_GREED = 1.20  # Extreme Greed: BUY閾値を20%引き上げ
+
+fng_value = market_context.get('fear_greed', {}).get('value')
+if fng_value is not None:
+    if fng_value <= FNG_FEAR_THRESHOLD:
+        buy_threshold *= FNG_BUY_MULTIPLIER_FEAR
+    elif fng_value >= FNG_GREED_THRESHOLD:
+        buy_threshold *= FNG_BUY_MULTIPLIER_GREED
+```
+
+- SELL閾値は変更なし (ストップロスは常に実行すべき)
+- F&G=14の場合: `BUY_TH = 0.28 × vol_ratio × 1.35` → ¥-3,162の損失トレードをブロック
+- Slack通知に `⚠️ F&G=14: BUY_TH ×1.35` 等の警告を追加
+
+### 設計原則
+
+| 原則 | 詳細 |
+|------|------|
+| **Extreme Fearは買い控え** | 市場恐怖時はAIスコアの信頼性が低下する。閾値引き上げで高確信度のみ通過 |
+| **Extreme Greedは過熱警戒** | バブル時の天井掴みを防止。ただしFearほど厳しくない (×1.20 vs ×1.35) |
+| **SELL閾値は不変** | 損切り・利確は市場環境に関係なく常に実行すべき |

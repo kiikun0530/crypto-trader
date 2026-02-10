@@ -308,6 +308,7 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
 2. BB幅（ボリンジャーバンド幅）からボラティリティ適応型閾値を計算
    - `vol_ratio = avg_bb_width / baseline(0.03)` → クランプ 0.67〜2.0
    - `buy_threshold = 0.28 × vol_ratio`, `sell_threshold = -0.15 × vol_ratio`
+   - F&G連動補正: F&G≤20 → `buy_threshold × 1.35`, F&G≥80 → `buy_threshold × 1.20` (SELL不変)
 3. 全通貨のシグナルを DynamoDB に保存（動的閾値・BB幅・market_context_scoreも記録）
 4. 全通貨をスコア降順でランキング
 5. 全通貨のアクティブポジションを取得（複数保有対応）

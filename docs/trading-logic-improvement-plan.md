@@ -251,6 +251,44 @@
 - **修正**: trades テーブルに TTL (90日) を追加。order-executor の save_trade に `ttl` フィールド追加
 - **影響範囲**: `services/order-executor/handler.py`, `terraform/dynamodb.tf`
 
+### 【Phase 4.5: Data Quality & Noise Protection】
+
+#### 24. データ品質ゲート (Daily Reporter) ✅ 実装済
+- **目的**: 自動改善パイプラインが低品質データで誤った判断をするのを防止
+- **実装**: `build_data_quality()` 関数を追加
+  - Wilson信頼区間 (95%) で勝率の下限/上限を算出
+  - 最低取引数チェック (3件未満は改善トリガー無効)
+  - クールダウンチェック (直近2週間の改善履歴)
+  - `data_quality.allow_improvement` が `false` の場合、`trigger_auto_improve()` をスキップ
+- **影響範囲**: `services/daily-reporter/handler.py`
+
+#### 25. Auto-Improve Pre-Check ゲート ✅ 実装済
+- **目的**: GitHub Actions側でもハードコードされたゲートで不適切な改善を防止
+- **実装**: `auto-improve.yml` に pre-check ステップ追加
+  - `total_trades < 3` → 即座にNO_ACTION
+  - `confidence_score` 要件: PARAM_TUNE ≥ 0.5, CODE_CHANGE ≥ 0.6
+- **影響範囲**: `.github/workflows/auto-improve.yml`
+
+#### 26. Fear & Greed連動 BUY閾値抑制 ✅ 実装済
+- **問題**: Extreme Fear (F&G≤20) 時にChronos AIが異常に高いスコア (AI=+1.000) を出し、損失発生
+  - 実例: 02/10 ETH (-¥1,661, -1.89%), XRP (-¥1,501, -2.32%) — F&G=14の市場で
+- **修正**: `calculate_dynamic_thresholds()` にF&G補正ロジック追加
+  - F&G ≤ 20 (Extreme Fear): BUY閾値 ×1.35 (より慎重に)
+  - F&G ≥ 80 (Extreme Greed): BUY閾値 ×1.20 (バブル警戒)
+  - SELL閾値は変更なし (ストップロスは常に実行)
+- **新定数**: `FNG_FEAR_THRESHOLD=20`, `FNG_GREED_THRESHOLD=80`, `FNG_BUY_MULTIPLIER_FEAR=1.35`, `FNG_BUY_MULTIPLIER_GREED=1.20`
+- **Slack通知**: F&G補正適用時は `⚠️ F&G=14: BUY_TH ×1.35` 等の警告を表示
+- **影響範囲**: `services/aggregator/handler.py`
+
+#### 27. ゴミデータクリーンアップ ✅ 完了
+- **問題**: 02/09のCoincheck API fillバグ (order_idフィルタ未使用) により、異常なentry_priceのレコードが発生
+  - trades テーブル: 101件のゴミレコード (score=0, threshold=0, BTC rate=520M JPY vs 実勢14M)
+  - positions テーブル: 39件のゴミポジション (全closed, 異常なentry_price)
+- **対応**: 手動スクリプトで全ゴミレコードを削除
+  - trades: 101件削除、12件の正常レコードが残存
+  - positions: 39件削除、19件の正常レコードが残存 (1 open: sol_jpy)
+- **再発防止**: fillバグは既に修正済 (`order_id` フィルタ + 50%乖離チェック)
+
 ### Phase 2 実装ログ
 
 | 日付 | 項目 | コミット | 備考 |
@@ -270,3 +308,6 @@
 | 2026-02-10 | #20a 閾値調整 | `8b5f2a4` | BUY 0.30→0.28, SELL -0.20→-0.15, 4成分圧縮補正 |
 | 2026-02-10 | docs Phase 3 | `1647fe9` | ドキュメント更新 |
 | 2026-02-10 | #21-23 Phase 4 | `5f0ba34` | daily-reporter + auto-improve + trades TTL |
+| 2026-02-10 | #24-25 データ品質ゲート | `2b7022d` | daily-reporter品質チェック + auto-improve pre-check |
+| 2026-02-10 | #26 F&G BUY抑制 | `bb5cfa2` | Extreme Fear時BUY閾値×1.35 |
+| 2026-02-10 | #27 ゴミデータ削除 | - | trades 101件 + positions 39件を手動削除 |
