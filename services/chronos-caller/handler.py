@@ -159,6 +159,24 @@ def get_price_history(pair: str, limit: int = 200) -> list:
 # SageMaker Inference (リトライ機能強化)
 # ==============================================================
 
+def check_endpoint_exists(endpoint_name: str) -> bool:
+    """SageMaker Endpointの存在確認"""
+    try:
+        sagemaker_client = boto3.client('sagemaker')
+        response = sagemaker_client.describe_endpoint(EndpointName=endpoint_name)
+        status = response.get('EndpointStatus', '')
+        return status == 'InService'
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', '')
+        if error_code in ['ValidationException', 'ResourceNotFound']:
+            return False
+        # その他のエラーは一時的なものかもしれないのでTrueを返す
+        return True
+    except Exception:
+        # その他の例外も一時的なものと仮定
+        return True
+
+
 def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_samples: int = 50) -> dict:
     """
     SageMaker Serverless Endpoint を呼び出し（ThrottlingException対応リトライ付き）
@@ -166,6 +184,11 @@ def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_s
     ThrottlingExceptionに対して指数バックオフでリトライを実行
     SageMaker Serverlessは同時実行制限があるため、Throttlingは想定内の動作
     """
+    # 事前にエンドポイントの存在確認
+    if not check_endpoint_exists(SAGEMAKER_ENDPOINT):
+        print(f"[ERROR] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not found or not InService")
+        raise Exception(f"Endpoint {SAGEMAKER_ENDPOINT} not found")
+    
     for attempt in range(MAX_RETRIES):
         try:
             return invoke_sagemaker(prices, prediction_length, num_samples)
@@ -188,15 +211,26 @@ def invoke_sagemaker_with_retry(prices: list, prediction_length: int = 12, num_s
                 else:
                     print(f"[WARN] SageMaker throttling persisted after {MAX_RETRIES} retries, using fallback")
                     raise
+            elif error_code in ['ValidationException', 'ValidationError']:
+                # エンドポイントが存在しない場合は即座に諦める
+                print(f"[ERROR] SageMaker endpoint validation failed: {error_code} - {str(e)}")
+                print(f"[ERROR] Endpoint '{SAGEMAKER_ENDPOINT}' may have been deleted or is not accessible")
+                raise
             else:
-                # ThrottlingException以外のエラーは即座に再発生
-                print(f"[ERROR] SageMaker error (non-throttling): {error_code} - {str(e)}")
+                # その他のエラーは即座に再発生
+                print(f"[ERROR] SageMaker error (non-retriable): {error_code} - {str(e)}")
                 raise
                 
         except Exception as e:
-            # その他の例外（ネットワークエラー等）も再発生
-            print(f"[ERROR] SageMaker unexpected error: {str(e)}")
-            raise
+            # その他の例外（ネットワークエラー等）
+            if "not found" in str(e).lower() or "validation" in str(e).lower():
+                # エンドポイント関連のエラーは即座に諦める
+                print(f"[ERROR] SageMaker endpoint error: {str(e)}")
+                raise
+            else:
+                # その他のエラーは再発生
+                print(f"[ERROR] SageMaker unexpected error: {str(e)}")
+                raise
     
     # ここには到達しないはずだが、安全のため
     raise Exception("Unexpected error in retry loop")
