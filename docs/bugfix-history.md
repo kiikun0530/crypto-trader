@@ -17,6 +17,7 @@
 8. [02/11 SageMaker Serverless ThrottlingException 頻発](#8-0211-sagemaker-serverless-throttlingexception-頻発)
 9. [02/12 TP/トレーリングストップ矛盾（デッドコード）](#9-0212-tpトレーリングストップ矛盾デッドコード)
 10. [02/12 DynamoDB Limit+FilterExpression アンチパターン](#10-0212-dynamodb-limitfilterexpression-アンチパターン)
+11. [02/12 Bedrock nova-micro オンデマンド呼び出し廃止](#11-0212-bedrock-nova-micro-オンデマンド呼び出し廃止)
 
 ---
 
@@ -595,3 +596,43 @@ DynamoDB は **Limit を FilterExpression の前に適用する**ため、最新
 
 - **DynamoDB の Limit は SQL の LIMIT と異なる**: FilterExpression の前に pageSize として働く
 - FilterExpression でフィルタしたい場合は十分大きな Limit を指定し、クライアント側でフィルタリング
+
+---
+
+## 11. 02/12 Bedrock nova-micro オンデマンド呼び出し廃止
+
+### 発生日時
+
+2026-02-12 00:18〜00:48（news-collector 30分サイクルで連続エラー）
+
+### エラー
+
+```
+botocore.errorfactory.ValidationException: An error occurred (ValidationException)
+when calling the Converse operation: Invocation of model ID amazon.nova-micro-v1:0
+with on-demand throughput isn't supported. Retry your request with the ID or ARN
+of an inference profile that contains this model.
+```
+
+### 原因
+
+AWSがBedrock基盤モデルの直接モデルID（`amazon.nova-micro-v1:0`）でのオンデマンド呼び出しを廃止。
+**推論プロファイルID**（`us.amazon.nova-micro-v1:0`）経由のみサポートする仕様に変更された。
+
+### 影響
+
+- `news-collector` のLLMセンチメント分析が全て失敗
+- フォールバック（ルールベースNLP）で動作は継続していたが、センチメント精度が低下
+
+### 修正箇所
+
+| ファイル | 修正 |
+|----------|------|
+| `terraform/lambda.tf` | `BEDROCK_MODEL_ID` を `amazon.nova-micro-v1:0` → `us.amazon.nova-micro-v1:0` に変更 |
+| `services/news-collector/handler.py` | デフォルト値を同様に変更 |
+| `terraform/iam.tf` | IAMポリシーに推論プロファイル用ARN (`arn:aws:bedrock:...:inference-profile/us.amazon.nova-*`) を追加 |
+
+### 教訓
+
+- AWS Bedrockの基盤モデル呼び出しは推論プロファイルID経由が必須になった
+- IAMポリシーも `foundation-model/*` だけでなく `inference-profile/*` のリソースARNが必要
