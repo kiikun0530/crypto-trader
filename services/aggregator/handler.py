@@ -34,19 +34,20 @@ DEFAULT_PAIRS = {
 TRADING_PAIRS = json.loads(os.environ.get('TRADING_PAIRS_CONFIG', json.dumps(DEFAULT_PAIRS)))
 
 # 重み設定 (4コンポーネント: Tech + Chronos + Sentiment + MarketContext)
-# Phase 2: Tech dominant (0.55) → Phase 3: 4成分分散
+# Phase 2: Tech dominant (0.55) → Phase 3: 4成分分散 → Phase 4: AI重視均等化
+# Phase 4: AI(Chronos)の予測精度向上に伴い、TechとAIを同等の基準重みに変更
 # MarketContext = Fear&Greed + FundingRate + BTC Dominance (市場マクロ環境)
-TECHNICAL_WEIGHT = float(os.environ.get('TECHNICAL_WEIGHT', '0.45'))
-CHRONOS_WEIGHT = float(os.environ.get('AI_PREDICTION_WEIGHT', '0.25'))
+TECHNICAL_WEIGHT = float(os.environ.get('TECHNICAL_WEIGHT', '0.35'))
+CHRONOS_WEIGHT = float(os.environ.get('AI_PREDICTION_WEIGHT', '0.35'))
 SENTIMENT_WEIGHT = float(os.environ.get('SENTIMENT_WEIGHT', '0.15'))
 MARKET_CONTEXT_WEIGHT = float(os.environ.get('MARKET_CONTEXT_WEIGHT', '0.15'))
 
 # ボラティリティ適応型閾値
 # 基準閾値（平均的なボラティリティ時に使用）
-# Phase 3: 4成分化でスコア圧縮 (-15%) + MarketContext上方バイアス (+0.02)
-# 旧 BUY=0.30 / SELL=-0.20 → 新 BUY=0.28 / SELL=-0.15
-BASE_BUY_THRESHOLD = float(os.environ.get('BASE_BUY_THRESHOLD', '0.28'))
-BASE_SELL_THRESHOLD = float(os.environ.get('BASE_SELL_THRESHOLD', '-0.15'))
+# Phase 4: Tech重み削減(0.45→0.35)でスコア圧縮 + AI均等化
+# 旧 BUY=0.28 / SELL=-0.15 → 新 BUY=0.25 / SELL=-0.13
+BASE_BUY_THRESHOLD = float(os.environ.get('BASE_BUY_THRESHOLD', '0.25'))
+BASE_SELL_THRESHOLD = float(os.environ.get('BASE_SELL_THRESHOLD', '-0.13'))
 # BB幅の基準値（暗号通貨の典型的なBB幅 ≈ 3%）
 BASELINE_BB_WIDTH = float(os.environ.get('BASELINE_BB_WIDTH', '0.03'))
 # ボラティリティ補正のクランプ範囲
@@ -216,16 +217,18 @@ def score_pair(pair: str, result: dict, market_context: dict = None) -> dict:
             alt_dominance_adjustment = 0.05
 
     # === 確信度ベース動的重み ===
-    # 高確信度 → Chronos重み増加 (最大0.35), Tech重み減少
-    # 低確信度 → Chronos重み減少 (最小0.10), Tech重み増加
-    # 中間 (0.5) → ベース値通り (0.25)
-    base_chronos_w = CHRONOS_WEIGHT  # 0.25
-    base_tech_w = TECHNICAL_WEIGHT   # 0.45
+    # Phase 4: TechとAIが同等基準重み(0.35)のため、シフト幅を±0.08に縮小
+    # 高確信度 → Chronos重み増加 (最大0.43), Tech重み減少 (最小0.27)
+    # 低確信度 → Chronos重み減少 (最小0.27), Tech重み増加 (最大0.43)
+    # 中間 (0.5) → ベース値通り (0.35/0.35)
+    base_chronos_w = CHRONOS_WEIGHT  # 0.35
+    base_tech_w = TECHNICAL_WEIGHT   # 0.35
 
-    # confidence: 0.0~1.0 → weight_shift: -0.15 ~ +0.10
-    # confidence=0.0 → shift=-0.15 (Chronos: 0.10), confidence=1.0 → shift=+0.10 (Chronos: 0.35)
-    weight_shift = (chronos_confidence - 0.5) * 0.30  # ±0.15 range, centered at 0.5
-    weight_shift = max(-0.15, min(0.10, weight_shift))
+    # confidence: 0.0~1.0 → weight_shift: -0.08 ~ +0.08
+    # confidence=0.0 → shift=-0.08 (Chronos: 0.27, Tech: 0.43)
+    # confidence=1.0 → shift=+0.08 (Chronos: 0.43, Tech: 0.27)
+    weight_shift = (chronos_confidence - 0.5) * 0.16  # ±0.08 range, centered at 0.5
+    weight_shift = max(-0.08, min(0.08, weight_shift))
 
     effective_chronos_w = base_chronos_w + weight_shift
     effective_tech_w = base_tech_w - weight_shift  # Techで相殺
@@ -778,7 +781,7 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
                 "type": "context",
                 "elements": [
                     {"type": "mrkdwn", "text": f"BUY閾値: `{buy_threshold:+.3f}` / SELL閾値: `{sell_threshold:+.3f}` | "
-                                                f"基準重み: Tech={TECHNICAL_WEIGHT} AI={CHRONOS_WEIGHT}(確信度で±0.15変動) Sent={SENTIMENT_WEIGHT} Mkt={MARKET_CONTEXT_WEIGHT}"
+                                                f"基準重み: Tech={TECHNICAL_WEIGHT} AI={CHRONOS_WEIGHT}(確信度で±0.08変動) Sent={SENTIMENT_WEIGHT} Mkt={MARKET_CONTEXT_WEIGHT}"
                                                 + (f" | ⚠️ F&G補正あり" if buy_threshold > BASE_BUY_THRESHOLD * 1.3 else "")}
                 ]
             }

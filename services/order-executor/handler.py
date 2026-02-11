@@ -78,15 +78,23 @@ CB_DAILY_LOSS_LIMIT_JPY = float(os.environ.get('CB_DAILY_LOSS_LIMIT_JPY', '15000
 CB_MAX_CONSECUTIVE_LOSSES = int(os.environ.get('CB_MAX_CONSECUTIVE_LOSSES', '5'))      # 連敗上限
 CB_COOLDOWN_HOURS = float(os.environ.get('CB_COOLDOWN_HOURS', '6'))                    # トリップ後の冷却時間
 
-# スコア閾値と投資比率（期待値連動）
-# 現実的なスコア分布: 典型 ±0.25、最大 ±0.55
-# アグリゲーターのBUY閾値(基準0.20)を超えたスコアのみ到達する
-SCORE_THRESHOLDS = [
-    (0.45, 1.00),   # スコア0.45以上 → 利用可能残高の100%（非常に強いシグナル）
-    (0.35, 0.75),   # スコア0.35-0.45 → 75%（強いシグナル）
-    (0.25, 0.50),   # スコア0.25-0.35 → 50%（中程度のシグナル）
-    (0.15, 0.30),   # スコア0.15-0.25 → 30%（弱いシグナル）
+# Kelly Criterion ベースの投資比率（期待値連動）
+# 過去のトレード統計から勝率・損益比を計算し、最適な投資比率を算出
+# データ不足時（5件未満）はフォールバック固定比率を使用
+# フォールバック比率は Half-Kelly 相当の保守的設定
+FALLBACK_SCORE_THRESHOLDS = [
+    (0.45, 0.60),   # スコア0.45以上 → 利用可能残高の60%（非常に強いシグナル）
+    (0.35, 0.45),   # スコア0.35-0.45 → 45%（強いシグナル）
+    (0.25, 0.30),   # スコア0.25-0.35 → 30%（中程度のシグナル）
+    (0.15, 0.20),   # スコア0.15-0.25 → 20%（弱いシグナル）
 ]
+# Kelly計算に必要な最少トレード件数
+MIN_TRADES_FOR_KELLY = int(os.environ.get('MIN_TRADES_FOR_KELLY', '5'))
+# Kelly fraction の安全マージン（0.5 = Half-Kelly）
+KELLY_SAFETY_FACTOR = float(os.environ.get('KELLY_SAFETY_FACTOR', '0.5'))
+# Kelly fraction のクランプ範囲
+KELLY_MIN_FRACTION = 0.10  # 最低10%
+KELLY_MAX_FRACTION = 0.80  # 最大80%
 
 
 def get_currency_from_pair(pair: str) -> str:
@@ -261,12 +269,155 @@ def get_balance() -> dict:
         return {'jpy': 0}
 
 
+def get_trade_statistics() -> dict:
+    """
+    過去90日間のクローズ済みポジションから勝率・平均損益率を計算
+    Kelly Criterion の入力パラメータを生成
+
+    Returns:
+        {
+            'total_trades': int,
+            'win_rate': float (0-1),
+            'avg_win_pct': float (例: 3.5 = +3.5%),
+            'avg_loss_pct': float (例: 2.0 = -2.0%, 絶対値),
+            'n_wins': int,
+            'n_losses': int,
+        }
+    """
+    try:
+        table = dynamodb.Table(POSITIONS_TABLE)
+        now = int(time.time())
+        cutoff = now - (90 * 86400)  # 過去90日
+
+        closed_positions = []
+        for config in TRADING_PAIRS.values():
+            coincheck_pair = config['coincheck']
+            try:
+                response = table.query(
+                    KeyConditionExpression='pair = :pair',
+                    ExpressionAttributeValues={':pair': coincheck_pair}
+                )
+                items = response.get('Items', [])
+                for item in items:
+                    if item.get('closed') and item.get('exit_time') and item.get('exit_price'):
+                        exit_time = int(item.get('exit_time', 0))
+                        if exit_time > cutoff:
+                            entry_price = float(item.get('entry_price', 0))
+                            exit_price = float(item.get('exit_price', 0))
+                            if entry_price > 0:
+                                pnl_pct = (exit_price - entry_price) / entry_price * 100
+                                closed_positions.append(pnl_pct)
+            except Exception as e:
+                print(f"Trade stats: error querying {coincheck_pair}: {e}")
+
+        if not closed_positions:
+            return {'total_trades': 0}
+
+        wins = [p for p in closed_positions if p > 0]
+        losses = [abs(p) for p in closed_positions if p <= 0]
+
+        return {
+            'total_trades': len(closed_positions),
+            'win_rate': len(wins) / len(closed_positions),
+            'avg_win_pct': sum(wins) / len(wins) if wins else 0,
+            'avg_loss_pct': sum(losses) / len(losses) if losses else 0,
+            'n_wins': len(wins),
+            'n_losses': len(losses),
+        }
+    except Exception as e:
+        print(f"Error getting trade statistics: {e}")
+        return {'total_trades': 0}
+
+
 def calculate_order_amount(score: float, available_jpy: float) -> float:
     """
-    スコアに応じた投資金額を計算（期待値連動）
+    Kelly Criterion ベースの投資金額計算（期待値最大化）
+
+    ロジック:
+    1. 過去90日のクローズ済みポジションから勝率・損益比を算出
+    2. Kelly fraction = (p × b - q) / b
+       p=勝率, q=1-p, b=平均勝ち/平均負け
+    3. Half-Kelly（安全マージン50%）を適用
+    4. スコアで変調（高スコア → Kelly寄り、低スコア → 保守的）
+    5. データ不足時はフォールバック（スコアベース固定比率）
+
+    利点:
+    - 勝率が高い時は自動的に投資比率が増加
+    - 負けが続くと自動的に投資比率が低下（破産確率を最小化）
+    - 期待値がプラスの時のみ有意な投資を行う
+    """
+    # 1. 過去のトレード統計を取得
+    stats = get_trade_statistics()
+
+    if stats['total_trades'] < MIN_TRADES_FOR_KELLY:
+        print(f"Insufficient trade history ({stats['total_trades']} trades < {MIN_TRADES_FOR_KELLY}), "
+              f"using fallback sizing")
+        return _calculate_order_amount_fallback(score, available_jpy)
+
+    win_rate = stats['win_rate']
+    avg_win_pct = stats['avg_win_pct']
+    avg_loss_pct = stats['avg_loss_pct']
+
+    print(f"Trade stats: {stats['total_trades']} trades "
+          f"(W:{stats['n_wins']}/L:{stats['n_losses']}), "
+          f"win_rate={win_rate:.2f}, avg_win={avg_win_pct:+.2f}%, avg_loss=-{avg_loss_pct:.2f}%")
+
+    if avg_loss_pct == 0:
+        print("No losing trades (avg_loss=0), using fallback")
+        return _calculate_order_amount_fallback(score, available_jpy)
+
+    # 2. Kelly fraction 計算
+    # f* = (p × b - q) / b
+    b = avg_win_pct / avg_loss_pct  # win/loss ratio
+    q = 1 - win_rate
+
+    kelly_full = (win_rate * b - q) / b
+
+    if kelly_full <= 0:
+        # 負のKelly → エッジがない（期待値マイナス）
+        # 最低限のポジションのみ取る（様子見）
+        print(f"Negative Kelly ({kelly_full:.4f}): no positive edge, using minimum fraction")
+        kelly_fraction = KELLY_MIN_FRACTION
+    else:
+        # Half-Kelly for safety（破産リスクを大幅に低減）
+        kelly_fraction = kelly_full * KELLY_SAFETY_FACTOR
+
+    # 3. スコアによる変調
+    # BUY閾値付近(≈0.25)のスコアは控えめ、高スコアはKelly寄り
+    # score=0.15 → factor=0.3, score=0.25 → factor=0.5, score=0.50 → factor=1.0
+    score_factor = min(1.0, max(0.3, (score - 0.10) / 0.40))
+    adjusted_fraction = kelly_fraction * score_factor
+
+    # 4. クランプ（最低10%、最大80%）
+    adjusted_fraction = max(KELLY_MIN_FRACTION, min(KELLY_MAX_FRACTION, adjusted_fraction))
+
+    print(f"Kelly sizing: full_kelly={kelly_full:.4f}, half_kelly={kelly_fraction:.4f}, "
+          f"score_factor={score_factor:.2f}, adjusted={adjusted_fraction:.4f}")
+
+    # 5. 投資金額計算
+    order_amount = available_jpy * adjusted_fraction
+
+    # 手数料を考慮
+    if TAKER_FEE_RATE > 0:
+        order_amount = order_amount / (1 + TAKER_FEE_RATE)
+
+    # 上限・下限チェック
+    order_amount = min(order_amount, MAX_POSITION_JPY)
+
+    if order_amount < MIN_ORDER_JPY:
+        print(f"Order amount ¥{order_amount:,.0f} below minimum ¥{MIN_ORDER_JPY:,.0f}")
+        return 0
+
+    return order_amount
+
+
+def _calculate_order_amount_fallback(score: float, available_jpy: float) -> float:
+    """
+    フォールバック: スコアベースの固定比率（Kelly計算不可時）
+    Half-Kelly相当の保守的な設定
     """
     ratio = 0.0
-    for threshold, r in SCORE_THRESHOLDS:
+    for threshold, r in FALLBACK_SCORE_THRESHOLDS:
         if score >= threshold:
             ratio = r
             break

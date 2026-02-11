@@ -72,15 +72,15 @@ aws dynamodb scan --table-name eth-trading-signals --output json > data/signals_
 | `technical_score` | N | Phase 2+ | テクニカルスコア (-1.0 ~ +1.0) |
 | `chronos_score` | N | Phase 2+ | Chronos予測スコア (-1.0 ~ +1.0) |
 | `sentiment_score` | N | Phase 2+ | センチメントスコア (-1.0 ~ +1.0) |
-| `weight_technical` | N | Phase 2+ | テクニカル重み (0.45) |
-| `weight_chronos` | N | Phase 2+ | Chronos重み (0.25) |
+| `weight_technical` | N | Phase 2+ | テクニカル重み (0.35, Phase 4以前は0.45) |
+| `weight_chronos` | N | Phase 2+ | Chronos重み (0.35, Phase 4以前は0.25) |
 | `weight_sentiment` | N | Phase 2+ | センチメント重み (0.15) |
 | `weight_market_context` | N | Phase 3+ | マーケットコンテキスト重み (0.15) |
 | `market_context_score` | N | Phase 3+ | マーケットコンテキストスコア |
 | `buy_threshold` | N | Phase 2+ | 実効BUY閾値 (動的) |
 | `sell_threshold` | N | Phase 2+ | 実効SELL閾値 (動的) |
 
-> **Phase 3 トレードの見分け方**: `weight_technical=0.45` + `weight_market_context` が存在するレコードがPhase 3以降
+> **Phase 3/4 トレードの見分け方**: `weight_technical=0.45` + `weight_market_context` が存在 → Phase 3、`weight_technical=0.35` → Phase 4以降
 
 ### Slack ログの活用
 
@@ -133,12 +133,12 @@ aws dynamodb scan --table-name eth-trading-signals --output json > data/signals_
 
 | パラメータ | 環境変数 | 現在値 | Phase 1 | Phase 2変更 | 変更理由 |
 |-----------|---------|--------|---------|------------|---------|
-| テクニカル重み | `TECHNICAL_WEIGHT` | **0.45** | 0.45 | `72cf12f` | #20 4成分化 |
-| Chronos重み | `AI_PREDICTION_WEIGHT` | **0.25** | 0.40 | `72cf12f` | #20 4成分化 |
+| テクニカル重み | `TECHNICAL_WEIGHT` | **0.35** | 0.45 | Phase 4 | AI精度向上で均等化 |
+| Chronos重み | `AI_PREDICTION_WEIGHT` | **0.35** | 0.40 | Phase 4 | AI精度向上で均等化 |
 | センチメント重み | `SENTIMENT_WEIGHT` | 0.15 | 0.15 | - | 変更なし |
 | マーケットCtx重み | `MARKET_CONTEXT_WEIGHT` | **0.15** | - | `72cf12f` | #20 新規 |
-| BUY基準閾値 | `BASE_BUY_THRESHOLD` | **0.28** | 0.20 | `8b5f2a4` | #20a 4成分圧縮補正 |
-| SELL基準閾値 | `BASE_SELL_THRESHOLD` | **-0.15** | -0.20 | `8b5f2a4` | #20a 4成分圧縮補正 |
+| BUY基準閾値 | `BASE_BUY_THRESHOLD` | **0.25** | 0.20 | Phase 4 | AI均等化でスコア圧縮補正 |
+| SELL基準閾値 | `BASE_SELL_THRESHOLD` | **-0.13** | -0.20 | Phase 4 | AI均等化でスコア圧縮補正 |
 | BB幅基準 | `BASELINE_BB_WIDTH` | 0.03 | 0.03 | - | 変更なし |
 | ボラ補正下限 | `VOL_CLAMP_MIN` | **0.67** | 0.50 | `5ffcbea` | #19 最低BUY閾値0.15→0.20 |
 | ボラ補正上限 | `VOL_CLAMP_MAX` | 2.0 | 2.0 | - | 変更なし |
@@ -153,16 +153,16 @@ aws dynamodb scan --table-name eth-trading-signals --output json > data/signals_
 ```
 vol_ratio = avg_bb_width / BASELINE_BB_WIDTH(0.03)
 vol_ratio = clamp(vol_ratio, VOL_CLAMP_MIN(0.67), VOL_CLAMP_MAX(2.0))
-BUY_threshold = BASE_BUY_THRESHOLD(0.28) × vol_ratio
-SELL_threshold = BASE_SELL_THRESHOLD(-0.15) × vol_ratio
+BUY_threshold = BASE_BUY_THRESHOLD(0.25) × vol_ratio
+SELL_threshold = BASE_SELL_THRESHOLD(-0.13) × vol_ratio
 
 # F&G連動補正 (Phase 4.5)
 if F&G ≤ 20: BUY_threshold × 1.35
 if F&G ≥ 80: BUY_threshold × 1.20
 # SELL_thresholdはF&G補正なし
 
-→ 通常BUY範囲: [0.19, 0.56]
-→ Fear時BUY範囲: [0.25, 0.76]  (×1.35)
+→ 通常BUY範囲: [0.17, 0.50]
+→ Fear時BUY範囲: [0.23, 0.68]  (×1.35)
 → Greed時BUY範囲: [0.23, 0.67] (×1.20)
 → SELL範囲: [-0.10, -0.30]     (変更なし)
 ```
@@ -356,8 +356,8 @@ Compress-Archive -Path "services/chronos-caller/*" -DestinationPath "chronos.zip
                     └─────────┼─────────┘
                           aggregator
                               │ + DynamoDB(market-context) ← market-context Lambda (30分毎)
-                              ↓ 4成分加重 (0.45/0.25/0.15/0.15)
-                              ↓ (BUY: score>0.28×vol / SELL: score<-0.15×vol)
+                              ↓ 4成分加重 (0.35/0.35/0.15/0.15)
+                              ↓ (BUY: score>0.25×vol / SELL: score<-0.13×vol)
                           SQS → order-executor → Coincheck API
                                                       ↓
 [5分間隔] EventBridge → position-monitor → SL/TP/トレーリング判定

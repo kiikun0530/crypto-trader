@@ -407,14 +407,14 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
 
 0. DynamoDB `market-context` テーブルから最新のマーケットコンテキストを取得
    - 2時間以上古い場合は中立 (0.0) として扱う
-1. 各通貨の4成分加重平均スコアを計算 (ベース: Tech×0.45 + Chronos×0.25 + Sent×0.15 + MktCtx×0.15)
+1. 各通貨の4成分加重平均スコアを計算 (ベース: Tech×0.35 + Chronos×0.35 + Sent×0.15 + MktCtx×0.15)
    - **確信度ベース動的ウェイト**: Chronos confidence に応じてウェイトを動的調整
-     - `weight_shift = (confidence - 0.5) × 0.30` → クランプ [-0.15, +0.10]
-     - 高確信度(1.0): Chronos 0.35, Tech 0.35 / 低確信度(0.0): Chronos 0.10, Tech 0.60
+     - `weight_shift = (confidence - 0.5) × 0.16` → クランプ [-0.08, +0.08]
+     - 高確信度(1.0): Chronos 0.43, Tech 0.27 / 低確信度(0.0): Chronos 0.27, Tech 0.43
    - アルトコインはBTC Dominance補正: >60%で-0.05、<40%で+0.05
 2. BB幅（ボリンジャーバンド幅）からボラティリティ適応型閾値を計算
    - `vol_ratio = avg_bb_width / baseline(0.03)` → クランプ 0.67〜2.0
-   - `buy_threshold = 0.28 × vol_ratio`, `sell_threshold = -0.15 × vol_ratio`
+   - `buy_threshold = 0.25 × vol_ratio`, `sell_threshold = -0.13 × vol_ratio`
    - F&G連動補正: F&G≤20 → `buy_threshold × 1.35`, F&G≥80 → `buy_threshold × 1.20` (SELL不変)
 3. モメンタム減速チェック: 保有中通貨のMACDヒストグラムが正→縮小中(slope<-0.3)なら、SELL閾値を50%緩和して早期利確
 3. 全通貨のシグナルを DynamoDB に保存（動的閾値・BB幅・market_context_scoreも記録）
