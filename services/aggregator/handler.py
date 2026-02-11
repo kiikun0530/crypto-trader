@@ -75,19 +75,20 @@ def handler(event, context):
             scored = score_pair(pair, result, market_context)
             scored_pairs.append(scored)
 
-        # 2. ボラティリティ適応型閾値を計算（F&G連動補正付き）
-        buy_threshold, sell_threshold = calculate_dynamic_thresholds(scored_pairs, market_context)
+        # 2. 通貨別ボラティリティ適応型閾値を計算（F&G連動補正付き）
+        thresholds_map = calculate_per_currency_thresholds(scored_pairs, market_context)
 
-        # 3. シグナル保存（動的閾値を使用）
+        # 3. シグナル保存（通貨別閾値を使用）
         for scored in scored_pairs:
-            save_signal(scored, buy_threshold, sell_threshold)
+            pair_th = thresholds_map.get(scored['pair'], {'buy': BASE_BUY_THRESHOLD, 'sell': BASE_SELL_THRESHOLD})
+            save_signal(scored, pair_th['buy'], pair_th['sell'])
 
         # 4. スコア順にソート（期待値の高い順）
         scored_pairs.sort(key=lambda x: x['total_score'], reverse=True)
 
-        # 5. 通貨毎のBUY/SELL/HOLD判定（ポジション非依存）
+        # 5. 通貨毎のBUY/SELL/HOLD判定（通貨別閾値・ポジション非依存）
         per_currency_decisions = decide_per_currency_signals(
-            scored_pairs, buy_threshold, sell_threshold
+            scored_pairs, thresholds_map
         )
 
         # 6. 非HOLDの判定を抽出
@@ -97,8 +98,7 @@ def handler(event, context):
         # 7. キューにバッチ送信（BUY/SELLがある場合のみ）
         if has_signal and ORDER_QUEUE_URL:
             send_batch_order_message(
-                actionable_decisions, int(time.time()),
-                buy_threshold, sell_threshold
+                actionable_decisions, int(time.time())
             )
 
         # 8. ポジション取得（表示用）
@@ -134,14 +134,13 @@ def handler(event, context):
                 for s in scored_pairs
             ],
             'active_positions': [p.get('pair') for p in active_positions],
-            'buy_threshold': round(buy_threshold, 4),
-            'sell_threshold': round(sell_threshold, 4),
+            'thresholds': {pair: {'buy': th['buy'], 'sell': th['sell']} for pair, th in thresholds_map.items()},
             'timestamp': int(time.time())
         }
 
         # 9. Slack通知（ランキング付き + 通貨別判定 + 含み損益表示）
         notify_slack(result, scored_pairs, active_positions,
-                     buy_threshold, sell_threshold, per_currency_decisions)
+                     thresholds_map, per_currency_decisions)
 
         return result
 
@@ -366,34 +365,25 @@ FNG_BUY_MULTIPLIER_FEAR = 1.35   # Extreme Fear: BUY閾値を1.35倍（例: 0.28
 FNG_BUY_MULTIPLIER_GREED = 1.20  # Extreme Greed: BUY閾値を1.20倍
 
 
-def calculate_dynamic_thresholds(scored_pairs: list, market_context: dict = None) -> tuple:
+def calculate_per_currency_thresholds(scored_pairs: list, market_context: dict = None) -> dict:
     """
-    ボラティリティ適応型閾値を計算（Fear & Greed 連動補正付き）
+    通貨別ボラティリティ適応型閾値を計算（Fear & Greed 連動補正付き）
 
-    ロジック:
-    1. 全通貨の平均BB幅（ボラティリティ指標）から基本補正
-       - 高ボラ時: 閾値を厳しく（ノイズに反応しない）
-       - 低ボラ時: 閾値を緩く（小さな確実なシグナルを拾う）
-    2. Fear & Greed Index による BUY 閾値補正
-       - Extreme Fear (< 20): BUY閾値を1.35倍に引き上げ
-         → 恐怖相場での安易な逆張りを抑制
-       - Extreme Greed (> 80): BUY閾値を1.20倍に引き上げ
-         → 過熱相場での天井掴みを防止
-       - SELL閾値は変更しない（損切りは市場環境に関わらず実行すべき）
+    各通貨のBB幅（ボラティリティ）に基づいて個別の閾値を計算する。
+    高ボラ通貨（DOGE, SOLなど）は閾値を厳しく（ノイズに反応しない）、
+    低ボラ通貨（BTCなど）は閾値を緩く（小さな確実なシグナルを拾う）設定。
+
+    F&G連動補正は全通貨共通で適用（BUYのみ）:
+    - Extreme Fear (< 20): BUY閾値を1.35倍に引き上げ
+    - Extreme Greed (> 80): BUY閾値を1.20倍に引き上げ
+    - SELL閾値は変更しない（損切りは市場環境に関わらず実行すべき）
+
+    Returns: dict[pair] = {'buy': float, 'sell': float, 'vol_ratio': float}
     """
     if not scored_pairs:
-        return BASE_BUY_THRESHOLD, BASE_SELL_THRESHOLD
+        return {}
 
-    bb_widths = [s.get('bb_width', BASELINE_BB_WIDTH) for s in scored_pairs]
-    avg_bb_width = sum(bb_widths) / len(bb_widths)
-
-    vol_ratio = avg_bb_width / BASELINE_BB_WIDTH
-    vol_ratio = max(VOL_CLAMP_MIN, min(VOL_CLAMP_MAX, vol_ratio))
-
-    buy_threshold = BASE_BUY_THRESHOLD * vol_ratio
-    sell_threshold = BASE_SELL_THRESHOLD * vol_ratio
-
-    # --- Fear & Greed 連動 BUY閾値補正 ---
+    # --- Fear & Greed 連動 BUY閾値補正（全通貨共通） ---
     fng_multiplier = 1.0
     fng_reason = ''
     if market_context:
@@ -405,24 +395,47 @@ def calculate_dynamic_thresholds(scored_pairs: list, market_context: dict = None
             fng_multiplier = FNG_BUY_MULTIPLIER_GREED
             fng_reason = f'ExtremeGreed(F&G={fng_value}>=80)'
 
-    buy_threshold *= fng_multiplier
+    thresholds = {}
+    for scored in scored_pairs:
+        pair = scored['pair']
+        bb_width = scored.get('bb_width', BASELINE_BB_WIDTH)
 
-    fng_info = f", fng_mult={fng_multiplier:.2f} [{fng_reason}]" if fng_reason else ''
-    print(f"Dynamic thresholds: BUY={buy_threshold:+.3f} SELL={sell_threshold:+.3f} "
-          f"(avg_bb_width={avg_bb_width:.4f}, vol_ratio={vol_ratio:.2f}{fng_info})")
+        vol_ratio = bb_width / BASELINE_BB_WIDTH
+        vol_ratio = max(VOL_CLAMP_MIN, min(VOL_CLAMP_MAX, vol_ratio))
 
-    return buy_threshold, sell_threshold
+        buy_t = BASE_BUY_THRESHOLD * vol_ratio * fng_multiplier
+        sell_t = BASE_SELL_THRESHOLD * vol_ratio
+
+        thresholds[pair] = {
+            'buy': round(buy_t, 4),
+            'sell': round(sell_t, 4),
+            'vol_ratio': round(vol_ratio, 3),
+        }
+
+        name = TRADING_PAIRS.get(pair, {}).get('name', pair)
+        print(f"  {name}({pair}) threshold: BUY={buy_t:+.4f} SELL={sell_t:+.4f} "
+              f"(bb_width={bb_width:.4f}, vol_ratio={vol_ratio:.2f})")
+
+    if fng_reason:
+        print(f"  F&G correction: multiplier={fng_multiplier:.2f} [{fng_reason}]")
+
+    return thresholds
 
 
 def decide_per_currency_signals(scored_pairs: list,
-                                 buy_threshold: float, sell_threshold: float) -> list:
+                                 thresholds_map: dict) -> list:
     """
-    通貨毎のBUY/SELL/HOLDを判定（ポジション非依存）
+    通貨毎のBUY/SELL/HOLDを判定（通貨別閾値・ポジション非依存）
 
+    各通貨のボラティリティに応じた個別閾値を使用して判定する。
     現在のポジション状況に関わらず、純粋にスコアと閾値で判定する。
     実際の注文可否はorder-executorが残高・ポジションを確認して決定する。
 
-    Returns: list of {pair, analysis_pair, signal, score, components, weights, ...}
+    Args:
+        scored_pairs: score_pair()の結果リスト
+        thresholds_map: {pair: {'buy': float, 'sell': float}} 通貨別閾値
+
+    Returns: list of {pair, analysis_pair, signal, score, buy_threshold, sell_threshold, ...}
     """
     decisions = []
     for scored in scored_pairs:
@@ -430,14 +443,19 @@ def decide_per_currency_signals(scored_pairs: list,
         coincheck_pair = TRADING_PAIRS.get(pair, {}).get('coincheck', pair)
         score = scored['total_score']
 
-        if score >= buy_threshold:
+        pair_th = thresholds_map.get(pair, {'buy': BASE_BUY_THRESHOLD, 'sell': BASE_SELL_THRESHOLD})
+        buy_t = pair_th['buy']
+        sell_t = pair_th['sell']
+
+        if score >= buy_t:
             signal = 'BUY'
-        elif score <= sell_threshold:
+        elif score <= sell_t:
             signal = 'SELL'
         else:
             signal = 'HOLD'
 
-        print(f"  {pair} ({coincheck_pair}): score={score:+.4f} → {signal}")
+        print(f"  {pair} ({coincheck_pair}): score={score:+.4f} → {signal} "
+              f"(BUY>={buy_t:+.4f}, SELL<={sell_t:+.4f})")
 
         decisions.append({
             'pair': coincheck_pair,
@@ -448,6 +466,8 @@ def decide_per_currency_signals(scored_pairs: list,
             'weights': scored.get('weights', {}),
             'chronos_confidence': scored.get('chronos_confidence', 0.5),
             'bb_width': scored.get('bb_width', 0),
+            'buy_threshold': buy_t,
+            'sell_threshold': sell_t,
         })
 
     buy_count = sum(1 for d in decisions if d['signal'] == 'BUY')
@@ -531,9 +551,8 @@ def save_signal(scored: dict, buy_threshold: float, sell_threshold: float):
         print(f"Error saving signal for {scored.get('pair', 'unknown')}: {e}")
 
 
-def send_batch_order_message(decisions: list, timestamp: int,
-                              buy_threshold: float, sell_threshold: float):
-    """SQSにバッチ注文メッセージ送信（全通貨の判定を1メッセージで）"""
+def send_batch_order_message(decisions: list, timestamp: int):
+    """SQSにバッチ注文メッセージ送信（全通貨の判定を1メッセージで・通貨別閾値付き）"""
     try:
         orders = []
         for d in decisions:
@@ -544,8 +563,8 @@ def send_batch_order_message(decisions: list, timestamp: int,
                 'analysis_context': {
                     'components': d.get('components', {}),
                     'bb_width': d.get('bb_width', 0),
-                    'buy_threshold': round(buy_threshold, 4),
-                    'sell_threshold': round(sell_threshold, 4),
+                    'buy_threshold': round(d.get('buy_threshold', BASE_BUY_THRESHOLD), 4),
+                    'sell_threshold': round(d.get('sell_threshold', BASE_SELL_THRESHOLD), 4),
                     'weights': d.get('weights', {}),
                     'chronos_confidence': d.get('chronos_confidence', 0.5),
                 }
@@ -569,11 +588,10 @@ def send_batch_order_message(decisions: list, timestamp: int,
 
 
 def notify_slack(result: dict, scored_pairs: list, active_positions: list,
-                 buy_threshold: float = None, sell_threshold: float = None,
+                 thresholds_map: dict = None,
                  per_currency_decisions: list = None):
-    """Slackに分析結果を通知（通貨別判定 + ランキング + 含み損益表示）"""
-    buy_threshold = buy_threshold or BASE_BUY_THRESHOLD
-    sell_threshold = sell_threshold or BASE_SELL_THRESHOLD
+    """Slackに分析結果を通知（通貨別判定 + ランキング + 通貨別閾値 + 含み損益表示）"""
+    thresholds_map = thresholds_map or {}
     if not SLACK_WEBHOOK_URL:
         return
 
@@ -613,20 +631,22 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
         for i, s in enumerate(scored_pairs):
             name = TRADING_PAIRS.get(s['pair'], {}).get('name', s['pair'])
             medal = ['🥇', '🥈', '🥉'][i] if i < 3 else f'{i+1}.'
-            conf = s.get('chronos_confidence', 0.5)
-            conf_bar = '🟢' if conf >= 0.7 else '🟡' if conf >= 0.4 else '🔴'
             weights = s.get('weights', {})
 
             # 通貨別判定表示
             pair_signal = decision_map.get(s['pair'], 'HOLD')
             signal_emoji = {'BUY': '🟢BUY', 'SELL': '🔴SELL', 'HOLD': '⚪HOLD'}.get(pair_signal, '⚪HOLD')
 
+            # 通貨別閾値
+            pair_th = thresholds_map.get(s['pair'], {'buy': BASE_BUY_THRESHOLD, 'sell': BASE_SELL_THRESHOLD})
+
             ranking_text += (
                 f"{medal} *{name}*: `{s['total_score']:+.4f}` {score_bar(s['total_score'])} → {signal_emoji}\n"
                 f"    Tech: `{s['components']['technical']:+.3f}`({weights.get('technical', TECHNICAL_WEIGHT):.2f}) | "
-                f"AI: `{s['components']['chronos']:+.3f}`({weights.get('chronos', CHRONOS_WEIGHT):.2f}){conf_bar} | "
+                f"AI: `{s['components']['chronos']:+.3f}`({weights.get('chronos', CHRONOS_WEIGHT):.2f}) | "
                 f"Sent: `{s['components']['sentiment']:+.3f}` | "
                 f"Mkt: `{s['components'].get('market_context', 0):+.3f}`\n"
+                f"    閾値: BUY≥`{pair_th['buy']:+.3f}` / SELL≤`{pair_th['sell']:+.3f}`\n"
             )
 
         # ポジション情報（複数対応 + 含み損益表示）
@@ -730,9 +750,9 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
             {
                 "type": "context",
                 "elements": [
-                    {"type": "mrkdwn", "text": f"BUY閾値: `{buy_threshold:+.3f}` / SELL閾値: `{sell_threshold:+.3f}` | "
+                    {"type": "mrkdwn", "text": f"基準閾値: BUY≥`{BASE_BUY_THRESHOLD:+.3f}` / SELL≤`{BASE_SELL_THRESHOLD:+.3f}` (通貨別ボラ補正あり) | "
                                                 f"基準重み: Tech={TECHNICAL_WEIGHT} AI={CHRONOS_WEIGHT}(確信度で±0.08変動) Sent={SENTIMENT_WEIGHT} Mkt={MARKET_CONTEXT_WEIGHT}"
-                                                + (f" | ⚠️ F&G補正あり" if buy_threshold > BASE_BUY_THRESHOLD * 1.3 else "")}
+                                                + (f" | ⚠️ F&G補正あり" if any(th['buy'] > BASE_BUY_THRESHOLD * 1.3 for th in thresholds_map.values()) else "")}
                 ]
             }
         ]
