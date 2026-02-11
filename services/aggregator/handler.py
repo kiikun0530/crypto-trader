@@ -646,10 +646,34 @@ def generate_ai_comment(scored: dict, thresholds: dict) -> str:
         news = scored.get('news_headlines', [])
         mkt = scored.get('market_context_detail', {})
 
+        # レジーム別ウェイト
+        regime = ind.get('regime', 'neutral')
+        if regime == 'trending':
+            regime_label = 'トレンド相場'
+            weight_desc = 'MACD/SMA重視(35%ずつ)、RSI/BB軽視(15%ずつ)'
+        elif regime == 'ranging':
+            regime_label = 'レンジ相場'
+            weight_desc = 'RSI/BB重視(35%ずつ)、MACD/SMA軽視(15%ずつ)'
+        else:
+            regime_label = '中間'
+            weight_desc = '均等(各25%)'
+
         # プロンプトに渡す材料
+        buy_th = thresholds.get('buy', BASE_BUY_THRESHOLD)
+        sell_th = thresholds.get('sell', BASE_SELL_THRESHOLD)
+
+        # シグナル理由
+        if signal == 'BUY':
+            signal_reason = f'総合スコア{total:+.3f}がBUY閾値{buy_th:+.2f}以上のため買いシグナル'
+        elif signal == 'SELL':
+            signal_reason = f'総合スコア{total:+.3f}がSELL閾値{sell_th:+.2f}以下のため売りシグナル'
+        else:
+            signal_reason = f'総合スコア{total:+.3f}はBUY閾値{buy_th:+.2f}とSELL閾値{sell_th:+.2f}の間でHOLD'
+
         materials = f"""通貨: {coin_name}
-総合スコア: {total:+.3f} (シグナル: {signal})
-テクニカル: {comp.get('technical', 0):+.3f} (RSI={ind.get('rsi', 'N/A')}, ADX={ind.get('adx', 'N/A')}, レジーム={ind.get('regime', 'N/A')})
+シグナル判定: {signal} — {signal_reason}
+レジーム: {regime_label}（ADX={ind.get('adx', 'N/A')}）→ {weight_desc}
+テクニカル: {comp.get('technical', 0):+.3f} (RSI={ind.get('rsi', 'N/A')}, ADX={ind.get('adx', 'N/A')})
 AI予測: {comp.get('chronos', 0):+.3f} (変化率={chr_d.get('predicted_change_pct', 'N/A')}%, 確信度={chr_d.get('confidence', 'N/A')})
 センチメント: {comp.get('sentiment', 0):+.3f}
 市場環境: {comp.get('market_context', 0):+.3f} (F&G={mkt.get('fng_value', 'N/A')}, BTC Dom={mkt.get('btc_dominance', 'N/A')}%)"""
@@ -664,10 +688,10 @@ AI予測: {comp.get('chronos', 0):+.3f} (変化率={chr_d.get('predicted_change_
 
 ルール:
 - 敬体（です・ます調）で書く
+- なぜそのシグナル（BUY/SELL/HOLD）になったかを閾値と主要因を引用して説明する
+- レジーム（トレンド/レンジ）による重み配分がスコアにどう影響したかに触れる
 - データに基づいた客観的な分析を述べる
-- 最も影響力の大きい要因を強調する
-- 「買い推奨」「売り推奨」など直接的な投資助言は避ける
-- 100文字以内に収める"""
+- 150文字以内に収める"""
 
         response = bedrock.converse(
             modelId=BEDROCK_MODEL_ID,
