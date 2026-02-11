@@ -9,7 +9,7 @@ API最適化:
 
 センチメント分析:
 - 投票数≥ 5: CryptoPanicの投票データを使用
-- 投票数 < 5: AWS Bedrock (Claude 3 Haiku) でタイトルベースのセンチメント分析
+- 投票数 < 5: AWS Bedrock (Amazon Nova Micro) でタイトルベースのセンチメント分析
 - Bedrock失敗時: ルールベースNLPにフォールバック
 """
 import json
@@ -23,7 +23,7 @@ from trading_common import TRADING_PAIRS, SENTIMENT_TABLE, dynamodb
 
 # Bedrock クライアント (LLMセンチメント分析用)
 bedrock = boto3.client('bedrock-runtime')
-BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'anthropic.claude-3-haiku-20240307-v1:0')
+BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'amazon.nova-micro-v1:0')
 
 CRYPTOPANIC_API_KEY = os.environ.get('CRYPTOPANIC_API_KEY', '')
 
@@ -216,7 +216,7 @@ def fetch_news(currencies: str = None, limit: int = 50) -> list:
 
 def analyze_titles_with_llm(articles: list) -> dict:
     """
-    投票不足の記事タイトルをAWS Bedrock (Claude 3 Haiku) でバッチ分析
+    投票不足の記事タイトルをAWS Bedrock (Amazon Nova Micro) でバッチ分析
 
     投票が十分な記事はスキップし、投票不足の記事のみLLMに送信。
     全記事を1回のAPI呼び出しでまとめて処理（コスト効率化）。
