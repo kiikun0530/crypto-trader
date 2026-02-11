@@ -8,7 +8,6 @@ Daily Reporter Lambda
 - signals: 直近24hのシグナル統計
 - positions: アクティブポジション
 - market-context: 直近の市場環境
-- improvements: 直近の自動改善履歴
 """
 import json
 import os
@@ -25,7 +24,6 @@ TRADES_TABLE = os.environ.get('TRADES_TABLE', 'eth-trading-trades')
 SIGNALS_TABLE = os.environ.get('SIGNALS_TABLE', 'eth-trading-signals')
 POSITIONS_TABLE = os.environ.get('POSITIONS_TABLE', 'eth-trading-positions')
 MARKET_CONTEXT_TABLE = os.environ.get('MARKET_CONTEXT_TABLE', 'eth-trading-market-context')
-IMPROVEMENTS_TABLE = os.environ.get('IMPROVEMENTS_TABLE', 'eth-trading-improvements')
 REPORT_BUCKET = os.environ.get('REPORT_BUCKET', 'eth-trading-daily-reports')
 SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL', '')
 TRADING_PAIRS_CONFIG = os.environ.get('TRADING_PAIRS_CONFIG', '{}')
@@ -67,7 +65,6 @@ def handler(event, context):
         signals_24h = fetch_signals(now - 86400, now, all_pairs)
         active_positions = fetch_positions(all_pairs, pair_to_coincheck)
         market_context = fetch_market_context()
-        recent_improvements = fetch_improvements(now - 86400 * 14)
 
         # 統計計算
         report = build_report(
@@ -79,7 +76,6 @@ def handler(event, context):
             signals_24h=signals_24h,
             active_positions=active_positions,
             market_context=market_context,
-            recent_improvements=recent_improvements
         )
 
         # S3保存
@@ -216,38 +212,14 @@ def fetch_market_context() -> dict:
         return {}
 
 
-def fetch_improvements(since_ts: int) -> list:
-    """直近の自動改善履歴
-    
-    improvement_id がハッシュキーのためscanが必要だが、
-    TTLで古いアイテムは自動削除されるためデータ量は限定的。
-    Limit=50で安全マージンを確保。
-    """
-    table = dynamodb.Table(IMPROVEMENTS_TABLE)
-    try:
-        response = table.scan(
-            FilterExpression='#ts > :s',
-            ExpressionAttributeNames={'#ts': 'timestamp'},
-            ExpressionAttributeValues={':s': since_ts},
-            Limit=50
-        )
-        return sorted(response.get('Items', []),
-                       key=lambda x: float(x.get('timestamp', 0)),
-                       reverse=True)
-    except Exception as e:
-        print(f"Error fetching improvements: {e}")
-        return []
-
-
 # =============================================================================
 # レポート生成
 # =============================================================================
 
-def build_data_quality(trades_24h, trades_7d, trades_30d, signals_24h,
-                      recent_improvements) -> dict:
+def build_data_quality(trades_24h, trades_7d, trades_30d, signals_24h) -> dict:
     """
-    データ品質を評価し、自動改善の可否を判定する。
-    コードレベルの強制ゲート — Claudeプロンプト任せにしない。
+    データ品質を評価する。
+    コードレベルの強制ゲート。
     """
     import math
 
@@ -264,21 +236,6 @@ def build_data_quality(trades_24h, trades_7d, trades_30d, signals_24h,
     MIN_TRADES_24H = 3   # 日次3件未満は統計的に無意味
     MIN_TRADES_7D = 5    # 週次5件未満は傾向判断不可
     has_enough_data = (n_7d >= MIN_TRADES_7D)
-
-    # --- ゲート2: 直近改善のクールダウン ---
-    # PARAM_TUNE/CODE_CHANGE が直近7日以内にあったら抑制
-    COOLDOWN_DAYS = 7
-    active_changes = [
-        imp for imp in recent_improvements
-        if str(imp.get('decision', '')) in ('PARAM_TUNE', 'CODE_CHANGE')
-    ]
-    days_since_last_change = None
-    if active_changes:
-        latest = max(active_changes, key=lambda x: int(float(x.get('timestamp', 0))))
-        days_since_last_change = round(
-            (int(time.time()) - int(float(latest.get('timestamp', 0)))) / 86400, 1
-        )
-    cooldown_ok = (days_since_last_change is None or days_since_last_change >= COOLDOWN_DAYS)
 
     # --- ゲート3: 勝率の信頼区間 (Wilson score interval) ---
     # n が小さいときは信頼区間が広すぎるので変更すべきでない
@@ -319,8 +276,6 @@ def build_data_quality(trades_24h, trades_7d, trades_30d, signals_24h,
     skip_reasons = []
     if not has_enough_data:
         skip_reasons.append(f'insufficient_data(7d={n_7d}<{MIN_TRADES_7D})')
-    if not cooldown_ok:
-        skip_reasons.append(f'cooldown(last_change={days_since_last_change}d<{COOLDOWN_DAYS}d)')
     if not statistically_significant:
         skip_reasons.append(f'wide_ci(width={ci_width:.3f}>={CI_WIDTH_THRESHOLD})')
     if all_same_direction and n_24h >= 2:
@@ -333,10 +288,9 @@ def build_data_quality(trades_24h, trades_7d, trades_30d, signals_24h,
     if n_7d > 0:
         data_factor = min(1.0, n_7d / 20)           # 20件で満点
         ci_factor = max(0, 1.0 - ci_width / 0.5)    # CI幅が狭いほど高い
-        cooldown_factor = 1.0 if cooldown_ok else 0.3
         market_factor = 0.5 if all_same_direction else 1.0
         confidence_score = round(
-            data_factor * 0.35 + ci_factor * 0.35 + cooldown_factor * 0.15 + market_factor * 0.15,
+            data_factor * 0.40 + ci_factor * 0.40 + market_factor * 0.20,
             3
         )
 
@@ -350,22 +304,19 @@ def build_data_quality(trades_24h, trades_7d, trades_30d, signals_24h,
         'signals_24h': n_signals,
         'win_rate_7d': round(wins_7d / n_7d, 4) if n_7d > 0 else 0,
         'win_rate_7d_ci': {'lower': ci_lower, 'upper': ci_upper, 'width': ci_width},
-        'days_since_last_change': days_since_last_change,
         'all_same_direction': all_same_direction,
         'thresholds': {
             'min_trades_7d': MIN_TRADES_7D,
-            'cooldown_days': COOLDOWN_DAYS,
             'ci_width_threshold': CI_WIDTH_THRESHOLD
         }
     }
 
 
 def build_report(date, timestamp, trades_24h, trades_7d, trades_30d,
-                 signals_24h, active_positions, market_context,
-                 recent_improvements) -> dict:
+                 signals_24h, active_positions, market_context) -> dict:
     """構造化レポートを生成"""
     data_quality = build_data_quality(
-        trades_24h, trades_7d, trades_30d, signals_24h, recent_improvements
+        trades_24h, trades_7d, trades_30d, signals_24h
     )
     return {
         'date': date,
@@ -377,16 +328,6 @@ def build_report(date, timestamp, trades_24h, trades_7d, trades_30d,
         'market_summary': build_market_summary(market_context),
         'rolling_7d': build_rolling_stats(trades_7d),
         'rolling_30d': build_rolling_stats(trades_30d),
-        'recent_improvements': [
-            {
-                'id': str(imp.get('improvement_id', '')),
-                'date': str(imp.get('date', '')),
-                'decision': str(imp.get('decision', '')),
-                'summary': str(imp.get('summary', ''))[:200],
-                'changes_applied': imp.get('changes_applied', [])
-            }
-            for imp in recent_improvements[:5]
-        ]
     }
 
 
@@ -660,12 +601,6 @@ def send_slack_summary(report: dict):
                                f"S:{comp.get('sentiment',0):.2f}"])
         detail_lines += f"\n   {icon} {d['pair']}: ¥{d['pnl']:+,.0f} ({d['hold_minutes']:.0f}分) [{comp_str}]"
 
-    # 直近の改善
-    improve_line = ""
-    if report.get('recent_improvements'):
-        latest = report['recent_improvements'][0]
-        improve_line = f"\n🔧 *直近の改善:* {latest.get('summary', 'N/A')[:100]}"
-
     text = f"""📊 *日次レポート: {report['date']}*
 
 {pnl_icon} *本日の成績:*
@@ -678,9 +613,7 @@ def send_slack_summary(report: dict):
 {mkt_line}
 {pos_line}
 
-📈 *ローリング:* 7d: {r7d['trades']}件 勝率{r7d['win_rate']:.0%} ¥{r7d['total_pnl']:+,.0f} | 30d: {r30d['trades']}件 勝率{r30d['win_rate']:.0%} ¥{r30d['total_pnl']:+,.0f}{improve_line}
-
-🤖 _自動改善分析を実行中..._"""
+◈ *ローリング:* 7d: {r7d['trades']}件 勝率{r7d['win_rate']:.0%} ¥{r7d['total_pnl']:+,.0f} | 30d: {r30d['trades']}件 勝率{r30d['win_rate']:.0%} ¥{r30d['total_pnl']:+,.0f}"""
 
     payload = {
         "blocks": [

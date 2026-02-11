@@ -7,10 +7,10 @@ API最適化:
 - 全体市場ニュースを1リクエストで取得
 - 合計2 API calls/実行 × 1,440回/月 = 2,880/mo（Growth Plan 3,000内）
 
-改善点:
-- 各通貨ごとにセンチメントスコアを個別保存
-- BTC相関・全体市場の影響を加味
-- 投票数の信頼性閾値を維持
+センチメント分析:
+- 投票数≥ 5: CryptoPanicの投票データを使用
+- 投票数 < 5: AWS Bedrock (Claude 3.5 Haiku) でタイトルベースのセンチメント分析
+- Bedrock失敗時: ルールベースNLPにフォールバック
 """
 import json
 import os
@@ -20,6 +20,10 @@ import boto3
 import traceback
 from decimal import Decimal
 from trading_common import TRADING_PAIRS, SENTIMENT_TABLE, dynamodb
+
+# Bedrock クライアント (LLMセンチメント分析用)
+bedrock = boto3.client('bedrock-runtime')
+BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'anthropic.claude-3-5-haiku-20241022-v1:0')
 
 CRYPTOPANIC_API_KEY = os.environ.get('CRYPTOPANIC_API_KEY', '')
 
@@ -55,7 +59,12 @@ def handler(event, context):
         market_news = fetch_news(currencies=None, limit=20)
         print(f"Successfully fetched {len(market_news)} market-wide articles")
 
-        # 3. 通貨別にセンチメント計算・保存
+        # 3. 投票不足記事のLLMセンチメント分析（バッチ）
+        all_articles = list({a.get('id'): a for a in currency_news + market_news}.values())
+        llm_scores = analyze_titles_with_llm(all_articles)
+        print(f"LLM sentiment: {len(llm_scores)} articles scored")
+
+        # 4. 通貨別にセンチメント計算・保存
         results = {}
         failed_pairs = []
         
@@ -101,7 +110,7 @@ def handler(event, context):
 
                 # センチメント分析
                 print(f"Analyzing sentiment for {pair} with {len(weighted_articles)} articles...")
-                score, fresh_count, stats = analyze_sentiment_weighted(weighted_articles)
+                score, fresh_count, stats = analyze_sentiment_weighted(weighted_articles, llm_scores)
                 
                 print(f"Saving sentiment for {pair}...")
                 save_sentiment(pair, timestamp, score, len(weighted_articles), fresh_count)
@@ -205,10 +214,118 @@ def fetch_news(currencies: str = None, limit: int = 50) -> list:
                 return []
 
 
-def analyze_sentiment_weighted(news: list) -> tuple:
-    """時間加重センチメント分析（投票信頼性考慮）"""
+def analyze_titles_with_llm(articles: list) -> dict:
+    """
+    投票不足の記事タイトルをAWS Bedrock (Claude 3.5 Haiku) でバッチ分析
+
+    投票が十分な記事はスキップし、投票不足の記事のみLLMに送信。
+    全記事を1回のAPI呼び出しでまとめて処理（コスト効率化）。
+
+    Returns: {article_id: float(0.0-1.0)} のdict。Bedrock失敗時は空dict
+    """
+    # 投票不足の記事のみ抽出
+    low_vote_articles = []
+    for article in articles:
+        votes = article.get('votes', {})
+        positive = votes.get('positive', 0) + votes.get('important', 0) * 1.5
+        negative = votes.get('negative', 0) + votes.get('toxic', 0) * 1.5
+        liked = votes.get('liked', 0)
+        disliked = votes.get('disliked', 0)
+        total_votes = positive + negative + liked + disliked
+        if total_votes < MIN_RELIABLE_VOTES:
+            article_id = article.get('id')
+            title = article.get('title', '').strip()
+            if article_id and title:
+                low_vote_articles.append({'id': article_id, 'title': title})
+
+    if not low_vote_articles:
+        print("No low-vote articles to analyze with LLM")
+        return {}
+
+    print(f"Analyzing {len(low_vote_articles)} low-vote articles with Bedrock LLM")
+
+    try:
+        # タイトルリストを構築（最大50件に制限）
+        titles_for_llm = low_vote_articles[:50]
+        titles_text = '\n'.join(
+            f'{i+1}. {a["title"]}' for i, a in enumerate(titles_for_llm)
+        )
+
+        prompt = f"""Analyze the sentiment of these crypto news article titles.
+For each title, provide a sentiment score from 0.0 (very bearish) to 1.0 (very bullish), with 0.5 being neutral.
+
+Consider:
+- Regulatory actions, bans, lawsuits → bearish
+- ETF approvals, institutional adoption, partnerships → bullish
+- Hacks, exploits, fraud → bearish
+- Price milestones, ATH, breakouts → bullish
+- "Buy the dip", whale accumulation → bullish despite negative words
+- Market uncertainty, FUD → mildly bearish
+- Neutral news (updates, releases without clear impact) → 0.5
+
+Titles:
+{titles_text}
+
+Respond with ONLY a JSON array of numbers in the same order. Example: [0.72, 0.35, 0.50]"""
+
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 256,
+            "temperature": 0.0,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ]
+        })
+
+        response = bedrock.invoke_model(
+            modelId=BEDROCK_MODEL_ID,
+            contentType='application/json',
+            accept='application/json',
+            body=body
+        )
+
+        result = json.loads(response['body'].read())
+        content = result.get('content', [{}])[0].get('text', '').strip()
+
+        # JSON配列をパース
+        # LLMが余分なテキストを返す場合に備えて、最初の [ ... ] を抽出
+        start = content.find('[')
+        end = content.rfind(']') + 1
+        if start >= 0 and end > start:
+            scores_list = json.loads(content[start:end])
+        else:
+            print(f"LLM response not valid JSON array: {content[:200]}")
+            return {}
+
+        # スコアを記事IDにマッピング
+        llm_scores = {}
+        for i, article in enumerate(titles_for_llm):
+            if i < len(scores_list):
+                score = float(scores_list[i])
+                # 0.0-1.0 にクランプ
+                score = max(0.0, min(1.0, score))
+                llm_scores[article['id']] = score
+
+        input_tokens = result.get('usage', {}).get('input_tokens', 0)
+        output_tokens = result.get('usage', {}).get('output_tokens', 0)
+        print(f"LLM sentiment analysis complete: {len(llm_scores)} scores "
+              f"(tokens: in={input_tokens}, out={output_tokens})")
+
+        return llm_scores
+
+    except Exception as e:
+        print(f"Bedrock LLM sentiment analysis failed, falling back to rule-based: {e}")
+        traceback.print_exc()
+        return {}
+
+
+def analyze_sentiment_weighted(news: list, llm_scores: dict = None) -> tuple:
+    """時間加重センチメント分析（投票信頼性考慮 + LLMフォールバック）"""
     if not news:
         return 0.5, 0, {}
+
+    if llm_scores is None:
+        llm_scores = {}
 
     current_time = time.time()
     total_weighted_score = 0
@@ -251,8 +368,12 @@ def analyze_sentiment_weighted(news: list) -> tuple:
                 article_score = 0.5 + (article_score - 0.5) * vote_confidence
             else:
                 vote_unreliable_count += 1
-                # 投票データ不足時はタイトルベースの簡易センチメント
-                article_score = estimate_sentiment_from_title(article.get('title', ''))
+                # 投票データ不足時はLLMスコアを優先、フォールバックでルールベースNLP
+                article_id = article.get('id')
+                if article_id and article_id in llm_scores:
+                    article_score = llm_scores[article_id]
+                else:
+                    article_score = estimate_sentiment_from_title(article.get('title', ''))
 
             # panic_score があれば補助的に使用
             # API v2: panic_score は 0〜100 の整数（市場重要度/インパクト）

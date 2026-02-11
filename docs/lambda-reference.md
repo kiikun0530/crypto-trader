@@ -25,6 +25,7 @@
 | `MODEL_PREFIX` | ONNXモデルのS3プレフィックス |
 | `CRYPTOPANIC_API_KEY` | CryptoPanic APIキー |
 | `MARKET_CONTEXT_TABLE` | マーケットコンテキストテーブル名 |
+| `BEDROCK_MODEL_ID` | Bedrock LLMモデルID (センチメント分析) |
 | `VOLATILITY_THRESHOLD` | 変動閾値（%） |
 | `MAX_POSITION_JPY` | 最大ポジション額（円） |
 
@@ -369,10 +370,11 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
 | 優先度 | 条件 | スコア決定方法 |
 |---|---|---|
 | 1 | 投票数 ≥ 5 | 賛否比率 × 信頼度係数 |
-| 2 | 投票数 < 5 | タイトルキーワード分析（強気/弱気語検出） |
+| 2 | 投票数 < 5 | AWS Bedrock (Claude 3.5 Haiku) によるLLMセンチメント分析 |
+| 3 | LLM失敗時 | ルールベースNLPフォールバック（キーワード分析） |
 | 補助 | `panic_score` 存在時 | ±0.10 の微調整（0=ネガ, 2=中立, 4=ポジ） |
 
-**タイトルキーワード分析**: surge, rally, breakout 等の強気語と crash, plunge, hack 等の弱気語を検出し、キーワード1つにつき±0.1（最大±0.3）をスコアに加算。
+**LLMセンチメント分析**: 投票不足の全記事タイトルをバッチで1回のAPI呼び出しで分析。暠定語や文脈を考慮した高精度なスコアを返す。コスト: ~$2/月。
 
 ---
 
@@ -617,7 +619,7 @@ DLQ滞留等のシステムアラートを Slack Webhook に転送。取引通�
 | トリガー | EventBridge (毎日 14:00 UTC = 23:00 JST) |
 | メモリ | 512MB |
 | タイムアウト | 120秒 |
-| DynamoDB | trades (R), signals (R), positions (R), market-context (R), improvements (R/W) |
+| DynamoDB | trades (R), signals (R), positions (R), market-context (R) |
 | S3 | daily-reports (W) |
 | 外部連携 | Slack Webhook |
 
@@ -637,7 +639,7 @@ DLQ滞留等のシステムアラートを Slack Webhook に転送。取引通�
 | 閾値変更幅 | 1回 ±0.03 以内 |
 | 変更頻度 | 直近2週間以内は効果測定のため変更控え |
 | 最低データ量 | 日次3件以上のトレード |
-| ロールバック | improvements テーブルにbefore/after記録 |
+
 
 ---
 

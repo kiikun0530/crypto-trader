@@ -112,7 +112,7 @@ locals {
       handler     = "handler.handler"
     }
     daily-reporter = {
-      description = "日次レポート生成 + 自動改善トリガー (23:00 JST)"
+      description = "日次レポート生成 (23:00 JST)"
       timeout     = 120
       memory      = 512
       handler     = "handler.handler"
@@ -138,7 +138,7 @@ locals {
     MODEL_BUCKET           = "${local.name_prefix}-sagemaker-models-${local.account_id}"
     MODEL_PREFIX           = "chronos-onnx"
     SAGEMAKER_ENDPOINT     = "${local.name_prefix}-chronos-base"
-    IMPROVEMENTS_TABLE     = aws_dynamodb_table.improvements.name
+    BEDROCK_MODEL_ID       = "anthropic.claude-3-5-haiku-20241022-v1:0"
     REPORT_BUCKET          = "${local.name_prefix}-daily-reports-${local.account_id}"
   }
 }

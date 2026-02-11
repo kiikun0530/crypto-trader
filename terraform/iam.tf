@@ -67,15 +67,13 @@ resource "aws_iam_role_policy" "lambda_custom" {
           aws_dynamodb_table.signals.arn,
           aws_dynamodb_table.analysis_state.arn,
           aws_dynamodb_table.market_context.arn,
-          aws_dynamodb_table.improvements.arn,
           "${aws_dynamodb_table.prices.arn}/index/*",
           "${aws_dynamodb_table.sentiment.arn}/index/*",
           "${aws_dynamodb_table.positions.arn}/index/*",
           "${aws_dynamodb_table.trades.arn}/index/*",
           "${aws_dynamodb_table.signals.arn}/index/*",
           "${aws_dynamodb_table.analysis_state.arn}/index/*",
-          "${aws_dynamodb_table.market_context.arn}/index/*",
-          "${aws_dynamodb_table.improvements.arn}/index/*"
+          "${aws_dynamodb_table.market_context.arn}/index/*"
         ]
       },
       # Secrets Managerアクセス
@@ -154,6 +152,16 @@ resource "aws_iam_role_policy" "lambda_custom" {
         Resource = [
           "arn:aws:s3:::${local.name_prefix}-daily-reports-${local.account_id}",
           "arn:aws:s3:::${local.name_prefix}-daily-reports-${local.account_id}/*"
+        ]
+      },
+      # Bedrock: LLMセンチメント分析 (news-collector)
+      {
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel"
+        ]
+        Resource = [
+          "arn:aws:bedrock:${var.aws_region}::foundation-model/anthropic.claude-*"
         ]
       }
     ]
