@@ -106,29 +106,6 @@ resource "aws_lambda_permission" "market_context" {
   source_arn    = aws_cloudwatch_event_rule.market_context.arn
 }
 
-# 分析トリガールール (価格収集Lambdaからのイベント)
-resource "aws_cloudwatch_event_rule" "analysis_trigger" {
-  name        = "${local.name_prefix}-analysis-trigger"
-  description = "Trigger analysis workflow based on price volatility"
-  state       = "ENABLED"
-
-  event_pattern = jsonencode({
-    source      = ["eth-trading.price-collector"]
-    detail-type = ["analysis-required"]
-  })
-
-  tags = {
-    Name = "${local.name_prefix}-analysis-trigger"
-  }
-}
-
-resource "aws_cloudwatch_event_target" "analysis_trigger" {
-  rule      = aws_cloudwatch_event_rule.analysis_trigger.name
-  target_id = "AnalysisWorkflow"
-  arn       = aws_sfn_state_machine.analysis_workflow.arn
-  role_arn  = aws_iam_role.eventbridge_execution.arn
-}
-
 # 日次レポート (毎日 23:00 JST = 14:00 UTC)
 resource "aws_cloudwatch_event_rule" "daily_reporter" {
   name                = "${local.name_prefix}-daily-reporter"

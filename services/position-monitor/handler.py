@@ -126,6 +126,13 @@ def handler(event, context):
                     notify_trailing_stop(config['name'], coincheck_pair,
                                        old_sl, new_sl, entry_price, current_price, highest_price)
 
+                    # トレーリングストップ引き上げ後のSL再チェック
+                    # 新SLが現在価格以上になった場合、次サイクル(5分後)を待たずに即売り
+                    if current_price <= stop_loss:
+                        result['action'] = 'TRAILING_STOP'
+                        trigger_sell(coincheck_pair, config['name'], 'trailing_stop',
+                                    current_price, entry_price)
+
                 # 利確判定（安全弁: +30%ハードTP）
                 # トレーリングストップが主な利確手段。TPは異常時の最終防衛線
                 if current_price >= take_profit:
@@ -174,7 +181,7 @@ def get_active_position(pair: str) -> dict:
             ':pair': pair,
         },
         ScanIndexForward=False,
-        Limit=5
+        Limit=10
     )
     items = response.get('Items', [])
     for item in items:

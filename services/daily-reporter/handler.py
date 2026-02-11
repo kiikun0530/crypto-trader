@@ -30,8 +30,8 @@ REPORT_BUCKET = os.environ.get('REPORT_BUCKET', 'eth-trading-daily-reports')
 SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL', '')
 TRADING_PAIRS_CONFIG = os.environ.get('TRADING_PAIRS_CONFIG', '{}')
 
-dynamodb = boto3.resource('dynamodb', region_name='ap-northeast-1')
-s3 = boto3.client('s3', region_name='ap-northeast-1')
+dynamodb = boto3.resource('dynamodb')
+s3 = boto3.client('s3')
 
 JST = timezone(timedelta(hours=9))
 
@@ -123,18 +123,23 @@ def fetch_trades(start_ts: int, end_ts: int, pairs: list, pair_map: dict) -> lis
     for pair in pairs:
         coincheck_pair = pair_map.get(pair, pair)
         try:
-            response = table.query(
-                KeyConditionExpression='pair = :p AND #ts BETWEEN :s AND :e',
-                ExpressionAttributeNames={'#ts': 'timestamp'},
-                ExpressionAttributeValues={
+            kwargs = {
+                'KeyConditionExpression': 'pair = :p AND #ts BETWEEN :s AND :e',
+                'ExpressionAttributeNames': {'#ts': 'timestamp'},
+                'ExpressionAttributeValues': {
                     ':p': coincheck_pair,
                     ':s': start_ts,
                     ':e': end_ts
                 }
-            )
-            for item in response.get('Items', []):
-                item['_analysis_pair'] = pair
-                all_trades.append(item)
+            }
+            while True:
+                response = table.query(**kwargs)
+                for item in response.get('Items', []):
+                    item['_analysis_pair'] = pair
+                    all_trades.append(item)
+                if 'LastEvaluatedKey' not in response:
+                    break
+                kwargs['ExclusiveStartKey'] = response['LastEvaluatedKey']
         except Exception as e:
             print(f"Error querying trades for {coincheck_pair}: {e}")
     return sorted(all_trades, key=lambda x: float(x.get('timestamp', 0)))
@@ -146,23 +151,33 @@ def fetch_signals(start_ts: int, end_ts: int, pairs: list) -> list:
     all_signals = []
     for pair in pairs:
         try:
-            response = table.query(
-                KeyConditionExpression='pair = :p AND #ts BETWEEN :s AND :e',
-                ExpressionAttributeNames={'#ts': 'timestamp'},
-                ExpressionAttributeValues={
+            kwargs = {
+                'KeyConditionExpression': 'pair = :p AND #ts BETWEEN :s AND :e',
+                'ExpressionAttributeNames': {'#ts': 'timestamp'},
+                'ExpressionAttributeValues': {
                     ':p': pair,
                     ':s': start_ts,
                     ':e': end_ts
                 }
-            )
-            all_signals.extend(response.get('Items', []))
+            }
+            while True:
+                response = table.query(**kwargs)
+                all_signals.extend(response.get('Items', []))
+                if 'LastEvaluatedKey' not in response:
+                    break
+                kwargs['ExclusiveStartKey'] = response['LastEvaluatedKey']
         except Exception as e:
             print(f"Error querying signals for {pair}: {e}")
     return all_signals
 
 
 def fetch_positions(pairs: list, pair_map: dict) -> list:
-    """アクティブポジション取得"""
+    """アクティブポジション取得
+    
+    注意: DynamoDBのLimit+FilterExpressionの仕様上、Limitはフィルタ前に適用される。
+    FilterExpressionだけだと全ポジション（open+closed）を読み取ってしまう。
+    → Limit=10でフェッチしPython側でフィルタリング。
+    """
     table = dynamodb.Table(POSITIONS_TABLE)
     active = []
     for pair in pairs:
@@ -170,13 +185,15 @@ def fetch_positions(pairs: list, pair_map: dict) -> list:
         try:
             response = table.query(
                 KeyConditionExpression='pair = :p',
-                FilterExpression='closed = :f',
                 ExpressionAttributeValues={
                     ':p': coincheck_pair,
-                    ':f': False
-                }
+                },
+                ScanIndexForward=False,
+                Limit=10
             )
-            active.extend(response.get('Items', []))
+            for item in response.get('Items', []):
+                if not item.get('closed'):
+                    active.append(item)
         except Exception as e:
             print(f"Error querying positions for {coincheck_pair}: {e}")
     return active
@@ -188,7 +205,7 @@ def fetch_market_context() -> dict:
     try:
         response = table.query(
             KeyConditionExpression='context_type = :ct',
-            ExpressionAttributeValues={':ct': 'market_context'},
+            ExpressionAttributeValues={':ct': 'global'},
             ScanIndexForward=False,
             Limit=1
         )
@@ -200,13 +217,19 @@ def fetch_market_context() -> dict:
 
 
 def fetch_improvements(since_ts: int) -> list:
-    """直近の自動改善履歴"""
+    """直近の自動改善履歴
+    
+    improvement_id がハッシュキーのためscanが必要だが、
+    TTLで古いアイテムは自動削除されるためデータ量は限定的。
+    Limit=50で安全マージンを確保。
+    """
     table = dynamodb.Table(IMPROVEMENTS_TABLE)
     try:
         response = table.scan(
             FilterExpression='#ts > :s',
             ExpressionAttributeNames={'#ts': 'timestamp'},
-            ExpressionAttributeValues={':s': since_ts}
+            ExpressionAttributeValues={':s': since_ts},
+            Limit=50
         )
         return sorted(response.get('Items', []),
                        key=lambda x: float(x.get('timestamp', 0)),
@@ -554,18 +577,13 @@ def build_market_summary(ctx: dict) -> dict:
     if not ctx:
         return {'available': False}
 
-    components = ctx.get('components', {})
-    fg = components.get('fear_greed', {})
-    funding = components.get('funding_rate', {})
-    dom = components.get('btc_dominance', {})
-
     return {
         'available': True,
         'market_score': float(ctx.get('market_score', 0)),
-        'fear_greed_value': int(fg.get('value', 50)),
-        'fear_greed_class': str(fg.get('classification', 'N/A')),
-        'funding_avg': float(funding.get('avg_rate', 0)),
-        'btc_dominance': float(dom.get('value', 50)),
+        'fear_greed_value': int(ctx.get('fng_value', 50)),
+        'fear_greed_class': str(ctx.get('fng_classification', 'N/A')),
+        'funding_avg': float(ctx.get('avg_funding_rate', 0)),
+        'btc_dominance': float(ctx.get('btc_dominance', 50)),
         'timestamp': int(float(ctx.get('timestamp', 0))),
     }
 

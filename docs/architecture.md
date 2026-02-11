@@ -309,8 +309,8 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
                                             └→ Slack通知（エラー内容）
 ```
 
-- **CloudWatch Alarms (24個)**: 全12 Lambda × (Errors + Duration) で異常検知
-- **Subscription Filters (11個)**: warm-up以外の全Lambdaのエラーログを検知
+- **CloudWatch Alarms (23個)**: 全11 Lambda × (Errors + Duration) + DLQアラーム で異常検知
+- **Subscription Filters (10個)**: warm-up以外の全Lambdaのエラーログを検知
   - フィルターパターン: `?"[ERROR]" ?Traceback ?"raise Exception" -"[INFO]" -"expected behavior" -"retrying in"`
   - SageMaker Serverless の想定内リトライログ（ThrottlingException → 自動リカバリ）を除外
 - **error-remediator Lambda**: エラー検知 → Slack通知（30分クールダウン付き）
@@ -353,7 +353,7 @@ EventBridge (23:00 JST) → daily-reporter Lambda
 | trades | pair (S) | timestamp (N) | 90日 | 取引履歴 |
 | analysis_state | pair (S) | - | - | 通貨別の最終分析時刻 |
 | market-context | context_type (S) | timestamp (N) | 14日 | マクロ市場環境指標 |
-| improvements | improvement_id (S) | - | 180日 | 自動改善履歴 (Phase 4) |
+| improvements | improvement_id (S) | timestamp (N) | 180日 | 自動改善履歴 (Phase 4) |
 
 ### TTL 設計の根拠
 
@@ -375,8 +375,6 @@ EventBridge (23:00 JST) → daily-reporter Lambda
 |---|---|---|
 | AWS認証 | IAMロール | Lambda実行ロールで自動付与 |
 | Coincheck API | Secrets Manager | 取引に直結するため厳重管理 |
-| GitHub PAT | Secrets Manager | 自動修復パイプライン用（repo権限） |
-| Anthropic API | GitHub Secrets | 自動修復パイプライン用 |
 | CryptoPanic API | Lambda環境変数 | 読み取り専用、リスク低 |
 | Slack Webhook | Lambda環境変数 | 読み取り専用、リスク低 |
 
@@ -393,8 +391,8 @@ IAM ロールは最小権限原則で設計。各 Lambda は必要な DynamoDB �
 | Lambda | ~$5.00 | 6通貨分析 + ONNX推論 + error-remediator + daily-reporter含む |
 | DynamoDB | ~$0.35 | 8テーブル×6通貨分のR/W + クールダウン + improvements |
 | Step Functions | ~$0.10 | Map State で遷移数増加 |
-| CloudWatch | ~$0.55 | ログ保存14日 + Metric Alarms 20個 + Subscription Filters |
-| Secrets Manager | ~$0.50 | Coincheck + GitHub PAT |
+| CloudWatch | ~$0.55 | ログ保存14日 + Metric Alarms 23個 + Subscription Filters |
+| Secrets Manager | ~$0.50 | Coincheck APIキー |
 | SQS/SNS/EventBridge | ~$0.05 | 軽微 |
 | **AWS合計** | **~$7/月** | |
 
@@ -407,7 +405,6 @@ IAM ロールは最小権限原則で設計。各 Lambda は必要な DynamoDB �
 | CoinGecko | 無料 | BTC Dominance |
 | CryptoPanic | 無料 or $199/月 | Growth Plan でリアルタイム取得 |
 | Coincheck | 0% | 取引手数料無料 |
-| Anthropic | 従量制 | 自動修復パイプライン (~$0.01-0.03/修復) |
 
 ### 総コスト
 

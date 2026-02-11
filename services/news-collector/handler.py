@@ -99,10 +99,12 @@ def handler(event, context):
                         seen_ids.add(article.get('id'))
 
                 for article in market_news:
-                    a = dict(article)
-                    a['_currency_weight'] = MARKET_NEWS_WEIGHT
-                    a['_source_currency'] = 'ALL'
-                    weighted_articles.append(a)
+                    if article.get('id') not in seen_ids:
+                        a = dict(article)
+                        a['_currency_weight'] = MARKET_NEWS_WEIGHT
+                        a['_source_currency'] = 'ALL'
+                        weighted_articles.append(a)
+                        seen_ids.add(article.get('id'))
 
                 # センチメント分析
                 print(f"Analyzing sentiment for {pair} with {len(weighted_articles)} articles...")

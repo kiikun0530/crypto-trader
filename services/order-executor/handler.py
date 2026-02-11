@@ -40,6 +40,9 @@ from decimal import Decimal
 dynamodb = boto3.resource('dynamodb')
 secrets = boto3.client('secretsmanager')
 
+# Secrets Manager キャッシュ（Lambda実行中に再利用）
+_cached_credentials = None
+
 POSITIONS_TABLE = os.environ.get('POSITIONS_TABLE', 'eth-trading-positions')
 TRADES_TABLE = os.environ.get('TRADES_TABLE', 'eth-trading-trades')
 SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL', '')
@@ -119,11 +122,25 @@ def get_currency_name(pair: str) -> str:
 # execute_buy()成功時にペアを追加、process_order()のSELL分岐でチェック
 _just_bought_pairs = set()
 
+# トレード統計・サーキットブレーカーのキャッシュ（同一Lambda実行内で再利用）
+# BUY毎にpositionsテーブルのフルスキャンを避けるため
+_cached_trade_stats = None
+_cached_trade_stats_time = 0
+_cached_circuit_breaker = None
+_cached_circuit_breaker_time = 0
+STATS_CACHE_TTL = 300  # 5分（position-monitorと同じ間隔）
+
 
 def handler(event, context):
     """注文実行"""
     global _just_bought_pairs
+    global _cached_trade_stats, _cached_trade_stats_time
+    global _cached_circuit_breaker, _cached_circuit_breaker_time
     _just_bought_pairs = set()
+    _cached_trade_stats = None
+    _cached_trade_stats_time = 0
+    _cached_circuit_breaker = None
+    _cached_circuit_breaker_time = 0
     errors = []
 
     for record in event.get('Records', []):
@@ -213,38 +230,12 @@ def get_position(pair: str) -> dict:
         KeyConditionExpression='pair = :pair',
         ExpressionAttributeValues={':pair': pair},
         ScanIndexForward=False,
-        Limit=5
+        Limit=10
     )
     items = response.get('Items', [])
     for item in items:
         if not item.get('closed'):
             return item
-    return None
-
-
-def check_any_other_position(exclude_pair: str) -> dict:
-    """指定ペア以外にアクティブポジションがないかチェック"""
-    table = dynamodb.Table(POSITIONS_TABLE)
-
-    for config in TRADING_PAIRS.values():
-        coincheck_pair = config['coincheck']
-        if coincheck_pair == exclude_pair:
-            continue
-
-        try:
-            response = table.query(
-                KeyConditionExpression='pair = :pair',
-                ExpressionAttributeValues={':pair': coincheck_pair},
-                ScanIndexForward=False,
-                Limit=5
-            )
-            items = response.get('Items', [])
-            for item in items:
-                if not item.get('closed'):
-                    return item
-        except Exception as e:
-            print(f"Error checking position for {coincheck_pair}: {e}")
-
     return None
 
 
@@ -283,6 +274,7 @@ def get_trade_statistics() -> dict:
     """
     過去90日間のクローズ済みポジションから勝率・平均損益率を計算
     Kelly Criterion の入力パラメータを生成
+    キャッシュ有効期間内は再計算せず前回結果を返す（フルスキャン回避）
 
     Returns:
         {
@@ -294,6 +286,11 @@ def get_trade_statistics() -> dict:
             'n_losses': int,
         }
     """
+    global _cached_trade_stats, _cached_trade_stats_time
+    now = int(time.time())
+    if _cached_trade_stats is not None and (now - _cached_trade_stats_time) < STATS_CACHE_TTL:
+        print(f"Using cached trade statistics (age: {now - _cached_trade_stats_time}s)")
+        return _cached_trade_stats
     try:
         table = dynamodb.Table(POSITIONS_TABLE)
         now = int(time.time())
@@ -303,30 +300,38 @@ def get_trade_statistics() -> dict:
         for config in TRADING_PAIRS.values():
             coincheck_pair = config['coincheck']
             try:
-                response = table.query(
-                    KeyConditionExpression='pair = :pair',
-                    ExpressionAttributeValues={':pair': coincheck_pair}
-                )
-                items = response.get('Items', [])
-                for item in items:
-                    if item.get('closed') and item.get('exit_time') and item.get('exit_price'):
-                        exit_time = int(item.get('exit_time', 0))
-                        if exit_time > cutoff:
-                            entry_price = float(item.get('entry_price', 0))
-                            exit_price = float(item.get('exit_price', 0))
-                            if entry_price > 0:
-                                pnl_pct = (exit_price - entry_price) / entry_price * 100
-                                closed_positions.append(pnl_pct)
+                kwargs = {
+                    'KeyConditionExpression': 'pair = :pair',
+                    'ExpressionAttributeValues': {':pair': coincheck_pair}
+                }
+                while True:
+                    response = table.query(**kwargs)
+                    items = response.get('Items', [])
+                    for item in items:
+                        if item.get('closed') and item.get('exit_time') and item.get('exit_price'):
+                            exit_time = int(item.get('exit_time', 0))
+                            if exit_time > cutoff:
+                                entry_price = float(item.get('entry_price', 0))
+                                exit_price = float(item.get('exit_price', 0))
+                                if entry_price > 0:
+                                    pnl_pct = (exit_price - entry_price) / entry_price * 100
+                                    closed_positions.append(pnl_pct)
+                    if 'LastEvaluatedKey' not in response:
+                        break
+                    kwargs['ExclusiveStartKey'] = response['LastEvaluatedKey']
             except Exception as e:
                 print(f"Trade stats: error querying {coincheck_pair}: {e}")
 
         if not closed_positions:
-            return {'total_trades': 0}
+            result = {'total_trades': 0}
+            _cached_trade_stats = result
+            _cached_trade_stats_time = now
+            return result
 
         wins = [p for p in closed_positions if p > 0]
         losses = [abs(p) for p in closed_positions if p <= 0]
 
-        return {
+        result = {
             'total_trades': len(closed_positions),
             'win_rate': len(wins) / len(closed_positions),
             'avg_win_pct': sum(wins) / len(wins) if wins else 0,
@@ -334,6 +339,9 @@ def get_trade_statistics() -> dict:
             'n_wins': len(wins),
             'n_losses': len(losses),
         }
+        _cached_trade_stats = result
+        _cached_trade_stats_time = now
+        return result
     except Exception as e:
         print(f"Error getting trade statistics: {e}")
         return {'total_trades': 0}
@@ -787,13 +795,18 @@ def check_spread(pair: str) -> float:
 
 
 def get_api_credentials() -> dict:
-    """Secrets Managerからクレデンシャル取得"""
+    """Secrets Managerからクレデンシャル取得（Lambda実行中はキャッシュ）"""
+    global _cached_credentials
+    if _cached_credentials:
+        return _cached_credentials
+
     if not COINCHECK_SECRET_ARN:
         return None
 
     try:
         response = secrets.get_secret_value(SecretId=COINCHECK_SECRET_ARN)
-        return json.loads(response['SecretString'])
+        _cached_credentials = json.loads(response['SecretString'])
+        return _cached_credentials
     except Exception as e:
         print(f"Failed to get API credentials: {e}")
         return None
@@ -1015,7 +1028,15 @@ def save_position(pair: str, timestamp: int, side: str, result: dict, order_amou
         rate = 0
 
     if amount <= 0 or rate <= 0:
-        print(f"WARNING: Saving position with incomplete fill data: amount={amount}, rate={rate}")
+        print(f"CRITICAL: Fill取得失敗 - ポジション保存をスキップ: amount={amount}, rate={rate}")
+        send_notification(
+            'System',
+            f"⚠️ Fill取得失敗 - ポジション未保存\n"
+            f"pair: {pair}, timestamp: {timestamp}\n"
+            f"amount: {amount}, rate: {rate}\n"
+            f"手動でCoincheck残高を確認してください"
+        )
+        return
 
     table.put_item(Item={
         'pair': pair,
@@ -1107,6 +1128,7 @@ def save_trade(pair: str, timestamp: int, action: str, result: dict,
 def check_circuit_breaker() -> tuple:
     """
     サーキットブレーカー判定
+    キャッシュ有効期間内は再計算せず前回結果を返す（フルスキャン回避）
 
     2つの条件のいずれかでトリップ:
     1. 日次累計損失が CB_DAILY_LOSS_LIMIT_JPY を超過
@@ -1115,6 +1137,11 @@ def check_circuit_breaker() -> tuple:
     Returns:
         (tripped: bool, reason: str)
     """
+    global _cached_circuit_breaker, _cached_circuit_breaker_time
+    now_check = int(time.time())
+    if _cached_circuit_breaker is not None and (now_check - _cached_circuit_breaker_time) < STATS_CACHE_TTL:
+        print(f"Using cached circuit breaker result (age: {now_check - _cached_circuit_breaker_time}s)")
+        return _cached_circuit_breaker
     try:
         table = dynamodb.Table(POSITIONS_TABLE)
         now = int(time.time())
@@ -1126,28 +1153,35 @@ def check_circuit_breaker() -> tuple:
         for config in TRADING_PAIRS.values():
             coincheck_pair = config['coincheck']
             try:
-                response = table.query(
-                    KeyConditionExpression='pair = :pair',
-                    ExpressionAttributeValues={':pair': coincheck_pair}
-                )
-                items = response.get('Items', [])
-                for item in items:
-                    if item.get('closed') and item.get('exit_time') and item.get('exit_price'):
-                        exit_time = int(item.get('exit_time', 0))
-                        if exit_time > today_start:
-                            entry_price = float(item.get('entry_price', 0))
-                            exit_price = float(item.get('exit_price', 0))
-                            amount = float(item.get('amount', 0))
-                            pnl = (exit_price - entry_price) * amount
-                            closed_positions.append({
-                                'exit_time': exit_time,
-                                'pnl': pnl,
-                                'pair': coincheck_pair
-                            })
+                kwargs = {
+                    'KeyConditionExpression': 'pair = :pair',
+                    'ExpressionAttributeValues': {':pair': coincheck_pair}
+                }
+                while True:
+                    response = table.query(**kwargs)
+                    items = response.get('Items', [])
+                    for item in items:
+                        if item.get('closed') and item.get('exit_time') and item.get('exit_price'):
+                            exit_time = int(item.get('exit_time', 0))
+                            if exit_time > today_start:
+                                entry_price = float(item.get('entry_price', 0))
+                                exit_price = float(item.get('exit_price', 0))
+                                amount = float(item.get('amount', 0))
+                                pnl = (exit_price - entry_price) * amount
+                                closed_positions.append({
+                                    'exit_time': exit_time,
+                                    'pnl': pnl,
+                                    'pair': coincheck_pair
+                                })
+                    if 'LastEvaluatedKey' not in response:
+                        break
+                    kwargs['ExclusiveStartKey'] = response['LastEvaluatedKey']
             except Exception as e:
                 print(f"Circuit breaker: error querying {coincheck_pair}: {e}")
 
         if not closed_positions:
+            _cached_circuit_breaker = (False, "")
+            _cached_circuit_breaker_time = now_check
             return False, ""
 
         # 時系列ソート（古い順）
@@ -1156,10 +1190,13 @@ def check_circuit_breaker() -> tuple:
         # --- 条件1: 日次累計損失チェック ---
         daily_pnl = sum(p['pnl'] for p in closed_positions)
         if daily_pnl < -CB_DAILY_LOSS_LIMIT_JPY:
-            return True, (
+            result = (True, (
                 f"日次累計損失 ¥{daily_pnl:,.0f} が上限 -¥{CB_DAILY_LOSS_LIMIT_JPY:,.0f} を超過 "
                 f"(24h内 {len(closed_positions)}件)"
-            )
+            ))
+            _cached_circuit_breaker = result
+            _cached_circuit_breaker_time = now_check
+            return result
 
         # --- 条件2: 連敗回数チェック ---
         consecutive_losses = 0
@@ -1170,9 +1207,12 @@ def check_circuit_breaker() -> tuple:
                 break
 
         if consecutive_losses >= CB_MAX_CONSECUTIVE_LOSSES:
-            return True, (
+            result = (True, (
                 f"連敗 {consecutive_losses}回 が上限 {CB_MAX_CONSECUTIVE_LOSSES}回 に到達"
-            )
+            ))
+            _cached_circuit_breaker = result
+            _cached_circuit_breaker_time = now_check
+            return result
 
         # --- 冷却期間チェック ---
         # 前回トリップ条件を満たした直後の再開を防ぐ
@@ -1184,12 +1224,17 @@ def check_circuit_breaker() -> tuple:
             elapsed = now - last_loss_time
             if elapsed < cooldown_sec:
                 remaining_min = (cooldown_sec - elapsed) / 60
-                return True, (
+                result = (True, (
                     f"冷却期間中 (連敗{consecutive_losses}回後、残り{remaining_min:.0f}分)"
-                )
+                ))
+                _cached_circuit_breaker = result
+                _cached_circuit_breaker_time = now_check
+                return result
 
         print(f"Circuit breaker: OK (daily_pnl=¥{daily_pnl:,.0f}, "
               f"consecutive_losses={consecutive_losses})")
+        _cached_circuit_breaker = (False, "")
+        _cached_circuit_breaker_time = now_check
         return False, ""
 
     except Exception as e:

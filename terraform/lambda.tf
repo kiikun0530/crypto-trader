@@ -83,7 +83,7 @@ locals {
     }
     order-executor = {
       description = "注文実行"
-      timeout     = 30
+      timeout     = 60
       memory      = 256
       handler     = "handler.handler"
     }

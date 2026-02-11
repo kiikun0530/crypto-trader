@@ -464,7 +464,7 @@ SQSから注文メッセージを受信し、Coincheck APIで成行注文を実�
 |---|---|
 | トリガー | SQS (order-queue, batch=1) |
 | メモリ | 256MB |
-| タイムアウト | 30秒 |
+| タイムアウト | 60秒 |
 | DynamoDB | positions (R/W), trades (W) |
 | 外部API | Coincheck |
 
@@ -531,7 +531,7 @@ Coincheck 取引所の通貨別最小注文数量・小数点以下桁数に基�
    - 3%以上到達後は必ず建値以上を保証
 5. SL/TP 判定:
    - 現在価格 <= ストップロス(参入-5%、またはトレーリングSL) → 売り指示
-   - 現在価格 >= テイクプロフィット(参入+10%) → 売り指示
+   - 現在価格 >= テイクプロフィット(参入+30%) → 売り指示
 6. 売り指示は SQS 経由で order-executor に送信
 
 ---
@@ -572,7 +572,7 @@ CloudWatch Logs のエラーパターンを検知し、Slack通知を送信。
 | トリガー | CloudWatch Subscription Filter (8 Lambda) |
 | メモリ | 256MB |
 | タイムアウト | 30秒 |
-| DynamoDB | error-remediator-cooldown (R/W) |
+| DynamoDB | analysis-state (R/W) |
 | 外部API | Slack Webhook |
 
 ### 処理フロー
@@ -666,7 +666,7 @@ DLQ滞留等のシステムアラートを Slack Webhook に転送。取引通�
 | API | エンドポイント | 取得データ | コスト |
 |---|---|---|---|
 | Alternative.me | `api.alternative.me/fng/` | Fear & Greed Index (0-100) | 無料 |
-| Binance Futures | `fapi.binance.com/fapi/v1/premiumIndex` | ファンディングレート | 無料 |
+| Binance Futures | `fapi.binance.com/fapi/v1/fundingRate` | ファンディングレート | 無料 |
 | CoinGecko | `api.coingecko.com/api/v3/global` | BTC Dominance (%) | 無料 |
 
 ### スコア計算
@@ -685,14 +685,16 @@ market_score = fng_score × 0.50 + funding_score × 0.30 + dominance_score × 0.
 
 ```json
 {
-  "context_type": "market_context",
+  "context_type": "global",
   "timestamp": 1770523800,
   "market_score": 0.1468,
-  "components": {
-    "fear_greed": {"value": 14, "classification": "Extreme Fear", "score": 0.397},
-    "funding_rate": {"symbols": ["BTCUSDT", "ETHUSDT", ...], "avg_rate": -0.000066, "score": 0.133},
-    "btc_dominance": {"value": 56.86, "score": -0.457}
-  },
+  "fng_value": 14,
+  "fng_classification": "Extreme Fear",
+  "fng_score": 0.397,
+  "funding_score": 0.133,
+  "dominance_score": -0.457,
+  "avg_funding_rate": -0.000066,
+  "btc_dominance": 56.86,
   "ttl": 1771733400
 }
 ```

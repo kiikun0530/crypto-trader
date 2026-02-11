@@ -27,7 +27,7 @@ def handler(event, context):
         if len(prices) < 50:
             return {
                 'pair': pair,
-                'technical_score': 0.5,
+                'technical_score': 0.0,
                 'indicators': {},
                 'reason': 'insufficient_data',
                 'data_count': len(prices),
@@ -113,7 +113,7 @@ def handler(event, context):
         print(f"Error: {str(e)}")
         return {
             'pair': pair,
-            'technical_score': 0.5,
+            'technical_score': 0.0,
             'error': str(e),
             'current_price': 0
         }

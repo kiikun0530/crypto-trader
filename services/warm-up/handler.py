@@ -29,7 +29,13 @@ def handler(event, context):
     target_pair = event.get('pair', None)
 
     if target_pair:
-        pairs_to_warmup = {target_pair: TRADING_PAIRS[target_pair]}
+        pair_config = TRADING_PAIRS.get(target_pair)
+        if not pair_config:
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'error': f'Unknown pair: {target_pair}', 'available': list(TRADING_PAIRS.keys())})
+            }
+        pairs_to_warmup = {target_pair: pair_config}
     else:
         pairs_to_warmup = TRADING_PAIRS
 

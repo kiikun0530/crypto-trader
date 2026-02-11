@@ -15,7 +15,7 @@ variable "environment" {
 }
 
 variable "trading_pair" {
-  description = "Trading pair (e.g., eth_jpy)"
+  description = "Trading pair (e.g., eth_jpy) [DEPRECATED - use trading_pairs_config]"
   type        = string
   default     = "eth_jpy"
 }
@@ -29,49 +29,10 @@ variable "volatility_threshold" {
   default     = 0.3
 }
 
-variable "analysis_interval_minutes" {
-  description = "Regular analysis interval in minutes"
-  type        = number
-  default     = 15
-}
-
 variable "max_position_jpy" {
   description = "Maximum position size in JPY"
   type        = number
   default     = 15000
-}
-
-variable "stop_loss_percent" {
-  description = "Stop loss percentage"
-  type        = number
-  default     = 5
-}
-
-variable "take_profit_percent" {
-  description = "Take profit percentage"
-  type        = number
-  default     = 10
-}
-
-# ============================================
-# DynamoDB TTL Settings
-# ============================================
-variable "prices_ttl_days" {
-  description = "TTL for prices table in days"
-  type        = number
-  default     = 7
-}
-
-variable "sentiment_ttl_days" {
-  description = "TTL for sentiment table in days"
-  type        = number
-  default     = 7
-}
-
-variable "signals_ttl_days" {
-  description = "TTL for signals table in days"
-  type        = number
-  default     = 30
 }
 
 # ============================================

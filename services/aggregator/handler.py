@@ -542,7 +542,7 @@ def find_all_active_positions() -> list:
                 KeyConditionExpression='pair = :pair',
                 ExpressionAttributeValues={':pair': coincheck_pair},
                 ScanIndexForward=False,
-                Limit=5
+                Limit=10
             )
             items = response.get('Items', [])
             for item in items:

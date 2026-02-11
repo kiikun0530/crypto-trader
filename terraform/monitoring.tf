@@ -121,6 +121,7 @@ resource "aws_lambda_function" "error_remediator" {
     variables = {
       SLACK_WEBHOOK_URL        = var.slack_webhook_url
       COOLDOWN_MINUTES         = "30"
+      ANALYSIS_STATE_TABLE     = aws_dynamodb_table.analysis_state.name
     }
   }
 

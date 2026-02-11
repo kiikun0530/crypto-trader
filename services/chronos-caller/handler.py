@@ -44,7 +44,6 @@ INPUT_LENGTH = int(os.environ.get('INPUT_LENGTH', '336'))  # 336 × 5min = 28h (
 
 # スコアリング設定
 SCORE_SCALE_PERCENT = 3.0    # ±3%変動で±1.0 (旧: ±1%で飽和していた)
-OUTLIER_PERCENTILE = 10      # 上下10%をカットして外れ値除去
 
 # リトライ設定 (SageMaker Serverlessは冷起動に時間がかかるため長めに設定)
 MAX_RETRIES = 5

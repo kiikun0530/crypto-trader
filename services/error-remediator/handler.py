@@ -120,7 +120,7 @@ def extract_function_name(log_group: str) -> str:
     """ロググループ名からLambda関数名の短縮名を抽出
     例: /aws/lambda/eth-trading-order-executor → order-executor
     """
-    prefix = '/aws/lambda/eth-trading-'
+    prefix = os.environ.get('LAMBDA_PREFIX', '/aws/lambda/eth-trading-')
     if log_group.startswith(prefix):
         return log_group[len(prefix):]
     # フルネームにフォールバック
@@ -159,13 +159,13 @@ def is_in_cooldown(function_name: str) -> bool:
     try:
         table = dynamodb.Table(COOLDOWN_TABLE)
         result = table.get_item(
-            Key={'key': f'error-cooldown-{function_name}'}
+            Key={'pair': f'error-cooldown-{function_name}'}
         )
         item = result.get('Item')
         if not item:
             return False
 
-        last_triggered = int(item.get('value', 0))
+        last_triggered = int(item.get('last_triggered', 0))
         now = int(time.time())
         return (now - last_triggered) < (COOLDOWN_MINUTES * 60)
     except Exception as e:
@@ -176,12 +176,14 @@ def is_in_cooldown(function_name: str) -> bool:
 def set_cooldown(function_name: str):
     """クールダウンを設定"""
     try:
+        now = int(time.time())
         table = dynamodb.Table(COOLDOWN_TABLE)
         table.put_item(Item={
-            'key': f'error-cooldown-{function_name}',
-            'value': str(int(time.time())),
+            'pair': f'error-cooldown-{function_name}',
+            'last_triggered': now,
             'function': function_name,
-            'type': 'error-cooldown'
+            'type': 'error-cooldown',
+            'ttl': now + 86400  # 24時間後に自動削除
         })
     except Exception as e:
         print(f"Failed to set cooldown: {e}")
