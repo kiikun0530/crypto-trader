@@ -137,8 +137,6 @@ def handler(event, context):
         if failed_pairs:
             print(f"Failed pairs: {failed_pairs}")
 
-        update_pipeline_status('news_collector', 'completed', f'{len(results)}\u901a\u8ca8\u5206\u6790\u5b8c\u4e86')
-
         return {
             'statusCode': 200,
             'body': json.dumps({
