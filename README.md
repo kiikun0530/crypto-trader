@@ -242,15 +242,11 @@ aws logs tail /aws/lambda/eth-trading-price-collector --since 5m
 
 ```
 CloudWatch Logs → Subscription Filter → error-remediator Lambda
-                                            ├→ Slack通知（エラー内容）
-                                            └→ GitHub Actions (repository_dispatch)
-                                                  └→ Claude Sonnet でエラー分析
-                                                        └→ コード修正 → デプロイ → 検証
+                                            └→ Slack通知（エラー内容）
 ```
 
-- エラー検知から修正・デプロイまで完全自動化
+- エラー検知からSlack通知まで自動化
 - 同一関数のエラーは30分間隔でクールダウン
-- Anthropic API (~$0.01-0.03/修復) でコスト効率的
 
 ## スコアベースの投資ロジック
 
@@ -289,9 +285,6 @@ python -c "from handler import handler; print(handler({}, None))"
 
 ```
 crypto-trader/
-├── .github/
-│   └── workflows/
-│       └── auto-fix-errors.yml  # Claude自動修復パイプライン
 ├── terraform/           # Terraform IaC
 │   ├── main.tf
 │   ├── lambda.tf

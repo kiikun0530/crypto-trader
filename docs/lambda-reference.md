@@ -565,7 +565,7 @@ aws lambda invoke --function-name eth-trading-warm-up \
 
 ## error-remediator
 
-CloudWatch Logs のエラーパターンを検知し、Slack通知 + GitHub Actions 自動修復パイプラインをトリガー。
+CloudWatch Logs のエラーパターンを検知し、Slack通知を送信。
 
 | 項目 | 値 |
 |---|---|
@@ -573,7 +573,7 @@ CloudWatch Logs のエラーパターンを検知し、Slack通知 + GitHub Acti
 | メモリ | 256MB |
 | タイムアウト | 30秒 |
 | DynamoDB | error-remediator-cooldown (R/W) |
-| 外部API | Slack Webhook, GitHub API |
+| 外部API | Slack Webhook |
 
 ### 処理フロー
 
@@ -581,8 +581,6 @@ CloudWatch Logs のエラーパターンを検知し、Slack通知 + GitHub Acti
 2. Base64 + gzip デコードしてエラーメッセージを抽出
 3. DynamoDB でクールダウン確認（同一関数は30分間隔）
 4. Slack にエラー内容を即座に通知
-5. GitHub API で `repository_dispatch` イベントを送信
-6. GitHub Actions が Claude AI でエラー分析 → コード修正 → デプロイ → 検証
 
 ### クールダウン
 
@@ -592,18 +590,7 @@ CloudWatch Logs のエラーパターンを検知し、Slack通知 + GitHub Acti
 | スコープ | Lambda関数ごと |
 | 保存先 | DynamoDB (TTL: 24時間) |
 
-同一関数のエラーが30分以内に再発した場合は、重複トリガーを防止してスキップ。
-
-### GitHub Actions 連携
-
-```
-error-remediator → GitHub API (repository_dispatch)
-                      → auto-fix-errors.yml ワークフロー
-                          → Claude Sonnet でエラー分析
-                          → コード修正 → デプロイ → 検証
-                          → 成功時: git push + Slack通知
-                          → 失敗時: Slack通知のみ
-```
+同一関数のエラーが30分以内に再発した場合は、重複通知を防止してスキップ。
 
 ---
 
@@ -623,7 +610,7 @@ DLQ滞留等のシステムアラートを Slack Webhook に転送。取引通�
 
 ## daily-reporter (Phase 4 新設)
 
-毎日 23:00 JST に実行。1日の取引・シグナル・市場データを集計し、S3保存 + Slack通知 + GitHub Actions 自動改善トリガー。
+毎日 23:00 JST に実行。1日の取引・シグナル・市場データを集計し、S3保存 + Slack通知。
 
 | 項目 | 値 |
 |---|---|
@@ -632,7 +619,7 @@ DLQ滞留等のシステムアラートを Slack Webhook に転送。取引通�
 | タイムアウト | 120秒 |
 | DynamoDB | trades (R), signals (R), positions (R), market-context (R), improvements (R/W) |
 | S3 | daily-reports (W) |
-| 外部連携 | Slack Webhook, GitHub API (repository_dispatch) |
+| 外部連携 | Slack Webhook |
 
 ### 処理フロー
 
@@ -641,20 +628,6 @@ DLQ滞留等のシステムアラートを Slack Webhook に転送。取引通�
 3. アクティブポジション・市場コンテキスト・改善履歴を取得
 4. 構造化レポートを生成 → S3に保存 (90日ライフサイクル)
 5. Slackに日次サマリーを投稿
-6. `repository_dispatch` で `daily-improvement` イベントをトリガー
-7. GitHub Actions (auto-improve.yml) がClaude AIで分析 → 自動改善
-
-### GitHub Actions 連携
-
-```
-daily-reporter → GitHub API (repository_dispatch)
-                    → auto-improve.yml ワークフロー
-                        → Claude Sonnet で日次データ分析
-                        → NO_ACTION / PARAM_TUNE / CODE_CHANGE 判定
-                        → コード変更 → デプロイ → docs更新 → git push
-                        → DynamoDB improvements テーブルに記録
-                        → Slack通知
-```
 
 ### 安全ルール
 
@@ -780,13 +753,12 @@ flowchart TD
         OE -->|"Coincheck API"| TRADE["取引"]
     end
 
-    subgraph 監視・自動修復
-        CW["CloudWatch Logs"] -->|"Subscription Filter"| ER["error-remediator"]
+    subgraph 監視・通知
+        CW["CloudWatch Logs"] -->|"“Subscription Filter"| ER["error-remediator"]
         ER -->|"Slack通知"| SLACK["Slack"]
-        ER -->|"repository_dispatch"| GH["GitHub Actions<br/>Claude自動修復"]
     end
 
-    subgraph 自動改善パイプライン
+    subgraph 日次レポート
         E5["毎日23:00 JST"] --> DR["daily-reporter"]
         DR -->|"R"| DB_T
         DR -->|"R"| DB_SIG
@@ -794,7 +766,5 @@ flowchart TD
         DR -->|"R"| DB_MC
         DR -->|"W"| S3_RPT["S3 daily-reports"]
         DR -->|"Slack"| SLACK
-        DR -->|"repository_dispatch"| AI["GitHub Actions<br/>Claude自動改善"]
-        AI -->|"W"| DB_IMP["improvements"]
     end
 ```

@@ -1,7 +1,7 @@
 """
 Daily Reporter Lambda
 毎日 23:00 JST に実行。1日の取引・シグナル・市場データを集計し、
-① S3にJSON保存 ② Slackサマリ通知 ③ GitHub Actions改善ワークフロートリガー
+① S3にJSON保存 ② Slackサマリ通知
 
 データソース:
 - trades: 直近24h/7d/30dの取引履歴
@@ -28,13 +28,10 @@ MARKET_CONTEXT_TABLE = os.environ.get('MARKET_CONTEXT_TABLE', 'eth-trading-marke
 IMPROVEMENTS_TABLE = os.environ.get('IMPROVEMENTS_TABLE', 'eth-trading-improvements')
 REPORT_BUCKET = os.environ.get('REPORT_BUCKET', 'eth-trading-daily-reports')
 SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL', '')
-GITHUB_TOKEN_SECRET_ARN = os.environ.get('GITHUB_TOKEN_SECRET_ARN', '')
-GITHUB_REPO = os.environ.get('GITHUB_REPO', '')
 TRADING_PAIRS_CONFIG = os.environ.get('TRADING_PAIRS_CONFIG', '{}')
 
 dynamodb = boto3.resource('dynamodb', region_name='ap-northeast-1')
 s3 = boto3.client('s3', region_name='ap-northeast-1')
-secrets = boto3.client('secretsmanager', region_name='ap-northeast-1')
 
 JST = timezone(timedelta(hours=9))
 
@@ -47,7 +44,7 @@ class DecimalEncoder(json.JSONEncoder):
 
 
 def handler(event, context):
-    """メインハンドラー: 日次レポート生成→S3保存→Slack→GitHub Actions"""
+    """メインハンドラー: 日次レポート生成→S3保存→Slack通知"""
     try:
         now = int(time.time())
         today_jst = datetime.fromtimestamp(now, tz=JST).strftime('%Y-%m-%d')
@@ -93,27 +90,13 @@ def handler(event, context):
         # Slack通知
         send_slack_summary(report)
 
-        # GitHub Actions トリガー (データ品質ゲート)
-        dq = report.get('data_quality', {})
-        if dq.get('allow_improvement', False):
-            trigger_auto_improve(report)
-            trigger_status = 'triggered'
-        else:
-            skip_reasons = dq.get('skip_reasons', ['unknown'])
-            print(f"Auto-improve SKIPPED: {', '.join(skip_reasons)}")
-            print(f"  confidence_score={dq.get('confidence_score', 0)}, "
-                  f"7d_trades={dq.get('trades_7d_paired', 0)}, "
-                  f"ci_width={dq.get('win_rate_7d_ci', {}).get('width', 'N/A')}")
-            trigger_status = f'skipped({skip_reasons[0]})'
-
         return {
             'statusCode': 200,
             'body': json.dumps({
                 'date': today_jst,
                 'trades_24h': report['trades']['total'],
                 'signals_24h': report['signals']['total'],
-                's3_key': s3_key,
-                'auto_improve': trigger_status
+                's3_key': s3_key
             })
         }
 
@@ -700,76 +683,6 @@ def send_slack_summary(report: dict):
         print(f"Slack summary sent (status: {response.status})")
     except Exception as e:
         print(f"Slack send failed: {e}")
-
-
-def trigger_auto_improve(report: dict):
-    """GitHub Actions auto-improve ワークフローをトリガー"""
-    token = get_github_token()
-    if not token:
-        print("No GitHub token, skipping auto-improve trigger")
-        return
-    if not GITHUB_REPO:
-        print("GITHUB_REPO not set")
-        return
-
-    # レポートを圧縮（GitHub dispatch payload上限 65KB 対策）
-    compact_report = {
-        'date': report['date'],
-        'timestamp': report['timestamp'],
-        'data_quality': report.get('data_quality', {}),
-        'trades': report['trades'],
-        'signals': {
-            'total': report['signals']['total'],
-            'buy_count': report['signals']['buy_count'],
-            'sell_count': report['signals']['sell_count'],
-            'hold_count': report['signals']['hold_count'],
-            'avg_score': report['signals']['avg_score'],
-            'score_distribution': report['signals']['score_distribution'],
-            'component_stats': report['signals']['component_stats'],
-        },
-        'positions': report['positions'],
-        'market_summary': report['market_summary'],
-        'rolling_7d': report['rolling_7d'],
-        'rolling_30d': report['rolling_30d'],
-        'recent_improvements': report.get('recent_improvements', []),
-    }
-
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/dispatches"
-    payload = {
-        "event_type": "daily-improvement",
-        "client_payload": {
-            "report": json.loads(json.dumps(compact_report, cls=DecimalEncoder))
-        }
-    }
-
-    try:
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode('utf-8'),
-            headers={
-                'Authorization': f'token {token}',
-                'Accept': 'application/vnd.github.v3+json',
-                'Content-Type': 'application/json',
-                'User-Agent': 'eth-trading-daily-reporter'
-            },
-            method='POST'
-        )
-        response = urllib.request.urlopen(req, timeout=10)
-        print(f"GitHub Actions auto-improve triggered (status: {response.status})")
-    except Exception as e:
-        print(f"GitHub Actions trigger failed: {e}")
-
-
-def get_github_token() -> str:
-    if not GITHUB_TOKEN_SECRET_ARN:
-        return ''
-    try:
-        response = secrets.get_secret_value(SecretId=GITHUB_TOKEN_SECRET_ARN)
-        secret = json.loads(response['SecretString'])
-        return secret.get('token', '')
-    except Exception as e:
-        print(f"Failed to get GitHub token: {e}")
-        return ''
 
 
 def notify_error(error_msg: str):

@@ -80,7 +80,6 @@ flowchart LR
         CW_LOGS["CloudWatch Logs"]
         CW_ALARM["CloudWatch Alarms<br/>全Lambda監視<br/>(Errors + Duration)"]
         CW_FILTER["Subscription Filters<br/>エラーログ検知"]
-        GH_ACTIONS["GitHub Actions<br/>Claude自動修復"]
     end
 
     %% 定期実行
@@ -146,7 +145,7 @@ flowchart LR
     CW_LOGS -->|"エラーパターン"| CW_FILTER
     CW_FILTER --> L_REMEDIATE
     L_REMEDIATE -->|"Slack通知"| SLACK
-    L_REMEDIATE -->|"repository_dispatch"| GH_ACTIONS
+
 ```
 
 ---
@@ -307,35 +306,21 @@ aggregator → SQS(order-queue) → order-executor
 
 ```
 CloudWatch Logs → Subscription Filter → error-remediator Lambda
-                                            ├→ Slack通知（エラー内容）
-                                            └→ GitHub Actions (repository_dispatch)
-                                                  └→ Claude AI エラー分析
-                                                        └→ コード修正 → デプロイ → 検証
+                                            └→ Slack通知（エラー内容）
 ```
 
 - **CloudWatch Alarms (24個)**: 全12 Lambda × (Errors + Duration) で異常検知
 - **Subscription Filters (11個)**: warm-up以外の全Lambdaのエラーログを検知
   - フィルターパターン: `?"[ERROR]" ?Traceback ?"raise Exception" -"[INFO]" -"expected behavior" -"retrying in"`
   - SageMaker Serverless の想定内リトライログ（ThrottlingException → 自動リカバリ）を除外
-- **error-remediator Lambda**: エラー検知 → Slack通知 + GitHub Actions トリガー（30分クールダウン付き）
-- **GitHub Actions (auto-fix-errors.yml)**: Claude Sonnet によるエラー分析 → コード修正 → デプロイ → 自動push
+- **error-remediator Lambda**: エラー検知 → Slack通知（30分クールダウン付き）
 
 ### 自動改善パイプライン (Phase 4)
 
 ```
 EventBridge (23:00 JST) → daily-reporter Lambda
-                              ├→ データ品質ゲート (Wilson CI + min trades + cooldown)
                               ├→ S3にJSON日次レポート保存 (90日保持)
-                              ├→ Slackに日次サマリー通知
-                              └→ GitHub Actions (repository_dispatch) ※品質ゲート通過時のみ
-                                    └→ auto-improve.yml
-                                          └→ Pre-Check ゲート (trades≥3, confidence要件)
-                                          └→ Claude AI がデータ分析
-                                                ├→ NO_ACTION: 変更不要
-                                                ├→ PARAM_TUNE: パラメータ微調整 (conf≥0.5)
-                                                └→ CODE_CHANGE: ロジック変更 (conf≥0.6)
-                                                      → 自動デプロイ → docs更新 → git push
-                                                      → DynamoDB improvements テーブルに記録
+                              └→ Slackに日次サマリー通知
 ```
 
 - **安全制約**: ウェイト±0.05/回、閾値±0.03/回、2週間以内の再変更抑止
