@@ -20,6 +20,7 @@
 11. [02/12 Bedrock Claude 3 Haiku → Amazon Nova Micro 移行](#11-0212-bedrock-claude-3-haiku--amazon-nova-micro-apac-移行)
 12. [02/12 シグナル根拠データの保存拡張](#12-0212-シグナル根拠データの保存拡張)
 13. [02/12 テクニカルスコア計算の過剰反応修正（RSI/BB/SMA）](#13-0212-テクニカルスコア計算の過剰反応修正rsibbs ma)
+14. [02/12 ニュース日時のJST変換保存](#14-0212-ニュース日時のjst変換保存)
 
 ---
 
@@ -725,3 +726,44 @@ BTC が RSI 67.6、レンジ相場でテクニカルスコア -0.71 と過剰に
 - スコアリングの変更前に必ずシミュレーションで旧/新を比較すること。sqrtカーブは0<x<1でlinearより大きくなる（惠化ではなく悪化）。二乗カーブが正解
 - RSI 60-70で`-w_rsi * (rsi-60)/10`を使うと、旧式より過剰になる。上限のキャップ（×0.3）が必要
 - 線形スコアリングが「中央付近でも線形にスコアが動く」ことによる過剰反応は、複数指標が累積する総合スコアで特に問題になる
+
+---
+
+## 14. 02/12 ニュース日時のJST変換保存
+
+### 概要
+
+CryptoPanicから取得するニュース記事の `published_at`（ISO 8601 UTC）を日本標準時（JST, UTC+9）に変換し、DynamoDBの `top_headlines` に `published_at_jst` フィールドとして保存するようにした。
+
+### 背景
+
+- ニュースのセンチメントスコアは保存していたが、各ヘッドラインがいつ公開されたかの日時情報を保持していなかった
+- CryptoPanic APIは `published_at` を ISO 8601 形式（UTC）で返す（例: `2026-02-12T05:30:00Z`）
+- 運用・分析時に日本時間で確認したいため、JST変換して保存
+
+### 変更内容
+
+| ファイル | 変更 |
+|----------|------|
+| `services/news-collector/handler.py` | `convert_to_jst()` 関数を追加。`datetime` をモジュールレベルimportに移動 |
+| `services/news-collector/handler.py` | `extract_top_headlines()` で各記事に `published_at_jst` を付与 |
+| `services/news-collector/handler.py` | `save_sentiment()` で `published_at_jst` をDynamoDBに保存 |
+
+### 保存例
+
+```json
+{
+  "top_headlines": [
+    {
+      "title": "Bitcoin ETF sees record inflows",
+      "score": 0.72,
+      "source": "BTC",
+      "published_at_jst": "2026-02-12 14:30:00 JST"
+    }
+  ]
+}
+```
+
+### API制限への影響
+
+なし。API呼び出し回数は変更なし（2 calls/実行 × 30分間隔 = 2,880/月、Growth Plan 3,000内）。
