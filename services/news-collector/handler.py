@@ -23,7 +23,7 @@ from trading_common import TRADING_PAIRS, SENTIMENT_TABLE, dynamodb
 
 # Bedrock クライアント (LLMセンチメント分析用)
 bedrock = boto3.client('bedrock-runtime')
-BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'anthropic.claude-3-haiku-20240307-v1:0')
+BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'amazon.nova-micro-v1:0')
 
 CRYPTOPANIC_API_KEY = os.environ.get('CRYPTOPANIC_API_KEY', '')
 
@@ -268,24 +268,19 @@ Titles:
 
 Respond with ONLY a JSON array of numbers in the same order. Example: [0.72, 0.35, 0.50]"""
 
-        body = json.dumps({
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 256,
-            "temperature": 0.0,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
-        })
-
-        response = bedrock.invoke_model(
+        # Converse API（モデル非依存の統一API）
+        response = bedrock.converse(
             modelId=BEDROCK_MODEL_ID,
-            contentType='application/json',
-            accept='application/json',
-            body=body
+            messages=[
+                {"role": "user", "content": [{"text": prompt}]}
+            ],
+            inferenceConfig={
+                "maxTokens": 256,
+                "temperature": 0.0,
+            }
         )
 
-        result = json.loads(response['body'].read())
-        content = result.get('content', [{}])[0].get('text', '').strip()
+        content = response['output']['message']['content'][0]['text'].strip()
 
         # JSON配列をパース
         # LLMが余分なテキストを返す場合に備えて、最初の [ ... ] を抽出
@@ -306,8 +301,8 @@ Respond with ONLY a JSON array of numbers in the same order. Example: [0.72, 0.3
                 score = max(0.0, min(1.0, score))
                 llm_scores[article['id']] = score
 
-        input_tokens = result.get('usage', {}).get('input_tokens', 0)
-        output_tokens = result.get('usage', {}).get('output_tokens', 0)
+        input_tokens = response.get('usage', {}).get('inputTokens', 0)
+        output_tokens = response.get('usage', {}).get('outputTokens', 0)
         print(f"LLM sentiment analysis complete: {len(llm_scores)} scores "
               f"(tokens: in={input_tokens}, out={output_tokens})")
 

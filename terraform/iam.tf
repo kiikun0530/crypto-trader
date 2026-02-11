@@ -150,10 +150,12 @@ resource "aws_iam_role_policy" "lambda_custom" {
       {
         Effect = "Allow"
         Action = [
-          "bedrock:InvokeModel"
+          "bedrock:InvokeModel",
+          "bedrock:Converse"
         ]
         Resource = [
-          "arn:aws:bedrock:${var.aws_region}::foundation-model/anthropic.claude-*"
+          "arn:aws:bedrock:${var.aws_region}::foundation-model/anthropic.claude-*",
+          "arn:aws:bedrock:${var.aws_region}::foundation-model/amazon.nova-*"
         ]
       }
     ]
