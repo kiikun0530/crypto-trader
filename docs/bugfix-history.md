@@ -21,6 +21,8 @@
 12. [02/12 シグナル根拠データの保存拡張](#12-0212-シグナル根拠データの保存拡張)
 13. [02/12 テクニカルスコア計算の過剰反応修正（RSI/BB/SMA）](#13-0212-テクニカルスコア計算の過剰反応修正rsibbs ma)
 14. [02/12 ニュース日時のJST変換保存](#14-0212-ニュース日時のjst変換保存)
+15. [02/12 Signal API DynamoDB 1MB制限によるデータ欠損](#15-0212-signal-api-dynamodb-1mb制限によるデータ欠損)
+16. [02/12 Terraform archive_file キャッシュによるLambdaデプロイ漏れ](#16-0212-terraform-archive_file-キャッシュによるlambdaデプロイ漏れ)
 
 ---
 
@@ -767,3 +769,84 @@ CryptoPanicから取得するニュース記事の `published_at`（ISO 8601 UTC
 ### API制限への影響
 
 なし。API呼び出し回数は変更なし（2 calls/実行 × 30分間隔 = 2,880/月、Growth Plan 3,000内）。
+
+---
+
+## 15. 02/12 Signal API DynamoDB 1MB制限によるデータ欠損
+
+### 概要
+
+crypto-signal の `/markers` API が24時間分のシグナルデータを返す際、DynamoDB Query の **1MBレスポンス上限** に達し、最新のシグナルが欠落していた。
+
+### 症状
+
+- 24時間分のシグナル（5分間隔 × 6通貨 ≒ 288件/通貨）を全フィールドで取得すると、1アイテムあたり約4KBのため合計 ≒ 1.1MB
+- DynamoDB は1回の Query で最大1MBしか返さないため、末尾（最新）のアイテムが切り捨てられていた
+- `ScanIndexForward=True` により古い方から取得するため、**最新のシグナルが欠落**
+
+### 根本原因
+
+`get_markers()` が全フィールド（indicators, chronos_detail, news_headlines, market_detail, ai_comment 等）を一括取得していた。これらの根拠データは BUY/SELL マーカーでのみ必要だが、HOLD を含む全件に対して取得していた。
+
+### 修正
+
+2段階クエリに分割:
+
+1. **軽量クエリ**: `ProjectionExpression` で必要最小限のフィールド（pair, timestamp, signal, score, 各コンポーネントスコア）のみ全件取得。ページネーション対応
+2. **詳細データ取得**: `BatchGetItem` で BUY/SELL + 最新6件の HOLD のみ根拠データを個別取得
+
+```
+旧: Query(全フィールド) → 1MB超え → 最新データ欠落
+新: Query(軽量10フィールド) → 全件取得OK → BatchGetItem(BUY/SELL+最新HOLD) → 根拠データ付与
+```
+
+### 修正ファイル
+
+| ファイル | 変更内容 |
+|----------|----------|
+| `crypto-signal/backend/api/handler.py` | `get_markers()` を ProjectionExpression + BatchGetItem パターンに書き換え |
+
+### 補足
+
+- DynamoDB の `signal` は予約語のため `ExpressionAttributeNames={'#sig': 'signal'}` が必要
+- `timestamp` も予約語のため `#ts` にマッピング
+- `BatchGetItem` の1回あたり上限は100件（BUY/SELL + 最新HOLD 6件なら十分）
+
+---
+
+## 16. 02/12 Terraform archive_file キャッシュによるLambdaデプロイ漏れ
+
+### 概要
+
+`terraform apply` で Lambda のハンドラーコードを更新したにもかかわらず、実際の Lambda 関数に反映されていなかった。
+
+### 症状
+
+- `sentiment-getter/handler.py` に `published_at_jst` パススルーを追加し、`terraform apply` で "3 changed" と表示されたが、Lambda の `LastModified` が更新前のまま
+- フロントエンドに JST 日時が表示されない原因の一つだった
+
+### 根本原因
+
+Terraform の `data "archive_file"` リソースはハッシュベースでZIPアーカイブを生成するが、**`.terraform/tmp/` 配下のキャッシュされたZIPが再利用される**ケースがある。`terraform apply` の出力では "changed" と表示されるが、実際のZIPバイナリは更新されておらず、Lambda へのアップロード内容が旧コードのままだった。
+
+### 修正（ワークアラウンド）
+
+Terraform を経由せず AWS CLI で直接 Lambda コードを更新:
+
+```powershell
+Compress-Archive -Path handler.py -DestinationPath lambda.zip -Force
+aws lambda update-function-code --function-name eth-trading-sentiment-getter \
+  --zip-file fileb://lambda.zip
+```
+
+### 影響範囲
+
+以下の Lambda で同様の問題が確認された:
+- `eth-trading-sentiment-getter`
+- `crypto-signal-api`
+
+### 教訓
+
+- `terraform apply` の "changed" 表示は **Lambda コードが実際に更新されたことを保証しない**
+- 重要な Lambda デプロイ後は `aws lambda get-function --query "Configuration.LastModified"` で更新日時を必ず確認する
+- 恒久対策: `terraform apply` 前に `.terraform/tmp/` 配下の既存ZIPを削除する、または `source_code_hash` を明示的に再計算させる
