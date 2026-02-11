@@ -346,13 +346,22 @@ def calculate_score(current_price: float, rsi: float, macd: float, signal: float
     score = 0.0
     
     # --- RSI スコア計算（継続時間 + トレンド方向を考慮）---
-    # 基本スコア
+    # 基本スコア: 30未満/70超はフルウェイト、
+    # 40-60 は「中立帯」としてスコアを大幅縮小
+    import math
     if rsi < 30:
         rsi_raw = w_rsi  # 売られすぎ → 買いシグナル
     elif rsi > 70:
         rsi_raw = -w_rsi  # 買われすぎ → 売りシグナル
+    elif rsi <= 40:
+        # 30-40: 売られすぎに接近 → 弱めの強気グラデーション (max 30% of w_rsi)
+        rsi_raw = (w_rsi * 0.3) * (40 - rsi) / 10  # 30→0.3*w, 40→0.0
+    elif rsi >= 60:
+        # 60-70: 買われすぎに接近 → 弱めの弱気グラデーション (max 30% of w_rsi)
+        rsi_raw = -(w_rsi * 0.3) * (rsi - 60) / 10  # 60→0.0, 70→-0.3*w
     else:
-        rsi_raw = (50 - rsi) / 200 * (w_rsi / 0.25)
+        # 40-60: 中立帯 → ほぼゼロ（微小な傾きのみ）
+        rsi_raw = (50 - rsi) / 500 * (w_rsi / 0.25)
     
     # 改善1: 売られすぎ/買われすぎ継続時間による減衰
     # 12bars(1h)以上継続 → 50%に減衰、36bars(3h)以上 → 25%に減衰
@@ -409,27 +418,32 @@ def calculate_score(current_price: float, rsi: float, macd: float, signal: float
         else:
             score -= w_macd
     
-    # SMA20/200 ゴールデン/デッドクロス
-    if sma_200:
-        if sma_20 > sma_200:
-            score += w_sma  # ゴールデンクロス（上昇トレンド）
-        else:
-            score -= w_sma  # デッドクロス（下降トレンド）
+    # SMA20/200 ゴールデン/デッドクロス（距離グラデーション）
+    if sma_200 and sma_200 > 0:
+        # SMA20とSMA200の乖離率でグラデーションスコア
+        # 乖離率 ±2% でフルスコア、±0.2%未満はほぼゼロ
+        divergence_pct = (sma_20 - sma_200) / sma_200 * 100  # %単位
+        sma_factor = max(-1.0, min(1.0, divergence_pct / 2.0))  # ±2%でクランプ
+        score += w_sma * sma_factor
     else:
         # SMA200がない場合はSMA20との位置関係で判断
         if current_price > sma_20:
-            score += w_sma * 0.6
+            score += w_sma * 0.4
         else:
-            score -= w_sma * 0.6
+            score -= w_sma * 0.4
     
-    # ボリンジャーバンド (線形グラデーション - デッドゾーン解消)
+    # ボリンジャーバンド (二乗カーブで中央付近を緩和、端のみ強いスコア)
     if bb_upper != bb_lower:
         bb_position = (current_price - bb_lower) / (bb_upper - bb_lower)
-        # 0.0=下限 → +w_bb, 0.5=中央 → 0, 1.0=上限 → -w_bb
-        bb_score = (0.5 - bb_position) * 2 * w_bb
-        # 極端な位置でボーナス（バンド外）
-        if bb_position < 0.0 or bb_position > 1.0:
-            bb_score *= 1.2
+        # 0.0=下限, 0.5=中央, 1.0=上限
+        # deviation: 0.5→中央=0, 0.0/1.0=バンド端=0.5
+        deviation = abs(bb_position - 0.5)  # 0.0~0.5+
+        # 二乗カーブ: 中央付近は穏やか、バンド端のみ急激
+        # x^2: deviation 0.1→0.04, 0.25→0.25, 0.5→1.0 (端でフルスコア)
+        normalized = min(deviation / 0.5, 1.0)  # 0~1に正規化
+        curved = normalized ** 2  # 二乗: 中央は極めて穏やか
+        direction = -1 if bb_position > 0.5 else 1  # 上限→弱気, 下限→強気
+        bb_score = direction * curved * w_bb
         score += max(-w_bb * 1.2, min(w_bb * 1.2, bb_score))
     
     return max(-1, min(1, score))
