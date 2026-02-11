@@ -43,7 +43,7 @@ PREDICTION_LENGTH = int(os.environ.get('PREDICTION_LENGTH', '12'))
 INPUT_LENGTH = int(os.environ.get('INPUT_LENGTH', '336'))  # 336 × 5min = 28h (日次サイクル1周+α)
 
 # スコアリング設定
-SCORE_SCALE_PERCENT = 3.0    # ±3%変動で±1.0 (旧: ±1%で飽和していた)
+SCORE_SCALE_PERCENT = 1.5    # ±1.5%変動で±1.0 (旧: ±3%では5分足12本先で常にゼロ付近だった)
 
 # リトライ設定 (SageMaker Serverlessは冷起動に時間がかかるため長めに設定)
 MAX_RETRIES = 5

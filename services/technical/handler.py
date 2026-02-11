@@ -67,13 +67,19 @@ def handler(event, context):
         # ADX > 25: トレンド相場, ADX < 20: レンジ相場
         regime = 'trending' if adx > 25 else ('ranging' if adx < 20 else 'neutral')
         
+        # RSI売られすぎ/買われすぎ 継続期間を算出
+        rsi_oversold_bars, rsi_overbought_bars = calculate_rsi_duration(close_prices, 14)
+        
         # Volume 確認シグナル（出来高急増でスコア増幅）
         volume_multiplier = 1.0
         if has_volume and len(volumes) >= 20:
             volume_multiplier = calculate_volume_signal(volumes)
         
         # スコア計算（-1 to 1）- レジーム適応型
-        score = calculate_score(close_prices[-1], rsi, macd, signal, sma_20, sma_200, bb_upper, bb_lower, regime)
+        score = calculate_score(close_prices[-1], rsi, macd, signal, sma_20, sma_200,
+                                bb_upper, bb_lower, regime,
+                                rsi_oversold_bars=rsi_oversold_bars,
+                                rsi_overbought_bars=rsi_overbought_bars)
         
         # Volume による確認: 出来高増加時にスコアの方向性を強化
         if volume_multiplier > 1.0:
@@ -92,6 +98,8 @@ def handler(event, context):
             'atr': round(atr, 4),
             'atr_percent': round(atr / close_prices[-1] * 100, 3) if close_prices[-1] > 0 else 0,
             'regime': regime,
+            'rsi_oversold_bars': rsi_oversold_bars,
+            'rsi_overbought_bars': rsi_overbought_bars,
             'current_price': close_prices[-1],
             'data_count': len(prices),
             'has_ohlc': has_ohlc,
@@ -252,9 +260,65 @@ def calculate_bollinger_bands(prices: list, period: int = 20, std_dev: int = 2) 
     
     return sma + std_dev * std, sma - std_dev * std
 
+def calculate_rsi_duration(prices: list, period: int = 14) -> tuple:
+    """
+    RSI系列を計算し、直近の売られすぎ/買われすぎ継続バー数を返す
+    
+    Returns:
+        (oversold_bars, overbought_bars):
+        - oversold_bars: RSI < 30 が連続している5分足バー数 (0 = 現在は非売られすぎ)
+        - overbought_bars: RSI > 70 が連続している5分足バー数
+        5分足なので 12bars = 1時間、144bars = 12時間
+    """
+    if len(prices) < period + 2:
+        return 0, 0
+    
+    deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+    gains = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
+    
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    
+    rsi_series = []
+    # 最初のRSI
+    if avg_loss == 0:
+        rsi_series.append(100.0)
+    else:
+        rs = avg_gain / avg_loss
+        rsi_series.append(100 - (100 / (1 + rs)))
+    
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        if avg_loss == 0:
+            rsi_series.append(100.0)
+        else:
+            rs = avg_gain / avg_loss
+            rsi_series.append(100 - (100 / (1 + rs)))
+    
+    # 末尾から売られすぎ/買われすぎの連続数をカウント
+    oversold_bars = 0
+    for r in reversed(rsi_series):
+        if r < 30:
+            oversold_bars += 1
+        else:
+            break
+    
+    overbought_bars = 0
+    for r in reversed(rsi_series):
+        if r > 70:
+            overbought_bars += 1
+        else:
+            break
+    
+    return oversold_bars, overbought_bars
+
+
 def calculate_score(current_price: float, rsi: float, macd: float, signal: float,
                    sma_20: float, sma_200: float, bb_upper: float, bb_lower: float,
-                   regime: str = 'neutral') -> float:
+                   regime: str = 'neutral',
+                   rsi_oversold_bars: int = 0, rsi_overbought_bars: int = 0) -> float:
     """
     総合スコア計算 (-1 to 1)
     
@@ -262,6 +326,10 @@ def calculate_score(current_price: float, rsi: float, macd: float, signal: float
     - トレンド相場 (ADX>25): MACD/SMA重視 (トレンドフォロー)
     - レンジ相場 (ADX<20): RSI/BB重視 (逆張り)
     - 中立: 均等ウェイト
+    
+    改善点:
+    - RSI売られすぎ/買われすぎ継続時間による減衰
+    - トレンド相場でのRSI逆張り抑制
     """
     # レジーム別ウェイト
     if regime == 'trending':
@@ -276,18 +344,56 @@ def calculate_score(current_price: float, rsi: float, macd: float, signal: float
     
     score = 0.0
     
-    # RSI (30以下: 買い、70以上: 売り)
+    # --- RSI スコア計算（継続時間 + トレンド方向を考慮）---
+    # 基本スコア
     if rsi < 30:
-        score += w_rsi
+        rsi_raw = w_rsi  # 売られすぎ → 買いシグナル
     elif rsi > 70:
-        score -= w_rsi
+        rsi_raw = -w_rsi  # 買われすぎ → 売りシグナル
     else:
-        score += (50 - rsi) / 200 * (w_rsi / 0.25)  # ウェイトに応じてスケール
+        rsi_raw = (50 - rsi) / 200 * (w_rsi / 0.25)
+    
+    # 改善1: 売られすぎ/買われすぎ継続時間による減衰
+    # 12bars(1h)以上継続 → 50%に減衰、36bars(3h)以上 → 25%に減衰
+    # 長期間の売られすぎは「落ちるナイフ」の可能性が高い
+    if rsi_oversold_bars > 0 and rsi_raw > 0:
+        if rsi_oversold_bars >= 36:  # 3時間以上
+            duration_damping = 0.25
+        elif rsi_oversold_bars >= 12:  # 1時間以上
+            # 12bars→0.5, 36bars→0.25 の線形補間
+            duration_damping = 0.5 - (rsi_oversold_bars - 12) / (36 - 12) * 0.25
+        else:
+            duration_damping = 1.0
+        rsi_raw *= duration_damping
+        print(f"RSI oversold for {rsi_oversold_bars} bars, damping={duration_damping:.2f}")
+    
+    if rsi_overbought_bars > 0 and rsi_raw < 0:
+        if rsi_overbought_bars >= 36:
+            duration_damping = 0.25
+        elif rsi_overbought_bars >= 12:
+            duration_damping = 0.5 - (rsi_overbought_bars - 12) / (36 - 12) * 0.25
+        else:
+            duration_damping = 1.0
+        rsi_raw *= duration_damping
+        print(f"RSI overbought for {rsi_overbought_bars} bars, damping={duration_damping:.2f}")
+    
+    # 改善2: トレンド相場でのRSI逆張り抑制
+    # トレンド中にMACDが下向き(MACD<signal)なのにRSIが「買い」を出す場合は信用しない
+    if regime == 'trending':
+        macd_bearish = macd < signal
+        macd_bullish = macd > signal
+        if macd_bearish and rsi_raw > 0:
+            # 下降トレンド中の「売られすぎ買い」→ 落ちるナイフ → 大幅抑制
+            rsi_raw *= 0.3
+            print(f"RSI buy suppressed in bearish trend: {rsi_raw:.3f}")
+        elif macd_bullish and rsi_raw < 0:
+            # 上昇トレンド中の「買われすぎ売り」→ FOMO継続の可能性 → 抑制
+            rsi_raw *= 0.3
+            print(f"RSI sell suppressed in bullish trend: {rsi_raw:.3f}")
+    
+    score += rsi_raw
     
     # MACD (ヒストグラムの大きさと勾配でグラデーション評価)
-    # 旧: バイナリ(MACD>signal → +w_macd, else -w_macd)
-    # 新: ヒストグラム(MACD-signal)の大きさをATR%で正規化し、
-    #     さらにヒストグラムの勾配(直近変化)も反映
     histogram_val = macd - signal
     if current_price > 0:
         # ヒストグラムを価格比で正規化 (ATR%相当のスケール)
@@ -316,7 +422,6 @@ def calculate_score(current_price: float, rsi: float, macd: float, signal: float
             score -= w_sma * 0.6
     
     # ボリンジャーバンド (線形グラデーション - デッドゾーン解消)
-    # 旧: 0.2-0.8はスコア0 → 新: 全範囲で線形スコア
     if bb_upper != bb_lower:
         bb_position = (current_price - bb_lower) / (bb_upper - bb_lower)
         # 0.0=下限 → +w_bb, 0.5=中央 → 0, 1.0=上限 → -w_bb
