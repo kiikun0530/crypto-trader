@@ -59,6 +59,9 @@ TAKER_FEE_RATE = float(os.environ.get('TAKER_FEE_RATE', '0.0'))
 # 最小注文金額（Coincheck: 500円相当）
 MIN_ORDER_JPY = float(os.environ.get('MIN_ORDER_JPY', '500'))
 
+# スプレッド上限（これ以上のスプレッドはスリッページリスクが高いためスキップ）
+MAX_SPREAD_PCT = float(os.environ.get('MAX_SPREAD_PCT', '1.0'))  # デフォルト1.0%
+
 # Coincheck取引所: 通貨別最小注文数量・小数点以下桁数
 CURRENCY_ORDER_RULES = {
     'btc': {'min_amount': 0.001, 'decimals': 8},
@@ -199,17 +202,23 @@ def process_order(order: dict):
 
 
 def get_position(pair: str) -> dict:
-    """現在のポジション取得"""
+    """現在のポジション取得
+    
+    注意: DynamoDBのLimit+FilterExpressionの仕様上、Limitはフィルタ前に適用される。
+    Limit=1だとclosedポジションが最新の場合、その裏のactiveを見逃す。
+    → Limit=5でフェッチしPython側でフィルタリング。
+    """
     table = dynamodb.Table(POSITIONS_TABLE)
     response = table.query(
         KeyConditionExpression='pair = :pair',
         ExpressionAttributeValues={':pair': pair},
         ScanIndexForward=False,
-        Limit=1
+        Limit=5
     )
     items = response.get('Items', [])
-    if items and not items[0].get('closed'):
-        return items[0]
+    for item in items:
+        if not item.get('closed'):
+            return item
     return None
 
 
@@ -227,11 +236,12 @@ def check_any_other_position(exclude_pair: str) -> dict:
                 KeyConditionExpression='pair = :pair',
                 ExpressionAttributeValues={':pair': coincheck_pair},
                 ScanIndexForward=False,
-                Limit=1
+                Limit=5
             )
             items = response.get('Items', [])
-            if items and not items[0].get('closed'):
-                return items[0]
+            for item in items:
+                if not item.get('closed'):
+                    return item
         except Exception as e:
             print(f"Error checking position for {coincheck_pair}: {e}")
 
@@ -375,9 +385,9 @@ def calculate_order_amount(score: float, available_jpy: float) -> float:
 
     if kelly_full <= 0:
         # 負のKelly → エッジがない（期待値マイナス）
-        # 最低限のポジションのみ取る（様子見）
-        print(f"Negative Kelly ({kelly_full:.4f}): no positive edge, using minimum fraction")
-        kelly_fraction = KELLY_MIN_FRACTION
+        # トレードをスキップ（エッジなしでポジションを取るのは数学的に不合理）
+        print(f"Negative Kelly ({kelly_full:.4f}): no positive edge, skipping trade")
+        return 0
     else:
         # Half-Kelly for safety（破産リスクを大幅に低減）
         kelly_fraction = kelly_full * KELLY_SAFETY_FACTOR
@@ -444,9 +454,21 @@ def _calculate_order_amount_fallback(score: float, available_jpy: float) -> floa
 
 
 def execute_buy(pair: str, score: float, analysis_context: dict = None):
-    """買い注文実行（残高確認・スコア連動金額）"""
+    """買い注文実行（残高確認・スコア連動金額・スプレッドチェック）"""
     timestamp = int(time.time())
     name = get_currency_name(pair)
+
+    # 0. スプレッドチェック（板が薄い通貨でのスリッページ防止）
+    spread_pct = check_spread(pair)
+    if spread_pct is not None and spread_pct > MAX_SPREAD_PCT:
+        print(f"Spread too wide for {pair}: {spread_pct:.2f}% > {MAX_SPREAD_PCT}%")
+        send_notification(
+            name,
+            f"⚠️ {name}BUYスキップ: スプレッド過大\n"
+            f"スプレッド: {spread_pct:.2f}% (上限: {MAX_SPREAD_PCT}%)\n"
+            f"→ 板が薄く、スリッページリスクが高い"
+        )
+        return
 
     # 1. 残高確認
     balance = get_balance()
@@ -739,6 +761,31 @@ def get_current_price(pair: str) -> float:
         return float(data['last'])
 
 
+def check_spread(pair: str) -> float:
+    """
+    Coincheck ticker APIからbid/askスプレッドを計算（%）
+    
+    板が薄い通貨（AVAX等）は成行注文で大きく滑るため、
+    スプレッドが大きい場合はBUYをスキップする判断材料にする。
+    
+    Returns: スプレッド（%）。取得失敗時はNone（チェックをスキップ）
+    """
+    try:
+        url = f"https://coincheck.com/api/ticker?pair={pair}"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            ask = float(data.get('ask', 0))
+            bid = float(data.get('bid', 0))
+            if bid > 0 and ask > 0:
+                spread_pct = (ask - bid) / bid * 100
+                print(f"Spread for {pair}: bid=¥{bid:,.2f} ask=¥{ask:,.2f} spread={spread_pct:.3f}%")
+                return spread_pct
+    except Exception as e:
+        print(f"Spread check failed for {pair}: {e}")
+    return None
+
+
 def get_api_credentials() -> dict:
     """Secrets Managerからクレデンシャル取得"""
     if not COINCHECK_SECRET_ARN:
@@ -747,7 +794,8 @@ def get_api_credentials() -> dict:
     try:
         response = secrets.get_secret_value(SecretId=COINCHECK_SECRET_ARN)
         return json.loads(response['SecretString'])
-    except:
+    except Exception as e:
+        print(f"Failed to get API credentials: {e}")
         return None
 
 
@@ -978,7 +1026,9 @@ def save_position(pair: str, timestamp: int, side: str, result: dict, order_amou
         'entry_time': timestamp,
         'order_amount_jpy': Decimal(str(order_amount_jpy or 0)),
         'stop_loss': Decimal(str(rate * 0.95)),
-        'take_profit': Decimal(str(rate * 1.10)),
+        # TP=+30%: 安全弁のみ。利確はトレーリングストップに委任
+        # (旧: +10% → トレーリングストップの8%+/12%+ティアがデッドコードだった)
+        'take_profit': Decimal(str(rate * 1.30)),
         'closed': False
     })
 

@@ -190,6 +190,17 @@ def score_pair(pair: str, result: dict, market_context: dict = None) -> dict:
     chronos_normalized = chronos_score  # 既に-1〜1
     sentiment_normalized = (sentiment_score - 0.5) * 2  # 0〜1 → -1〜1
 
+    # Chronos信頼度フィルター: 低確信度の予測を減衰
+    # confidence < 0.3 → スコアを confidence/0.3 倍に減衰（ノイズ予測の影響を抑制）
+    # confidence >= 0.3 → そのまま
+    CHRONOS_MIN_CONFIDENCE = 0.3
+    if chronos_confidence < CHRONOS_MIN_CONFIDENCE:
+        damping = chronos_confidence / CHRONOS_MIN_CONFIDENCE
+        original = chronos_normalized
+        chronos_normalized *= damping
+        print(f"  Chronos confidence filter: {chronos_confidence:.3f} < {CHRONOS_MIN_CONFIDENCE} "
+              f"→ score damped {original:.3f} → {chronos_normalized:.3f}")
+
     # マーケットコンテキストスコア（DynamoDB直接読み取り）
     market_context_normalized = 0.0  # デフォルト中立
     market_context_detail = {}
@@ -241,6 +252,9 @@ def score_pair(pair: str, result: dict, market_context: dict = None) -> dict:
         market_context_normalized * MARKET_CONTEXT_WEIGHT +
         alt_dominance_adjustment
     )
+
+    # スコアを[-1, 1]にクランプ（alt_dominance_adjustmentで範囲を超えうるため）
+    total_score = max(-1.0, min(1.0, total_score))
 
     # ボラティリティ情報を抽出（BB幅 = (上限-下限)/中央値）
     bb_width = extract_bb_width(technical_result)
@@ -528,11 +542,13 @@ def find_all_active_positions() -> list:
                 KeyConditionExpression='pair = :pair',
                 ExpressionAttributeValues={':pair': coincheck_pair},
                 ScanIndexForward=False,
-                Limit=1
+                Limit=5
             )
             items = response.get('Items', [])
-            if items and not items[0].get('closed'):
-                positions.append(items[0])
+            for item in items:
+                if not item.get('closed'):
+                    positions.append(item)
+                    break  # 1通貨1ポジションのみ
         except Exception as e:
             print(f"Error checking position for {coincheck_pair}: {e}")
 
@@ -561,8 +577,8 @@ def extract_score(result: dict, key: str, default: float) -> float:
                 try:
                     body = json.loads(result['body']) if isinstance(result['body'], str) else result['body']
                     return float(body.get(key, default))
-                except:
-                    pass
+                except (json.JSONDecodeError, TypeError, ValueError) as e:
+                    print(f"Warning: Failed to parse body for {key}: {e}")
             return float(result.get(key, default))
         return default
     except Exception as e:

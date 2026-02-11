@@ -1,7 +1,7 @@
 # 取引ロジック改善企画書
 
 **作成日**: 2025-02-09
-**ステータス**: Phase 1 完了 → Phase 2 完了 → Phase 3 完了 → Phase 4 完了 → Phase 5 完了 → Phase 6 完了
+**ステータス**: Phase 1 完了 → Phase 2 完了 → Phase 3 完了 → Phase 4 完了 → Phase 5 完了 → Phase 6 完了 → Phase 7 完了
 
 ---
 
@@ -351,6 +351,55 @@
 - **Slack通知**: 確信度インジケーター (🟢≥0.7, 🟡≥0.4, 🔴<0.4) + 通貨別動的ウェイト表示
 - **影響範囲**: `services/aggregator/handler.py`
 
+---
+
+### Phase 7: コード品質・信頼性改善 (AWS分析ベース)
+
+> Phase 7 は AWS 本番環境の DynamoDB・CloudWatch・Lambda を直接分析し、
+> 実データ (14件のトレード: 勝率7.1%, P/L -¥14,682) から発掘した構造的バグ・設計問題を修正。
+
+#### 32. TP/トレーリングストップ矛盾修正 ✅ 実装済
+- **問題**: position-monitorでTP判定(+10%)がトレーリングストップ処理の**前に**あった
+  - → トレーリングストップの8%+/12%+ティアが完全にデッドコード
+  - → +9%の含み益は常にTP利確。利益を伸ばせない構造
+- **修正**:
+  - `order-executor`: save_position の take_profit を `rate * 1.10` → `rate * 1.30` に変更
+  - `position-monitor`: TP判定をトレーリングストップの**後**に移動。+30%は安全弁のみ
+- **影響範囲**: `services/order-executor/handler.py`, `services/position-monitor/handler.py`
+
+#### 33. 負Kelly時トレードスキップ ✅ 実装済
+- **問題**: Kelly Criterionが負(期待値マイナス)でも KELLY_MIN_FRACTION=0.10 で10%ベットしていた
+- **修正**: `kelly_full <= 0` なら `return 0` でトレード自体をスキップ
+- **影響範囲**: `services/order-executor/handler.py`
+
+#### 34. DynamoDB Limit+FilterExpression修正 ✅ 実装済
+- **問題**: DynamoDB の `Limit` は `FilterExpression` の**前に**適用される
+  - `Limit=1` だと最新レコードがclosedの場合、その後ろのactiveレコードを見逃す
+- **修正**: 3ファイル4箇所で `Limit=1` → `Limit=5` に変更。Python側でフィルタリング
+- **影響範囲**: `services/position-monitor/handler.py`, `services/order-executor/handler.py`, `services/aggregator/handler.py`
+
+#### 35. alt_dominance_adjustment スコア範囲クランプ ✅ 実装済
+- **問題**: BTC Dominance補正(±0.05)が加重平均の外で加算され、total_scoreが[-1, 1]を逸脱しうる
+- **修正**: `total_score = max(-1.0, min(1.0, total_score))` でクランプ
+- **影響範囲**: `services/aggregator/handler.py`
+
+#### 36. bare except修正 + ログ追加 ✅ 実装済
+- **修正**:
+  - `aggregator` extract_score: `except:` → `except (json.JSONDecodeError, TypeError, ValueError) as e:` + ログ
+  - `order-executor` get_api_credentials: `except:` → `except Exception as e:` + ログ
+- **影響範囲**: `services/aggregator/handler.py`, `services/order-executor/handler.py`
+
+#### 37. BUY時スプレッドチェック追加 ✅ 実装済
+- **問題**: 板が薄い通貨(AVAX等)で成行注文が大きく滑り、エントリーから7秒でSL到達
+- **修正**: execute_buy冒頭でCoincheck ticker APIのbid/askスプレッドを確認。MAX_SPREAD_PCT(1.0%)超過ならBUYスキップ
+- **環境変数**: `MAX_SPREAD_PCT` (デフォルト: 1.0)
+- **影響範囲**: `services/order-executor/handler.py`
+
+#### 38. Chronos信頼度フィルター ✅ 実装済
+- **問題**: confidence < 0.3 の低品質Chronos予測がそのままスコアに反映。ノイズシグナル
+- **修正**: confidence < 0.3 ではスコアを `confidence / 0.3` 倍に減衰 (0.1→1/3に減衰)
+- **影響範囲**: `services/aggregator/handler.py`
+
 ### Phase 2 実装ログ
 
 | 日付 | 項目 | コミット | 備考 |
@@ -377,3 +426,10 @@
 | 2026-02-10 | #29 モメンタム減速 | `ce37e58` | MACD histogram slope + SELL閾値緩和 |
 | 2026-02-11 | #30 Chronos SageMaker化 | `372722f` | Tiny(8M)→Base(200M), SageMaker Serverless |
 | 2026-02-11 | #31 確信度ベース動的ウェイト | `372722f` | Chronos confidence→ウェイト±0.15動的変動 |
+| 2026-02-12 | #32 TP/トレーリングストップ矛盾修正 | - | TP +10%→+30%安全弁, 判定順序入替 |
+| 2026-02-12 | #33 負Kelly時スキップ | - | kelly_full≤0 → return 0 |
+| 2026-02-12 | #34 DynamoDB Limit修正 | - | Limit=1→5, 3ファイル4箇所 |
+| 2026-02-12 | #35 スコアクランプ | - | total_score [-1, 1] クランプ |
+| 2026-02-12 | #36 bare except修正 | - | 例外特定化 + ログ追加 |
+| 2026-02-12 | #37 スプレッドチェック | - | MAX_SPREAD_PCT=1.0% |
+| 2026-02-12 | #38 Chronos信頼度フィルター | - | confidence<0.3 減衰 |

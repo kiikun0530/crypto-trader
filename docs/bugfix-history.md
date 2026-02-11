@@ -15,6 +15,8 @@
 6. [02/09 ゴミデータ事件（order_id未指定フォールバック）](#6-0209-ゴミデータ事件order_id未指定フォールバック)
 7. [02/10 Extreme Fear損失とF&G BUY抑制](#7-0210-extreme-fear損失とfg-buy抑制)
 8. [02/11 SageMaker Serverless ThrottlingException 頻発](#8-0211-sagemaker-serverless-throttlingexception-頻発)
+9. [02/12 TP/トレーリングストップ矛盾（デッドコード）](#9-0212-tpトレーリングストップ矛盾デッドコード)
+10. [02/12 DynamoDB Limit+FilterExpression アンチパターン](#10-0212-dynamodb-limitfilterexpression-アンチパターン)
 
 ---
 
@@ -522,3 +524,74 @@ ThrottlingException修正の調査中にChronos-2の存在を発見。Chronos-T5
 3. **predict_quantiles API**: `tuple[list[Tensor], list[Tensor]]` = `(quantiles, mean)` を返す
 4. **3D入力**: Chronos-2 は `(batch, variates, time)` の3Dテンソルが必要（旧版は2D）
 5. **Endpoint Name**: 既存のまま `eth-trading-chronos-base` を維持（handler.py/terraform変更不要）
+
+---
+
+## 9. 02/12 TP/トレーリングストップ矛盾（デッドコード）
+
+### 概要
+
+position-monitor の処理順序が「SL → **TP** → トレーリングストップ」だった。  
+TP=+10% はトレーリングストップの上位ティア（+8%/+12%）より**先**に判定されるため、  
+含み益が +10% に達すると必ず TP 利確され、トレーリングストップの高ティアは**デッドコード**だった。
+
+### 影響
+
+- トレーリングストップの 8%+/12%+ ティア（利益を最大限に伸ばす核心機能）が一度も発動しない
+- 大きなトレンドに乗っても +10% で頭打ち。Phase 2 (#5) で実装したトレーリングストップが実質無効
+
+### 根本原因
+
+```python
+# 旧コード (position-monitor/handler.py)
+# 1. SL判定
+# 2. TP判定 ← ここで +10% 利確 → return
+# 3. トレーリングストップ ← 到達しない
+```
+
+### 修正
+
+1. **order-executor**: `take_profit = rate * 1.10` → `rate * 1.30` (安全弁のみ)
+2. **position-monitor**: TP判定をトレーリングストップ処理の**後**に移動
+
+```python
+# 新コード
+# 1. SL判定
+# 2. トレーリングストップ (ピーク追跡 + SL引き上げ) ← 利益を伸ばす
+# 3. TP判定 (+30% 安全弁) ← 最後のフォールバック
+```
+
+### 教訓
+
+- **処理順序は仕様を決める**: 同じコードでも判定順序で機能が死ぬ
+- **テスト不足**: +10% 以上の含み益シナリオのテストがなかった
+
+---
+
+## 10. 02/12 DynamoDB Limit+FilterExpression アンチパターン
+
+### 概要
+
+DynamoDB の `Query` で `Limit=1` と `FilterExpression` を同時使用していた。  
+DynamoDB は **Limit を FilterExpression の前に適用する**ため、最新の1件が `closed` だと、  
+その裏にある `active` なポジションを見逃す。
+
+### 影響
+
+- **position-monitor**: アクティブポジションのSL/TP監視が抜け落ちる可能性
+- **order-executor**: 重複ポジション検出が失敗し、二重エントリーの可能性
+- **aggregator**: アクティブポジション検索が不完全でHOLD判断が正しくない可能性
+
+### 修正箇所
+
+| ファイル | 関数 | 修正 |
+|----------|------|------|
+| `position-monitor/handler.py` | `get_active_position()` | Limit=1→5、FilterExpression削除、Python側フィルタ |
+| `order-executor/handler.py` | `get_position()` | Limit=1→5、Python側フィルタ |
+| `order-executor/handler.py` | `check_any_other_position()` | Limit=1→5、Python側フィルタ |
+| `aggregator/handler.py` | `find_all_active_positions()` | Limit=1→5、Python側フィルタ |
+
+### 教訓
+
+- **DynamoDB の Limit は SQL の LIMIT と異なる**: FilterExpression の前に pageSize として働く
+- FilterExpression でフィルタしたい場合は十分大きな Limit を指定し、クライアント側でフィルタリング

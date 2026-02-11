@@ -94,13 +94,9 @@ def handler(event, context):
                 result['action'] = 'STOP_LOSS'
                 trigger_sell(coincheck_pair, config['name'], 'stop_loss', current_price, entry_price)
 
-            # 利確判定
-            elif current_price >= take_profit:
-                result['action'] = 'TAKE_PROFIT'
-                trigger_sell(coincheck_pair, config['name'], 'take_profit', current_price, entry_price)
-
             else:
                 # 連続トレーリングストップ: ピーク価格を追跡し、動的SLを算出
+                # TP判定はトレーリングストップ処理の後に実行（TPは+30%安全弁のみ）
                 highest_price = float(position.get('highest_price', entry_price))
 
                 # ピーク更新チェック
@@ -129,6 +125,12 @@ def handler(event, context):
                     # Slack通知
                     notify_trailing_stop(config['name'], coincheck_pair,
                                        old_sl, new_sl, entry_price, current_price, highest_price)
+
+                # 利確判定（安全弁: +30%ハードTP）
+                # トレーリングストップが主な利確手段。TPは異常時の最終防衛線
+                if current_price >= take_profit:
+                    result['action'] = 'TAKE_PROFIT'
+                    trigger_sell(coincheck_pair, config['name'], 'take_profit', current_price, entry_price)
 
             # P/L計算
             amount = float(position.get('amount', 0))
@@ -159,20 +161,26 @@ def handler(event, context):
 
 
 def get_active_position(pair: str) -> dict:
-    """アクティブポジション取得"""
+    """アクティブポジション取得
+    
+    注意: DynamoDBのLimit+FilterExpressionの仕様上、Limitはフィルタ前に適用される。
+    Limit=1だとclosedポジションが最新の場合、その裏のactiveを見逃す。
+    → Limit=5でフェッチしPython側でフィルタリング。
+    """
     table = dynamodb.Table(POSITIONS_TABLE)
     response = table.query(
         KeyConditionExpression='pair = :pair',
-        FilterExpression='attribute_not_exists(closed) OR closed = :false',
         ExpressionAttributeValues={
             ':pair': pair,
-            ':false': False
         },
         ScanIndexForward=False,
-        Limit=1
+        Limit=5
     )
     items = response.get('Items', [])
-    return items[0] if items else None
+    for item in items:
+        if not item.get('closed'):
+            return item
+    return None
 
 
 def get_current_price(pair: str) -> float:
