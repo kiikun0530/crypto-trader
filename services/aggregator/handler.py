@@ -17,21 +17,16 @@ import time
 import boto3
 from decimal import Decimal, ROUND_HALF_UP
 import urllib.request
+from trading_common import (
+    TRADING_PAIRS, POSITIONS_TABLE, SLACK_WEBHOOK_URL,
+    get_current_price, get_active_position, send_slack_notification, dynamodb
+)
 
-dynamodb = boto3.resource('dynamodb')
 sqs = boto3.client('sqs')
 
 SIGNALS_TABLE = os.environ.get('SIGNALS_TABLE', 'eth-trading-signals')
-POSITIONS_TABLE = os.environ.get('POSITIONS_TABLE', 'eth-trading-positions')
 MARKET_CONTEXT_TABLE = os.environ.get('MARKET_CONTEXT_TABLE', 'eth-trading-market-context')
 ORDER_QUEUE_URL = os.environ.get('ORDER_QUEUE_URL', '')
-SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL', '')
-
-# 通貨ペア設定
-DEFAULT_PAIRS = {
-    "eth_usdt": {"binance": "ETHUSDT", "coincheck": "eth_jpy", "news": "ETH", "name": "Ethereum"}
-}
-TRADING_PAIRS = json.loads(os.environ.get('TRADING_PAIRS_CONFIG', json.dumps(DEFAULT_PAIRS)))
 
 # 重み設定 (4コンポーネント: Tech + Chronos + Sentiment + MarketContext)
 # Phase 2: Tech dominant (0.55) → Phase 3: 4成分分散 → Phase 4: AI重視均等化
@@ -538,35 +533,13 @@ def find_all_active_positions() -> list:
     for pair, config in TRADING_PAIRS.items():
         coincheck_pair = config['coincheck']
         try:
-            response = table.query(
-                KeyConditionExpression='pair = :pair',
-                ExpressionAttributeValues={':pair': coincheck_pair},
-                ScanIndexForward=False,
-                Limit=10
-            )
-            items = response.get('Items', [])
-            for item in items:
-                if not item.get('closed'):
-                    positions.append(item)
-                    break  # 1通貨1ポジションのみ
+            pos = get_active_position(coincheck_pair)
+            if pos:
+                positions.append(pos)
         except Exception as e:
             print(f"Error checking position for {coincheck_pair}: {e}")
 
     return positions
-
-
-def get_current_price(pair: str) -> float:
-    """
-    Coincheck ticker APIから現在価格を取得（JPY建て）
-
-    ⚠️ score_pair()のcurrent_price_usdはBinance USDT建て。
-    ポジションP/L計算には必ずこの関数でJPY価格を取得すること。
-    """
-    url = f"https://coincheck.com/api/ticker?pair={pair}"
-    req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=10) as response:
-        data = json.loads(response.read().decode())
-        return float(data['last'])
 
 
 def extract_score(result: dict, key: str, default: float) -> float:

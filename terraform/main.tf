@@ -18,14 +18,13 @@ terraform {
     }
   }
 
-  # S3バックエンドを使用する場合はコメント解除
-  # backend "s3" {
-  #   bucket         = "eth-trading-terraform-state"
-  #   key            = "terraform.tfstate"
-  #   region         = "ap-northeast-1"
-  #   encrypt        = true
-  #   dynamodb_table = "terraform-locks"
-  # }
+  backend "s3" {
+    bucket       = "eth-trading-terraform-state-652679684315"
+    key          = "terraform.tfstate"
+    region       = "ap-northeast-1"
+    encrypt      = true
+    use_lockfile = true
+  }
 }
 
 provider "aws" {

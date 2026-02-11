@@ -39,7 +39,15 @@ resource "aws_sfn_state_machine" "analysis_workflow" {
                         "Payload.$"  = "$"
                       }
                       OutputPath = "$.Payload"
-                      End        = true
+                      Retry = [
+                        {
+                          ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"]
+                          IntervalSeconds = 2
+                          MaxAttempts     = 3
+                          BackoffRate     = 2
+                        }
+                      ]
+                      End = true
                     }
                   }
                 },
@@ -54,7 +62,15 @@ resource "aws_sfn_state_machine" "analysis_workflow" {
                         "Payload.$"  = "$"
                       }
                       OutputPath = "$.Payload"
-                      End        = true
+                      Retry = [
+                        {
+                          ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"]
+                          IntervalSeconds = 2
+                          MaxAttempts     = 3
+                          BackoffRate     = 2
+                        }
+                      ]
+                      End = true
                     }
                   }
                 },
@@ -69,13 +85,28 @@ resource "aws_sfn_state_machine" "analysis_workflow" {
                         "Payload.$"  = "$"
                       }
                       OutputPath = "$.Payload"
-                      End        = true
+                      Retry = [
+                        {
+                          ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"]
+                          IntervalSeconds = 2
+                          MaxAttempts     = 3
+                          BackoffRate     = 2
+                        }
+                      ]
+                      End = true
                     }
                   }
                 }
               ]
               ResultPath = "$.analysisResults"
               Next       = "MergePairResults"
+              Catch = [
+                {
+                  ErrorEquals  = ["States.ALL"]
+                  ResultPath   = "$.analysisError"
+                  Next         = "MergePairResults"
+                }
+              ]
             }
 
             MergePairResults = {
@@ -93,6 +124,13 @@ resource "aws_sfn_state_machine" "analysis_workflow" {
         }
         ResultPath = "$.analysis_results"
         Next       = "Aggregator"
+        Catch = [
+          {
+            ErrorEquals = ["States.ALL"]
+            ResultPath  = "$.mapError"
+            Next        = "AnalysisFailed"
+          }
+        ]
       }
 
       # 全通貨のスコア比較 + 最適通貨選定
@@ -104,12 +142,33 @@ resource "aws_sfn_state_machine" "analysis_workflow" {
           "Payload.$"  = "$"
         }
         OutputPath = "$.Payload"
-        Next       = "AnalysisComplete"
+        Retry = [
+          {
+            ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"]
+            IntervalSeconds = 2
+            MaxAttempts     = 3
+            BackoffRate     = 2
+          }
+        ]
+        Catch = [
+          {
+            ErrorEquals = ["States.ALL"]
+            ResultPath  = "$.error"
+            Next        = "AnalysisFailed"
+          }
+        ]
+        Next = "AnalysisComplete"
       }
 
       AnalysisComplete = {
         Type   = "Pass"
         Result = { message = "Multi-currency analysis complete" }
+        End    = true
+      }
+
+      AnalysisFailed = {
+        Type   = "Pass"
+        Result = { message = "Analysis workflow failed" }
         End    = true
       }
     }

@@ -36,24 +36,19 @@ import hashlib
 import urllib.request
 import boto3
 from decimal import Decimal
+from trading_common import (
+    TRADING_PAIRS, POSITIONS_TABLE, TRADES_TABLE, SLACK_WEBHOOK_URL,
+    get_current_price, get_active_position, get_currency_from_pair,
+    send_slack_notification, dynamodb
+)
 
-dynamodb = boto3.resource('dynamodb')
 secrets = boto3.client('secretsmanager')
 
 # Secrets Manager キャッシュ（Lambda実行中に再利用）
 _cached_credentials = None
 
-POSITIONS_TABLE = os.environ.get('POSITIONS_TABLE', 'eth-trading-positions')
-TRADES_TABLE = os.environ.get('TRADES_TABLE', 'eth-trading-trades')
-SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL', '')
 COINCHECK_SECRET_ARN = os.environ.get('COINCHECK_SECRET_ARN', '')
 MAX_POSITION_JPY = float(os.environ.get('MAX_POSITION_JPY', '15000'))
-
-# 通貨ペア設定（他通貨のポジションチェック用）
-DEFAULT_PAIRS = {
-    "eth_usdt": {"binance": "ETHUSDT", "coincheck": "eth_jpy", "news": "ETH", "name": "Ethereum"}
-}
-TRADING_PAIRS = json.loads(os.environ.get('TRADING_PAIRS_CONFIG', json.dumps(DEFAULT_PAIRS)))
 
 # 手数料設定（Coincheck取引所: 対象通貨は全て0%）
 MAKER_FEE_RATE = float(os.environ.get('MAKER_FEE_RATE', '0.0'))
@@ -101,11 +96,6 @@ KELLY_SAFETY_FACTOR = float(os.environ.get('KELLY_SAFETY_FACTOR', '0.5'))
 # Kelly fraction のクランプ範囲
 KELLY_MIN_FRACTION = 0.10  # 最低10%
 KELLY_MAX_FRACTION = 0.80  # 最大80%
-
-
-def get_currency_from_pair(pair: str) -> str:
-    """Coincheckペアから通貨シンボルを取得（例: eth_jpy → eth）"""
-    return pair.split('_')[0]
 
 
 def get_currency_name(pair: str) -> str:
@@ -174,7 +164,7 @@ def process_order(order: dict):
     name = get_currency_name(pair)
 
     # 1. 現在のポジション確認
-    current_position = get_position(pair)
+    current_position = get_active_position(pair)
 
     # 2. 注文判定
     if signal == 'BUY':
@@ -216,27 +206,6 @@ def process_order(order: dict):
 
         # 売り注文
         execute_sell(pair, current_position, score, analysis_context)
-
-
-def get_position(pair: str) -> dict:
-    """現在のポジション取得
-    
-    注意: DynamoDBのLimit+FilterExpressionの仕様上、Limitはフィルタ前に適用される。
-    Limit=1だとclosedポジションが最新の場合、その裏のactiveを見逃す。
-    → Limit=5でフェッチしPython側でフィルタリング。
-    """
-    table = dynamodb.Table(POSITIONS_TABLE)
-    response = table.query(
-        KeyConditionExpression='pair = :pair',
-        ExpressionAttributeValues={':pair': pair},
-        ScanIndexForward=False,
-        Limit=10
-    )
-    items = response.get('Items', [])
-    for item in items:
-        if not item.get('closed'):
-            return item
-    return None
 
 
 def get_balance() -> dict:
@@ -760,15 +729,6 @@ def place_market_order(pair: str, side: str, amount_jpy: float = None, amount_cr
         return {'success': False, 'error': str(e)}
 
 
-def get_current_price(pair: str) -> float:
-    """Coincheck APIから現在の取引価格を取得（JPY）"""
-    url = f"https://coincheck.com/api/ticker?pair={pair}"
-    req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=10) as response:
-        data = json.loads(response.read().decode())
-        return float(data['last'])
-
-
 def check_spread(pair: str) -> float:
     """
     Coincheck ticker APIからbid/askスプレッドを計算（%）
@@ -1066,11 +1026,15 @@ def close_position(pair: str, position: dict, timestamp: int, result: dict):
 
     table.update_item(
         Key={'pair': pair, 'position_id': position['position_id']},
-        UpdateExpression='SET closed = :closed, exit_price = :exit, exit_time = :time',
+        UpdateExpression='SET closed = :closed, exit_price = :exit, exit_time = :time, #ttl = :ttl',
+        ExpressionAttributeNames={
+            '#ttl': 'ttl'
+        },
         ExpressionAttributeValues={
             ':closed': True,
             ':exit': Decimal(str(exit_rate)),
-            ':time': timestamp
+            ':time': timestamp,
+            ':ttl': timestamp + (180 * 86400)  # クローズ後180日で自動削除
         }
     )
 
@@ -1244,30 +1208,11 @@ def check_circuit_breaker() -> tuple:
 
 
 def send_notification(name: str, message: str):
-    """Slack通知送信"""
+    """Slack通知送信（共通モジュール委譲）"""
     if not SLACK_WEBHOOK_URL:
         print(f"SLACK_WEBHOOK_URL not set, skipping notification: {message}")
         return
-
-    try:
-        payload = {
-            "blocks": [
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": message
-                    }
-                }
-            ]
-        }
-
-        req = urllib.request.Request(
-            SLACK_WEBHOOK_URL,
-            data=json.dumps(payload).encode('utf-8'),
-            headers={'Content-Type': 'application/json'}
-        )
-        response = urllib.request.urlopen(req, timeout=5)
-        print(f"Slack notification sent (status: {response.status})")
-    except Exception as e:
-        print(f"Slack notification failed: {e}")
+    if send_slack_notification(message):
+        print(f"Slack notification sent")
+    else:
+        print(f"Slack notification failed")

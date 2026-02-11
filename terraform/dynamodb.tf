@@ -56,7 +56,7 @@ resource "aws_dynamodb_table" "sentiment" {
   }
 }
 
-# ポジションテーブル (TTLなし)
+# ポジションテーブル (TTL: クローズ後180日)
 resource "aws_dynamodb_table" "positions" {
   name         = "${local.name_prefix}-positions"
   billing_mode = "PAY_PER_REQUEST"
@@ -71,6 +71,11 @@ resource "aws_dynamodb_table" "positions" {
   attribute {
     name = "position_id"
     type = "S"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
   }
 
   tags = {

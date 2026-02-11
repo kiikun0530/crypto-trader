@@ -13,19 +13,14 @@ import os
 import time
 import urllib.request
 import boto3
+from trading_common import (
+    TRADING_PAIRS, POSITIONS_TABLE, SLACK_WEBHOOK_URL,
+    get_current_price, get_active_position, send_slack_notification, dynamodb
+)
 
-dynamodb = boto3.resource('dynamodb')
 sqs = boto3.client('sqs')
 
-POSITIONS_TABLE = os.environ.get('POSITIONS_TABLE', 'eth-trading-positions')
 ORDER_QUEUE_URL = os.environ.get('ORDER_QUEUE_URL', '')
-SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL', '')
-
-# 通貨ペア設定
-DEFAULT_PAIRS = {
-    "eth_usdt": {"binance": "ETHUSDT", "coincheck": "eth_jpy", "news": "ETH", "name": "Ethereum"}
-}
-TRADING_PAIRS = json.loads(os.environ.get('TRADING_PAIRS_CONFIG', json.dumps(DEFAULT_PAIRS)))
 
 
 def handler(event, context):
@@ -165,38 +160,6 @@ def handler(event, context):
             'results': results
         })
     }
-
-
-def get_active_position(pair: str) -> dict:
-    """アクティブポジション取得
-    
-    注意: DynamoDBのLimit+FilterExpressionの仕様上、Limitはフィルタ前に適用される。
-    Limit=1だとclosedポジションが最新の場合、その裏のactiveを見逃す。
-    → Limit=5でフェッチしPython側でフィルタリング。
-    """
-    table = dynamodb.Table(POSITIONS_TABLE)
-    response = table.query(
-        KeyConditionExpression='pair = :pair',
-        ExpressionAttributeValues={
-            ':pair': pair,
-        },
-        ScanIndexForward=False,
-        Limit=10
-    )
-    items = response.get('Items', [])
-    for item in items:
-        if not item.get('closed'):
-            return item
-    return None
-
-
-def get_current_price(pair: str) -> float:
-    """Coincheck APIから価格取得"""
-    url = f"https://coincheck.com/api/ticker?pair={pair}"
-    req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=10) as response:
-        data = json.loads(response.read().decode())
-        return float(data['last'])
 
 
 def trigger_sell(pair: str, name: str, reason: str, current_price: float, entry_price: float):

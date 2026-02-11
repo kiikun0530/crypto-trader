@@ -8,15 +8,7 @@ import os
 import urllib.request
 import boto3
 from decimal import Decimal
-
-dynamodb = boto3.resource('dynamodb')
-PRICES_TABLE = os.environ.get('PRICES_TABLE', 'eth-trading-prices')
-
-# 通貨ペア設定
-DEFAULT_PAIRS = {
-    "eth_usdt": {"binance": "ETHUSDT", "coincheck": "eth_jpy", "news": "ETH", "name": "Ethereum"}
-}
-TRADING_PAIRS = json.loads(os.environ.get('TRADING_PAIRS_CONFIG', json.dumps(DEFAULT_PAIRS)))
+from trading_common import TRADING_PAIRS, PRICES_TABLE, dynamodb
 
 BINANCE_INTERVAL = '5m'
 BINANCE_LIMIT = 1000  # 最大1000件 = 約3.5日分

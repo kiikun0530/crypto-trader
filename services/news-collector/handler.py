@@ -19,16 +19,9 @@ import urllib.request
 import boto3
 import traceback
 from decimal import Decimal
+from trading_common import TRADING_PAIRS, SENTIMENT_TABLE, dynamodb
 
-dynamodb = boto3.resource('dynamodb')
-SENTIMENT_TABLE = os.environ.get('SENTIMENT_TABLE', 'eth-trading-sentiment')
 CRYPTOPANIC_API_KEY = os.environ.get('CRYPTOPANIC_API_KEY', '')
-
-# 通貨ペア設定
-DEFAULT_PAIRS = {
-    "eth_usdt": {"binance": "ETHUSDT", "coincheck": "eth_jpy", "news": "ETH", "name": "Ethereum"}
-}
-TRADING_PAIRS = json.loads(os.environ.get('TRADING_PAIRS_CONFIG', json.dumps(DEFAULT_PAIRS)))
 
 NEWS_LIMIT = 50
 NEWS_FRESHNESS_HOURS = 1

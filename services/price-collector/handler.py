@@ -11,20 +11,13 @@ import boto3
 from decimal import Decimal
 import traceback
 from botocore.exceptions import ClientError
+from trading_common import TRADING_PAIRS, PRICES_TABLE, dynamodb
 
-dynamodb = boto3.resource('dynamodb')
 sfn = boto3.client('stepfunctions')
 
-PRICES_TABLE = os.environ.get('PRICES_TABLE', 'eth-trading-prices')
 ANALYSIS_STATE_TABLE = os.environ.get('ANALYSIS_STATE_TABLE', 'eth-trading-analysis-state')
 VOLATILITY_THRESHOLD = float(os.environ.get('VOLATILITY_THRESHOLD', '0.3'))
 STEP_FUNCTION_ARN = os.environ.get('STEP_FUNCTION_ARN', '')
-
-# 通貨ペア設定（環境変数からJSON読み込み）
-DEFAULT_PAIRS = {
-    "eth_usdt": {"binance": "ETHUSDT", "coincheck": "eth_jpy", "news": "ETH", "name": "Ethereum"}
-}
-TRADING_PAIRS = json.loads(os.environ.get('TRADING_PAIRS_CONFIG', json.dumps(DEFAULT_PAIRS)))
 
 
 def handler(event, context):
