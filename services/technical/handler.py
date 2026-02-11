@@ -15,30 +15,11 @@ from decimal import Decimal
 
 dynamodb = boto3.resource('dynamodb')
 PRICES_TABLE = os.environ.get('PRICES_TABLE', 'eth-trading-prices')
-ANALYSIS_STATE_TABLE = os.environ.get('ANALYSIS_STATE_TABLE', 'eth-trading-analysis-state')
-
-
-def _update_pipeline(stage, status, detail=''):
-    try:
-        table = dynamodb.Table(ANALYSIS_STATE_TABLE)
-        now = int(__import__('time').time())
-        table.update_item(
-            Key={'pair': 'pipeline_status'},
-            UpdateExpression='SET #s = :info, updated_at = :ts',
-            ExpressionAttributeNames={'#s': stage},
-            ExpressionAttributeValues={
-                ':info': {'status': status, 'timestamp': now, 'detail': detail},
-                ':ts': now,
-            },
-        )
-    except Exception:
-        pass
 
 
 def handler(event, context):
     """テクニカル分析実行"""
     pair = event.get('pair', 'eth_usdt')
-    _update_pipeline('technical', 'running', f'{pair} RSI/MACD/BB分析中')
     
     try:
         # 価格履歴取得（直近250件 - 余裕を持って）
@@ -130,7 +111,6 @@ def handler(event, context):
             indicators['sma_200'] = round(sma_200, 2)
             indicators['golden_cross'] = sma_20 > sma_200  # ゴールデンクロス状態
         
-        _update_pipeline('technical', 'completed', f'{pair} score={round(score, 3)}')
         return {
             'pair': pair,
             'technical_score': round(score, 3),

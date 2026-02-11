@@ -51,28 +51,6 @@
 - `news`: CryptoPanic APIの通貨コード（ニュース取得用）
 - `name`: Slack通知等に使う表示名
 
-### パイプラインステータス更新
-
-全分析Lambda（7関数）は実行開始時に `running`、完了時に `completed` を `analysis_state` テーブルに書き込む。
-
-```python
-# trading_common.update_pipeline_status(stage, status, detail)
-update_pipeline_status('price_collector', 'running', '6通貨収集開始')
-update_pipeline_status('price_collector', 'completed', '6 pairs collected')
-```
-
-| ステージ名 | Lambda | 実装 |
-|---|---|---|
-| `price_collector` | price-collector | trading_common |
-| `news_collector` | news-collector | trading_common |
-| `market_context` | market-context | インライン |
-| `technical` | technical | インライン |
-| `chronos` | chronos-caller | インライン |
-| `sentiment` | sentiment-getter | インライン |
-| `aggregator` | aggregator | trading_common |
-
-DynamoDBレコード形式: PK=`pipeline_status`、各ステージがトップレベル属性として格納される。
-
 ---
 
 ## price-collector
@@ -84,7 +62,7 @@ DynamoDBレコード形式: PK=`pipeline_status`、各ステージがトップ�
 | トリガー | EventBridge (5分間隔) |
 | メモリ | 256MB |
 | タイムアウト | 60秒 |
-| DynamoDB | prices (W), analysis_state (W) |
+| DynamoDB | prices (W) |
 
 ### 処理フロー
 
@@ -115,7 +93,7 @@ DynamoDB から価格履歴を読み取り、テクニカル指標を計算し�
 | トリガー | Step Functions (Map > Parallel) |
 | メモリ | 512MB |
 | タイムアウト | 60秒 |
-| DynamoDB | prices (R), analysis_state (W) |
+| DynamoDB | prices (R) |
 
 ### 入力
 
@@ -167,7 +145,7 @@ SageMaker Serverless Endpoint 上の Amazon Chronos-2 (120M params) を呼び出
 | トリガー | Step Functions (Map > Parallel) |
 | メモリ | 256MB |
 | タイムアウト | 180秒 |
-| DynamoDB | prices (R), analysis_state (W) |
+| DynamoDB | prices (R) |
 | SageMaker | `eth-trading-chronos-base` (Serverless Endpoint) |
 
 ### 動作モード
@@ -320,7 +298,7 @@ DynamoDB から最新のセンチメントスコアを取得して返す。
 | トリガー | Step Functions (Map > Parallel) |
 | メモリ | 256MB |
 | タイムアウト | 60秒 |
-| DynamoDB | sentiment (R), analysis_state (W) |
+| DynamoDB | sentiment (R) |
 
 ### 出力
 
@@ -344,7 +322,7 @@ CryptoPanic API から全通貨のニュースを取得し、通貨別にセン�
 | トリガー | EventBridge (30分間隔) |
 | メモリ | 256MB |
 | タイムアウト | 60秒 |
-| DynamoDB | sentiment (W), analysis_state (W) |
+| DynamoDB | sentiment (W) |
 | 外部API | CryptoPanic (2 calls/実行) |
 
 ### API最適化
@@ -393,7 +371,7 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
 | トリガー | Step Functions (Map完了後) |
 | メモリ | 512MB |
 | タイムアウト | 120秒 |
-| DynamoDB | signals (W), market-context (R), analysis_state (W) |
+| DynamoDB | signals (W), market-context (R) |
 
 ### 入力 (Step Functions Map の出力)
 
@@ -667,7 +645,7 @@ DLQ滞留等のシステムアラートを Slack Webhook に転送。取引通�
 | トリガー | EventBridge (30分間隔) |
 | メモリ | 256MB |
 | タイムアウト | 60秒 |
-| DynamoDB | market-context (W), analysis_state (W) |
+| DynamoDB | market-context (W) |
 | 外部API | Alternative.me, Binance Futures, CoinGecko |
 
 ### 処理フロー
@@ -764,7 +742,6 @@ flowchart TD
         OE -->|"R/W"| DB_POS
         OE -->|"W"| DB_T["trades"]
         PM -->|"R"| DB_POS
-        PC & NC & MC & TECH & CHRON & SENT & AGG -->|"W(status)"| DB_ST["analysis_state"]
     end
 
     subgraph 注文実行

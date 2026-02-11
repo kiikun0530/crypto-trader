@@ -63,7 +63,7 @@ flowchart LR
         DB_POSITIONS[("positions<br/>pair=PK")]
         DB_TRADES[("trades<br/>pair=PK")]
         DB_SIGNALS[("signals<br/>pair=PK, TTL:90日")]
-        DB_STATE[("analysis_state<br/>pair=PK<br/>+ pipeline_status")]
+        DB_STATE[("analysis_state<br/>pair=PK")]
         DB_MKTCTX[("market-context<br/>context_type=PK, TTL:14日")]
     end
 
@@ -110,12 +110,6 @@ flowchart LR
     L_NEWS -->|"W"| DB_SENTIMENT
     L_MKTCTX -->|"W"| DB_MKTCTX
     L_PRICE -->|"R/W"| DB_STATE
-    L_TECH -->|"W(status)"| DB_STATE
-    L_CHRONOS -->|"W(status)"| DB_STATE
-    L_SENTIMENT -->|"W(status)"| DB_STATE
-    L_AGG -->|"W(status)"| DB_STATE
-    L_NEWS -->|"W(status)"| DB_STATE
-    L_MKTCTX -->|"W(status)"| DB_STATE
     L_AGG -->|"R"| DB_POSITIONS
     L_AGG -->|"R"| DB_MKTCTX
     L_AGG -->|"W"| DB_SIGNALS
@@ -152,25 +146,6 @@ flowchart LR
     L_REMEDIATE -->|"Slack通知"| SLACK
 
 ```
-
-### パイプライン実行ステータス
-
-全7つの分析 Lambda（price-collector, news-collector, market-context, technical, chronos-caller, sentiment-getter, aggregator）は実行開始時と完了時に `analysis_state` テーブルへステータスを書き込む。これにより [crypto-signal](https://github.com/kiikun0530/crypto-signal) フロントエンドがリアルタイムでパイプラインの進行状況を可視化できる。
-
-```
-PK = "pipeline_status" (単一レコード)
-├── price_collector:  { status: "running"|"completed", timestamp, detail }
-├── news_collector:   { status: "running"|"completed", timestamp, detail }
-├── market_context:   { status: "running"|"completed", timestamp, detail }
-├── technical:        { status: "running"|"completed", timestamp, detail }
-├── chronos:          { status: "running"|"completed", timestamp, detail }
-├── sentiment:        { status: "running"|"completed", timestamp, detail }
-├── aggregator:       { status: "running"|"completed", timestamp, detail }
-└── updated_at:       ISO 8601 timestamp
-```
-
-- 共通ユーティリティ: `trading_common.update_pipeline_status(stage, status, detail)`
-- technical / chronos-caller / sentiment-getter / market-context はインライン実装（Layer 非依存）
 
 ---
 
@@ -363,7 +338,7 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
 | signals | pair (S) | timestamp (N) | 90日 | 分析シグナル履歴 |
 | positions | pair (S) | position_id (S) | - | ポジション管理 |
 | trades | pair (S) | timestamp (N) | 90日 | 取引履歴 |
-| analysis_state | pair (S) | - | - | 通貨別の最終分析時刻 + パイプライン実行ステータス |
+| analysis_state | pair (S) | - | - | 通貨別の最終分析時刻 |
 | market-context | context_type (S) | timestamp (N) | 14日 | マクロ市場環境指標 |
 
 ### TTL 設計の根拠

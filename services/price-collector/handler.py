@@ -11,12 +11,11 @@ import boto3
 from decimal import Decimal
 import traceback
 from botocore.exceptions import ClientError
-from trading_common import TRADING_PAIRS, PRICES_TABLE, dynamodb, update_pipeline_status
+from trading_common import TRADING_PAIRS, PRICES_TABLE, dynamodb
 
 
 def handler(event, context):
     """全通貨の価格収集"""
-    update_pipeline_status('price_collector', 'running', f'{len(TRADING_PAIRS)}通貨の価格取得中')
     print(f"Starting price collection for {len(TRADING_PAIRS)} trading pairs")
     print(f"Lambda remaining time: {context.get_remaining_time_in_millis()}ms")
     
@@ -54,8 +53,6 @@ def handler(event, context):
             # エラーが発生しても他の通貨ペアの処理を継続
 
     print(f"Price collection completed. {len(results)} pairs processed, {len(errors)} errors")
-    update_pipeline_status('price_collector', 'completed', f'{len(results)}通貨完了')
-
     if errors:
         for error in errors:
             print(f"  - {error}")

@@ -8,36 +8,16 @@ import boto3
 
 dynamodb = boto3.resource('dynamodb')
 SENTIMENT_TABLE = os.environ.get('SENTIMENT_TABLE', 'eth-trading-sentiment')
-ANALYSIS_STATE_TABLE = os.environ.get('ANALYSIS_STATE_TABLE', 'eth-trading-analysis-state')
-
-
-def _update_pipeline(stage, status, detail=''):
-    try:
-        table = dynamodb.Table(ANALYSIS_STATE_TABLE)
-        now = int(__import__('time').time())
-        table.update_item(
-            Key={'pair': 'pipeline_status'},
-            UpdateExpression='SET #s = :info, updated_at = :ts',
-            ExpressionAttributeNames={'#s': stage},
-            ExpressionAttributeValues={
-                ':info': {'status': status, 'timestamp': now, 'detail': detail},
-                ':ts': now,
-            },
-        )
-    except Exception:
-        pass
 
 
 def handler(event, context):
     """センチメント取得"""
     pair = event.get('pair', 'eth_usdt')
-    _update_pipeline('sentiment', 'running', f'{pair} センチメント取得中')
     
     try:
         # 最新のセンチメントスコア取得
         score, timestamp = get_latest_sentiment(pair)
         
-        _update_pipeline('sentiment', 'completed', f'{pair} score={score}')
         return {
             'pair': pair,
             'sentiment_score': score,

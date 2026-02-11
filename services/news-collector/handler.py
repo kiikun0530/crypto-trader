@@ -19,7 +19,7 @@ import urllib.request
 import boto3
 import traceback
 from decimal import Decimal
-from trading_common import TRADING_PAIRS, SENTIMENT_TABLE, dynamodb, update_pipeline_status
+from trading_common import TRADING_PAIRS, SENTIMENT_TABLE, dynamodb
 
 # Bedrock クライアント (LLMセンチメント分析用)
 bedrock = boto3.client('bedrock-runtime')
@@ -44,7 +44,6 @@ MARKET_NEWS_WEIGHT = 0.3
 def handler(event, context):
     """全通貨のニュース収集 + 通貨別センチメント分析"""
     timestamp = int(time.time())
-    update_pipeline_status('news_collector', 'running', 'ニュース収集+センチメント分析中')
     print(f"Starting news collection for {len(TRADING_PAIRS)} pairs at {timestamp}")
 
     try:
