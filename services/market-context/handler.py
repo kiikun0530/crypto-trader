@@ -14,6 +14,7 @@ import os
 import time
 import urllib.request
 import boto3
+from boto3.dynamodb.conditions import Key
 from decimal import Decimal
 from botocore.exceptions import ClientError
 
@@ -45,12 +46,17 @@ def handler(event, context):
         dominance_data = fetch_btc_dominance()
         print(f"BTC Dominance: {dominance_data['btc_dominance']:.2f}%")
 
-        # 4. 統合スコア計算
+        # 4. 前回F&G値取得（トレンド判定用）
+        print("Fetching previous F&G value for trend analysis...")
+        prev_fng_value = fetch_previous_fng_value()
+        print(f"Previous F&G value: {prev_fng_value}")
+
+        # 5. 統合スコア計算
         print("Calculating market score...")
-        market_score, components = calculate_market_score(fng_data, funding_data, dominance_data)
+        market_score, components = calculate_market_score(fng_data, funding_data, dominance_data, prev_fng_value)
         print(f"Market Context Score: {market_score:+.4f}")
 
-        # 5. DynamoDBに保存
+        # 6. DynamoDBに保存
         print("Saving to DynamoDB...")
         save_market_context(timestamp, market_score, components, fng_data, funding_data, dominance_data)
         print("Successfully saved market context data")
@@ -198,7 +204,29 @@ def fetch_btc_dominance() -> dict:
         return fallback
 
 
-def calculate_market_score(fng_data: dict, funding_data: dict, dominance_data: dict) -> tuple:
+def fetch_previous_fng_value():
+    """前回のF&G値をDynamoDBから取得（トレンド判定用）"""
+    try:
+        table = dynamodb.Table(MARKET_CONTEXT_TABLE)
+        response = table.query(
+            KeyConditionExpression=Key('context_type').eq('global'),
+            ScanIndexForward=False,
+            Limit=1
+        )
+        items = response.get('Items', [])
+        if items:
+            prev_fng = items[0].get('fng_value')
+            if prev_fng is not None:
+                print(f"Found previous F&G value: {prev_fng}")
+                return int(prev_fng)
+        print("No previous F&G value found")
+        return None
+    except Exception as e:
+        print(f"Error fetching previous F&G: {e}")
+        return None
+
+
+def calculate_market_score(fng_data: dict, funding_data: dict, dominance_data: dict, prev_fng_value: int = None) -> tuple:
     """
     マーケットコンテキストの統合スコアを計算
 
@@ -208,9 +236,9 @@ def calculate_market_score(fng_data: dict, funding_data: dict, dominance_data: d
       負 = 市場環境がBUYに不利
 
     コンポーネント重み:
-    - Fear & Greed: 50% (最も強い市場シグナル)
-    - ファンディングレート: 30% (レバレッジの過熱度)
-    - BTC Dominance変化: 20% (資金フロー方向)
+    - Fear & Greed: 30% (逆張りシグナル、±0.3キャップ & トレンド減衰)
+    - ファンディングレート: 35% (レバレッジの過熱度)
+    - BTC Dominance変化: 35% (資金フロー方向)
     """
 
     # === 1. Fear & Greed → スコア変換 ===
@@ -241,7 +269,31 @@ def calculate_market_score(fng_data: dict, funding_data: dict, dominance_data: d
         # Extreme Greed (91-100): 強い逆張り売りシグナル
         fng_score = -0.5 - (fng_value - 90) * 0.05  # -0.50 ~ -1.00
 
-    print(f"FNG score: {fng_score}")
+    print(f"FNG raw score: {fng_score}")
+
+    # --- F&G スコアキャップ (±0.3) ---
+    # 逆張りシグナルが強すぎると下落トレンドで裏目に出るため制限
+    fng_score = max(-0.3, min(0.3, fng_score))
+    print(f"FNG capped score: {fng_score}")
+
+    # --- F&G トレンド減衰 ---
+    # 恐怖が深まっている最中 or 強欲が加速中の逆張りは早すぎる可能性
+    # → 前回比で3pt以上悪化方向なら逆張りシグナルを50%に減衰
+    if prev_fng_value is not None:
+        fng_trend = fng_value - prev_fng_value
+        print(f"FNG trend: {fng_value} - {prev_fng_value} = {fng_trend:+d}")
+        if fng_score > 0 and fng_trend < -3:
+            # 買いシグナルだが恐怖が深まっている → 落ちるナイフ回避
+            fng_score *= 0.5
+            print(f"FNG dampened (fear deepening): {fng_score}")
+        elif fng_score < 0 and fng_trend > 3:
+            # 売りシグナルだが強欲が加速中 → FOMO継続の可能性
+            fng_score *= 0.5
+            print(f"FNG dampened (greed accelerating): {fng_score}")
+    else:
+        print("No previous FNG data, skipping trend adjustment")
+
+    print(f"FNG final score: {fng_score}")
 
     # === 2. ファンディングレート → スコア変換 ===
     # 正のファンディング = ロング過多 → BUYに不利 (過熱)
@@ -273,10 +325,11 @@ def calculate_market_score(fng_data: dict, funding_data: dict, dominance_data: d
     print(f"Dominance score: {dominance_score}")
 
     # === 統合 ===
-    # Fear & Greed: 50%, Funding: 30%, Dominance: 20%
-    FNG_WEIGHT = 0.50
-    FUNDING_WEIGHT = 0.30
-    DOMINANCE_WEIGHT = 0.20
+    # Fear & Greed: 30%, Funding: 35%, Dominance: 35%
+    # F&Gの比重を下げ、Funding/Dominanceの客観データに重み配分
+    FNG_WEIGHT = 0.30
+    FUNDING_WEIGHT = 0.35
+    DOMINANCE_WEIGHT = 0.35
 
     market_score = (
         fng_score * FNG_WEIGHT +

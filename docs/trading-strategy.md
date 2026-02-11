@@ -118,19 +118,24 @@ total_score = technical × 0.35 + chronos × 0.35 + sentiment × 0.15 + market_c
 
 | 指標 | API | 重み(内部) | 意味 | コスト |
 |---|---|---|---|---|
-| Fear & Greed Index | Alternative.me | 50% | 市場の恐怖/強欲度 (0-100) | 無料 |
-| ファンディングレート | Binance Futures | 30% | レバレッジポジションの偏り | 無料 |
-| BTC Dominance | CoinGecko Global | 20% | 資金フロー方向 | 無料 |
+| Fear & Greed Index | Alternative.me | 30% | 市場の恐怖/強欲度 (0-100)、±0.3キャップ+トレンド減衰 | 無料 |
+| ファンディングレート | Binance Futures | 35% | レバレッジポジションの偏り | 無料 |
+| BTC Dominance | CoinGecko Global | 35% | 資金フロー方向 | 無料 |
 
 ```
-# Fear & Greed Index (逆張りロジック)
-0-10 (Extreme Fear):   スコア +0.50〜+1.00  ← 恐怖は買い機会
-11-25 (Fear):          スコア +0.10〜+0.50
+# Fear & Greed Index (逆張りロジック + キャップ + トレンド減衰)
+0-10 (Extreme Fear):   スコア +0.30 (キャップ)    ← 恐怖は買い機会
+11-25 (Fear):          スコア +0.10〜+0.30
 26-45 (Mild Fear):     スコア  0.00〜+0.10
 46-55 (Neutral):       スコア  0.00
 56-75 (Greed):         スコア -0.10〜 0.00
-76-90 (High Greed):    スコア -0.50〜-0.10
-91-100 (Extreme Greed): スコア -1.00〜-0.50 ← 強欲は危険
+76-90 (High Greed):    スコア -0.30〜-0.10
+91-100 (Extreme Greed): スコア -0.30 (キャップ) ← 強欲は危険
+
+※ キャップ: 逆張りスコアを±0.3に制限（下落トレンドでの早すぎる逆張りを防止）
+※ トレンド減衰: 前回比でF&Gが3pt以上悪化方向 → 逆張りシグナルを50%に減衰
+  例: F&G 15→11 (恐怖深化中): 買いシグナル50%減衰（落ちるナイフを掄まない）
+  例: F&G 80→85 (強欲加速中): 売りシグナル50%減衰（FOMOに逆らわない）
 
 # ファンディングレート (逆符号)
 正のファンディング → ロング過多 → BUYに不利 (過熱)
@@ -147,7 +152,7 @@ BTC Dom > 60%: ETH/XRP/SOL/DOGE/AVAXに -0.05 ペナルティ
 BTC Dom < 40%: ETH/XRP/SOL/DOGE/AVAXに +0.05 ボーナス
 (BTC自身は補正なし)
 
-market_context = fng_score × 0.50 + funding_score × 0.30 + dominance_score × 0.20
+market_context = fng_score × 0.30 + funding_score × 0.35 + dominance_score × 0.35
 ```
 
 **設計上のポイント**:
