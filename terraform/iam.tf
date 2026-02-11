@@ -155,8 +155,8 @@ resource "aws_iam_role_policy" "lambda_custom" {
         ]
         Resource = [
           "arn:aws:bedrock:${var.aws_region}::foundation-model/anthropic.claude-*",
-          "arn:aws:bedrock:${var.aws_region}::foundation-model/amazon.nova-*",
-          "arn:aws:bedrock:${var.aws_region}:${local.account_id}:inference-profile/us.amazon.nova-*"
+          "arn:aws:bedrock:*::foundation-model/amazon.nova-*",
+          "arn:aws:bedrock:${var.aws_region}:${local.account_id}:inference-profile/apac.amazon.nova-*"
         ]
       }
     ]

@@ -23,7 +23,7 @@ from trading_common import TRADING_PAIRS, SENTIMENT_TABLE, dynamodb
 
 # Bedrock クライアント (LLMセンチメント分析用)
 bedrock = boto3.client('bedrock-runtime')
-BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'amazon.nova-micro-v1:0')
+BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'apac.amazon.nova-micro-v1:0')
 
 CRYPTOPANIC_API_KEY = os.environ.get('CRYPTOPANIC_API_KEY', '')
 
