@@ -56,6 +56,7 @@ def get_latest_sentiment(pair: str) -> tuple:
                 'title': h.get('title', ''),
                 'score': float(h.get('score', 0.5)),
                 'source': h.get('source', ''),
+                'published_at_jst': h.get('published_at_jst', ''),
             })
         return float(item.get('score', 0.5)), int(item.get('timestamp', 0)), parsed_headlines
     
