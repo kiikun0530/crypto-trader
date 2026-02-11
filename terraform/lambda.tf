@@ -121,10 +121,8 @@ locals {
     ANALYSIS_STATE_TABLE = aws_dynamodb_table.analysis_state.name
     MARKET_CONTEXT_TABLE = aws_dynamodb_table.market_context.name
     COINCHECK_SECRET_ARN = "arn:aws:secretsmanager:${var.aws_region}:${local.account_id}:secret:coincheck/api-credentials"
-    VOLATILITY_THRESHOLD = tostring(var.volatility_threshold)
     MAX_POSITION_JPY     = tostring(var.max_position_jpy)
     CRYPTOPANIC_API_KEY  = var.cryptopanic_api_key
-    STEP_FUNCTION_ARN    = "arn:aws:states:${var.aws_region}:${local.account_id}:stateMachine:${local.name_prefix}-analysis-workflow"
     ORDER_QUEUE_URL      = "https://sqs.${var.aws_region}.amazonaws.com/${local.account_id}/${local.name_prefix}-order-queue"
     SLACK_WEBHOOK_URL      = var.slack_webhook_url
     TRADING_PAIRS_CONFIG   = trimspace(var.trading_pairs_config)

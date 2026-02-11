@@ -44,7 +44,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 
 | 関数名 | 役割 | 実行間隔 |
 |--------|------|----------|
-| price-collector | 全6通貨の価格取得・変動検知 | 5分 |
+| price-collector | 全６通貨の価格取得 | 5分 |
 | technical | テクニカル指標計算（RSI, MACD, SMA, BB, ADX, ATR） | Step Functions (×6) |
 | chronos-caller | AI時系列予測 (ONNX Runtime, Chronos-T5-Tiny) | Step Functions (×6) |
 | sentiment-getter | 通貨別センチメントスコア取得 | Step Functions (×6) |
@@ -165,7 +165,6 @@ cp terraform.tfvars.example terraform.tfvars
 ```hcl
 environment          = "prod"
 aws_region           = "ap-northeast-1"
-volatility_threshold = 0.3        # 価格変動閾値（%）
 max_position_jpy     = 100000     # 最大ポジション（円）
 slack_webhook_url    = "https://hooks.slack.com/services/xxx/xxx/xxx"
 cryptopanic_api_key  = ""         # オプション

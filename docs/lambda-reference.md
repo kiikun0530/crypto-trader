@@ -17,7 +17,6 @@
 | `SIGNALS_TABLE` | シグナルテーブル名 |
 | `ANALYSIS_STATE_TABLE` | 分析状態テーブル名 |
 | `COINCHECK_SECRET_ARN` | Coincheck API認証情報のARN |
-| `STEP_FUNCTION_ARN` | Step Functions ARN |
 | `ORDER_QUEUE_URL` | SQS注文キューURL |
 | `SLACK_WEBHOOK_URL` | Slack通知用Webhook |
 | `TRADING_PAIRS_CONFIG` | 通貨ペア設定JSON |
@@ -26,7 +25,6 @@
 | `CRYPTOPANIC_API_KEY` | CryptoPanic APIキー |
 | `MARKET_CONTEXT_TABLE` | マーケットコンテキストテーブル名 |
 | `BEDROCK_MODEL_ID` | Bedrock LLMモデルID (センチメント分析) |
-| `VOLATILITY_THRESHOLD` | 変動閾値（%） |
 | `MAX_POSITION_JPY` | 最大ポジション額（円） |
 
 ### 通貨ペア設定 (TRADING_PAIRS_CONFIG)
@@ -57,23 +55,20 @@
 
 ## price-collector
 
-5分間隔で全通貨の価格を Binance から収集し、変動を検知して分析をトリガー。
+5分間隔で全通貨の価格を Binance から収集し、DynamoDB に保存。分析トリガーは行わず、純粋な価格収集のみ。
 
 | 項目 | 値 |
 |---|---|
 | トリガー | EventBridge (5分間隔) |
 | メモリ | 256MB |
 | タイムアウト | 60秒 |
-| DynamoDB | prices (W), analysis_state (R/W) |
+| DynamoDB | prices (W) |
 
 ### 処理フロー
 
 1. `TRADING_PAIRS_CONFIG` から全通貨ペアを取得
-2. 各通貨について Binance API から5分足終値を取得
+2. 各通貨について Binance API から5分足OHLCVを取得
 3. DynamoDB `prices` テーブルに保存
-4. 1時間前の価格と比較して変動率を計算
-5. いずれかの通貨が変動閾値(0.3%)超え、または1時間経過 → Step Functions 起動
-6. **全通貨のペアリスト** を Step Functions に渡す（個別ではなく一括分析）
 
 ### 出力
 
@@ -82,19 +77,8 @@
   "statusCode": 200,
   "body": {
     "pairs_collected": 6,
-    "triggered": 2,
-    "analysis_started": true
+    "errors": 0
   }
-}
-```
-
-### Step Functions への入力
-
-```json
-{
-  "pairs": ["eth_usdt", "btc_usdt", "xrp_usdt", "sol_usdt", "doge_usdt", "avax_usdt"],
-  "timestamp": 1770523800,
-  "trigger_reasons": ["volatility", "periodic"]
 }
 ```
 
@@ -686,10 +670,11 @@ flowchart TD
         E2["5分毎"] --> PM["position-monitor"]
         E3["30分毎"] --> NC["news-collector"]
         E4["30分毎"] --> MC["market-context"]
+        E5["5分毎"] --> MAP
     end
 
     subgraph Step Functions
-        PC -->|"全通貨リスト"| MAP["Map State"]
+        MAP["Map State"]
         MAP --> TECH["technical ×6"]
         MAP --> CHRON["chronos-caller ×6"]
         MAP --> SENT["sentiment-getter ×6"]
@@ -704,7 +689,6 @@ flowchart TD
 
     subgraph DynamoDB
         PC -->|"W"| DB_P["prices"]
-        PC -->|"R/W"| DB_ST["analysis_state"]
         NC -->|"W"| DB_S["sentiment"]
         MC -->|"W"| DB_MC["market-context"]
         TECH -->|"R"| DB_P

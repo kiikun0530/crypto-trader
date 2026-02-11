@@ -111,16 +111,6 @@ resource "aws_iam_role_policy" "lambda_custom" {
           "arn:aws:sns:${var.aws_region}:${local.account_id}:${local.name_prefix}-*"
         ]
       },
-      # Step Functions実行
-      {
-        Effect = "Allow"
-        Action = [
-          "states:StartExecution"
-        ]
-        Resource = [
-          "arn:aws:states:${var.aws_region}:${local.account_id}:stateMachine:${local.name_prefix}-*"
-        ]
-      },
       # S3: ONNXモデル読み取り (Chronos AI価格予測) + モデルアーティファクト
       {
         Effect = "Allow"

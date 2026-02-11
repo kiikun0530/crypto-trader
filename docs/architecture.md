@@ -26,6 +26,7 @@ flowchart LR
 
     subgraph EventBridge["EventBridge Scheduler"]
         EB_PRICE["5分間隔<br/>price-collection"]
+        EB_ANALYSIS["5分間隔<br/>analysis-workflow"]
         EB_POSITION["5分間隔<br/>position-monitor"]
         EB_NEWS["30分間隔<br/>news-collection"]
         EB_MKTCTX["30分間隔<br/>market-context"]
@@ -82,16 +83,16 @@ flowchart LR
 
     %% 定期実行
     EB_PRICE -->|"毎5分"| L_PRICE
+    EB_ANALYSIS -->|"毎5分"| SF_MAP
     EB_POSITION -->|"毎5分"| L_POSITION
     EB_NEWS -->|"30分毎"| L_NEWS
     EB_MKTCTX -->|"30分毎"| L_MKTCTX
 
-    %% 価格収集 → 分析トリガー
-    L_PRICE -->|"6通貨取得"| API_BINANCE
+    %% 価格収集
+    L_PRICE -->|"公通貨取得"| API_BINANCE
     L_PRICE -->|"保存"| DB_PRICES
-    L_PRICE -->|"変動検知"| SF_MAP
 
-    %% Step Functions (Map)
+    %% Step Functions (Map) - EventBridgeから直接起動
     SF_MAP -->|"通貨ごと"| SF_PARALLEL
     SF_PARALLEL --> L_TECH
     SF_PARALLEL --> L_CHRONOS
@@ -269,13 +270,13 @@ Lambda を VPC 内に配置すると、外部 API（Binance, Coincheck, CryptoPa
 | 15分 | 96 | ~$0.2 |
 
 - SMA200 に必要な最低データ量（約17時間分）を 5分足で十分カバー
-- 急変時は変動閾値（0.3%）を超えた時点で即座に分析開始
+- 価格収集・分析ともに5分間隔で定期実行
 - 1分間隔は暗号通貨のボラティリティに対して過剰
 
 ### Step Functions (Map State)
 
 ```
-price-collector
+EventBridge (5分間隔)
   └→ Step Functions
        └→ Map: [eth_usdt, btc_usdt, xrp_usdt, sol_usdt, doge_usdt, avax_usdt]
             MaxConcurrency = 6 (SageMaker Serverless MaxConcurrency=8 の範囲内)

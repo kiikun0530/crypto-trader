@@ -28,6 +28,30 @@ resource "aws_lambda_permission" "price_collection" {
   source_arn    = aws_cloudwatch_event_rule.price_collection.arn
 }
 
+# 分析ワークフロー (5分間隔、EventBridge → Step Functions 直接起動)
+resource "aws_cloudwatch_event_rule" "analysis_workflow" {
+  name                = "${local.name_prefix}-analysis-workflow"
+  description         = "Start analysis workflow every 5 minutes"
+  schedule_expression = "rate(5 minutes)"
+  state               = "ENABLED"
+
+  tags = {
+    Name = "${local.name_prefix}-analysis-workflow"
+  }
+}
+
+resource "aws_cloudwatch_event_target" "analysis_workflow" {
+  rule      = aws_cloudwatch_event_rule.analysis_workflow.name
+  target_id = "AnalysisWorkflow"
+  arn       = aws_sfn_state_machine.analysis_workflow.arn
+  role_arn  = aws_iam_role.eventbridge_execution.arn
+
+  input = jsonencode({
+    pairs     = keys(jsondecode(trimspace(var.trading_pairs_config)))
+    timestamp = 0
+  })
+}
+
 # ポジション監視ルール (5分間隔)
 resource "aws_cloudwatch_event_rule" "position_monitor" {
   name                = "${local.name_prefix}-position-monitor"

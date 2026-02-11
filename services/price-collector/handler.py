@@ -1,6 +1,6 @@
 """
-価格収集 + 変動検知 Lambda
-5分間隔で全対象通貨の価格を取得し、変動を検知して分析をトリガー
+価格収集 Lambda
+5分間隔で全対象通貨の価格を取得しDynamoDBに保存
 Binance APIから複数通貨ペアを一括取得
 """
 import json
@@ -13,21 +13,14 @@ import traceback
 from botocore.exceptions import ClientError
 from trading_common import TRADING_PAIRS, PRICES_TABLE, dynamodb
 
-sfn = boto3.client('stepfunctions')
-
-ANALYSIS_STATE_TABLE = os.environ.get('ANALYSIS_STATE_TABLE', 'eth-trading-analysis-state')
-VOLATILITY_THRESHOLD = float(os.environ.get('VOLATILITY_THRESHOLD', '0.3'))
-STEP_FUNCTION_ARN = os.environ.get('STEP_FUNCTION_ARN', '')
-
 
 def handler(event, context):
-    """全通貨の価格収集 + 変動検知"""
+    """全通貨の価格収集"""
     print(f"Starting price collection for {len(TRADING_PAIRS)} trading pairs")
     print(f"Lambda remaining time: {context.get_remaining_time_in_millis()}ms")
     
     current_time = int(time.time())
     results = []
-    triggered_pairs = []
     errors = []
 
     for pair, config in TRADING_PAIRS.items():
@@ -44,71 +37,24 @@ def handler(event, context):
             # 2. DynamoDBに価格保存（OHLCV付き）
             save_price(pair, candle_time, current_price, candle_data)
             print(f"Successfully saved price data for {pair}")
-            print(f"Saved to DynamoDB: {pair}")
-
-            # 3. 1時間前の価格取得
-            price_1h_ago = get_price_at(pair, current_time - 3600)
-            print(f"Price 1h ago: ${price_1h_ago:.2f}" if price_1h_ago else "Price 1h ago: Not available")
-
-            # 4. 変動率計算
-            if price_1h_ago:
-                change_percent = abs(current_price - price_1h_ago) / price_1h_ago * 100
-            else:
-                change_percent = 0
-            print(f"Change percent: {change_percent:.3f}%")
-
-            # 5. 分析トリガー判定
-            should_analyze, reason = check_analysis_trigger(pair, current_time, change_percent)
-            print(f"Analysis trigger: {should_analyze} ({reason})")
 
             result = {
                 'pair': pair,
                 'name': config['name'],
                 'price': current_price,
-                'change_percent': round(change_percent, 3),
-                'should_analyze': should_analyze,
-                'reason': reason
             }
             results.append(result)
-            print(f"{config['name']} ({pair}): ${current_price:,.2f} ({change_percent:+.2f}%) -> {reason}")
-
-            if should_analyze:
-                triggered_pairs.append({'pair': pair, 'reason': reason})
-                print(f"Added to triggered pairs: {pair} (reason: {reason})")
+            print(f"{config['name']} ({pair}): ${current_price:,.2f}")
 
         except Exception as e:
-            error_msg = f"Error collecting {pair}: {str(e)}"
             print(f"ERROR: {error_msg}")
             print(f"Stack trace for {pair}: {traceback.format_exc()}")
             errors.append(error_msg)
             # エラーが発生しても他の通貨ペアの処理を継続
 
-    print(f"Price collection completed. Triggered pairs: {len(triggered_pairs)}")
-    for tp in triggered_pairs:
-        print(f"  - {tp['pair']}: {tp['reason']}")
+    print(f"Price collection completed. {len(results)} pairs processed, {len(errors)} errors")
 
-    # 6. いずれかの通貨がトリガーされたら、全通貨を一括分析
-    analysis_started = False
-    if triggered_pairs and STEP_FUNCTION_ARN:
-        try:
-            print(f"Starting analysis workflow for {len(triggered_pairs)} triggered pairs")
-            all_pairs = list(TRADING_PAIRS.keys())
-            start_analysis(all_pairs, current_time, triggered_pairs)
-            analysis_started = True
-            print("Analysis workflow successfully started")
-        except Exception as e:
-            error_msg = f"Failed to start analysis workflow: {str(e)}"
-            print(f"ERROR: {error_msg}")
-            print(f"Analysis workflow error trace: {traceback.format_exc()}")
-            errors.append(error_msg)
-    elif triggered_pairs and not STEP_FUNCTION_ARN:
-        print("WARNING: Triggered pairs found but STEP_FUNCTION_ARN is not configured")
-    else:
-        print("No triggered pairs, skipping analysis workflow")
-
-    print(f"Collection summary: {len(results)} pairs processed, {len(triggered_pairs)} triggered, analysis: {analysis_started}")
     if errors:
-        print(f"Errors encountered: {len(errors)}")
         for error in errors:
             print(f"  - {error}")
 
@@ -119,8 +65,6 @@ def handler(event, context):
         'statusCode': 200,
         'body': json.dumps({
             'pairs_collected': len(results),
-            'triggered': len(triggered_pairs),
-            'analysis_started': analysis_started,
             'errors': len(errors),
             'remaining_time_ms': final_remaining_time
         })
@@ -291,132 +235,3 @@ def save_price(pair: str, timestamp: int, price: float, candle_data: dict = None
             else:
                 print(f"All {retries + 1} DynamoDB save attempts failed for {pair}: {error_msg}")
                 raise Exception(f"DynamoDB save failed after {retries + 1} attempts: {error_msg}")
-
-
-def get_price_at(pair: str, target_time: int) -> float:
-    """指定時刻付近の価格取得（5分足のキャンドル境界に対応するため±300秒）"""
-    try:
-        table = dynamodb.Table(PRICES_TABLE)
-        print(f"Querying historical price for {pair} around timestamp {target_time}")
-        
-        response = table.query(
-            KeyConditionExpression='pair = :pair AND #ts BETWEEN :start AND :end',
-            ExpressionAttributeNames={'#ts': 'timestamp'},
-            ExpressionAttributeValues={
-                ':pair': pair,
-                ':start': target_time - 300,
-                ':end': target_time + 300
-            },
-            ScanIndexForward=False,
-            Limit=1
-        )
-        
-        items = response.get('Items', [])
-        print(f"Historical price query returned {len(items)} items for {pair}")
-        
-        if items and 'price' in items[0]:
-            historical_price = float(items[0]['price'])
-            found_timestamp = items[0].get('timestamp', 'unknown')
-            print(f"Found historical price for {pair}: ${historical_price:.2f} at timestamp {found_timestamp}")
-            return historical_price
-        else:
-            print(f"No historical price found for {pair} around timestamp {target_time}")
-            return None
-            
-    except ClientError as e:
-        error_code = e.response['Error']['Code']
-        error_msg = e.response['Error']['Message']
-        print(f"DynamoDB ClientError getting historical price for {pair}: {error_code} - {error_msg}")
-        return None
-    except Exception as e:
-        print(f"Failed to get historical price for {pair}: {str(e)}")
-        print(f"Historical price query error trace for {pair}: {traceback.format_exc()}")
-        return None
-
-
-def check_analysis_trigger(pair: str, current_time: int, change_percent: float) -> tuple:
-    """分析トリガー判定"""
-    try:
-        # 急変時は即座に分析
-        if change_percent >= VOLATILITY_THRESHOLD:
-            print(f"Volatility trigger activated for {pair}: {change_percent:.3f}% >= {VOLATILITY_THRESHOLD}%")
-            return True, 'volatility'
-
-        # 1時間経過で定期分析
-        table = dynamodb.Table(ANALYSIS_STATE_TABLE)
-        print(f"Checking last analysis time for {pair}")
-        
-        response = table.get_item(Key={'pair': pair})
-        last_analysis = response.get('Item', {}).get('last_analysis_time', 0)
-        
-        time_since_last = current_time - last_analysis
-        print(f"Time since last analysis for {pair}: {time_since_last}s (last: {last_analysis}, current: {current_time})")
-
-        if time_since_last >= 3600:
-            print(f"Periodic trigger activated for {pair}: {time_since_last}s >= 3600s")
-            return True, 'periodic'
-
-        print(f"No trigger for {pair}: change={change_percent:.3f}% < {VOLATILITY_THRESHOLD}%, time={time_since_last}s < 3600s")
-        return False, 'skip'
-        
-    except ClientError as e:
-        error_code = e.response['Error']['Code']
-        error_msg = e.response['Error']['Message']
-        print(f"DynamoDB ClientError checking analysis trigger for {pair}: {error_code} - {error_msg}")
-        return False, 'error'
-    except Exception as e:
-        print(f"Failed to check analysis trigger for {pair}: {str(e)}")
-        print(f"Analysis trigger check error trace for {pair}: {traceback.format_exc()}")
-        return False, 'error'
-
-
-def start_analysis(pairs: list, timestamp: int, triggered: list):
-    """Step Functions分析ワークフロー開始（全通貨一括）"""
-    try:
-        print(f"Updating analysis state for {len(pairs)} pairs...")
-        # 分析状態を全通貨分更新
-        table = dynamodb.Table(ANALYSIS_STATE_TABLE)
-        successful_updates = 0
-        
-        for pair in pairs:
-            try:
-                table.put_item(Item={
-                    'pair': pair,
-                    'last_analysis_time': timestamp
-                })
-                print(f"Updated analysis state for {pair}")
-                successful_updates += 1
-            except Exception as e:
-                print(f"Failed to update analysis state for {pair}: {str(e)}")
-                # 個別エラーは警告として扱い、継続
-
-        print(f"Successfully updated analysis state for {successful_updates}/{len(pairs)} pairs")
-
-        # Step Functions実行（全通貨リストを渡す）
-        reasons = list(set([t['reason'] for t in triggered]))
-        execution_input = {
-            'pairs': pairs,
-            'timestamp': timestamp,
-            'trigger_reasons': reasons
-        }
-        
-        print(f"Starting Step Functions execution with input: {json.dumps(execution_input)}")
-        response = sfn.start_execution(
-            stateMachineArn=STEP_FUNCTION_ARN,
-            input=json.dumps(execution_input)
-        )
-        
-        execution_arn = response.get('executionArn', 'unknown')
-        triggered_info = ', '.join([f"{t['pair']}({t['reason']})" for t in triggered])
-        print(f"Analysis workflow started: {triggered_info} -> analyzing all {len(pairs)} pairs")
-        print(f"Step Functions execution ARN: {execution_arn}")
-        
-    except ClientError as e:
-        error_code = e.response['Error']['Code']
-        error_msg = e.response['Error']['Message']
-        print(f"Step Functions ClientError: {error_code} - {error_msg}")
-        raise Exception(f"Step Functions execution failed: {error_code} - {error_msg}")
-    except Exception as e:
-        print(f"Failed to start analysis workflow: {str(e)}")
-        print(f"Start analysis error trace: {traceback.format_exc()}")
-        raise e

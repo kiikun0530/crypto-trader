@@ -23,12 +23,6 @@ variable "trading_pair" {
 # ============================================
 # Trading Settings
 # ============================================
-variable "volatility_threshold" {
-  description = "Price volatility threshold for triggering analysis (%)"
-  type        = number
-  default     = 0.3
-}
-
 variable "max_position_jpy" {
   description = "Maximum position size in JPY"
   type        = number
