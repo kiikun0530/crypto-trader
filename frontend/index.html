@@ -1,0 +1,855 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CryptoSignal AI - 仮想通貨AI売買シグナル</title>
+    <style>
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-card: #1c2128;
+            --border: #30363d;
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --accent-green: #3fb950;
+            --accent-red: #f85149;
+            --accent-yellow: #d29922;
+            --accent-blue: #58a6ff;
+            --accent-purple: #bc8cff;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+        }
+
+        .container { max-width: 1200px; margin: 0 auto; padding: 0 20px; }
+
+        /* Header */
+        header {
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            padding: 16px 0;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .header-content {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--accent-blue);
+        }
+
+        .logo span { color: var(--accent-purple); }
+
+        .header-badge {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .delay-badge {
+            background: var(--accent-yellow);
+            color: #000;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        .delay-badge.realtime {
+            background: var(--accent-green);
+        }
+
+        .premium-btn {
+            background: linear-gradient(135deg, var(--accent-purple), var(--accent-blue));
+            color: white;
+            border: none;
+            padding: 8px 20px;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+
+        .premium-btn:hover { opacity: 0.85; }
+
+        /* Hero */
+        .hero {
+            text-align: center;
+            padding: 50px 0 30px;
+        }
+
+        .hero h1 {
+            font-size: 2.5rem;
+            margin-bottom: 12px;
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .hero p {
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+            max-width: 600px;
+            margin: 0 auto;
+        }
+
+        /* Stats Bar */
+        .stats-bar {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin: 30px 0;
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            text-align: center;
+        }
+
+        .stat-card .label {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            margin-bottom: 4px;
+        }
+
+        .stat-card .value {
+            font-size: 1.8rem;
+            font-weight: 700;
+        }
+
+        .stat-card .value.positive { color: var(--accent-green); }
+        .stat-card .value.negative { color: var(--accent-red); }
+
+        /* Signal Cards */
+        .section-title {
+            font-size: 1.3rem;
+            margin: 30px 0 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .signal-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+            gap: 16px;
+        }
+
+        .signal-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            transition: border-color 0.2s;
+        }
+
+        .signal-card:hover { border-color: var(--accent-blue); }
+
+        .signal-card.buy { border-left: 4px solid var(--accent-green); }
+        .signal-card.sell { border-left: 4px solid var(--accent-red); }
+        .signal-card.hold { border-left: 4px solid var(--text-secondary); }
+
+        .signal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .pair-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .pair-symbol {
+            font-size: 1.2rem;
+            font-weight: 700;
+        }
+
+        .pair-name {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+        }
+
+        .signal-badge {
+            padding: 4px 14px;
+            border-radius: 6px;
+            font-weight: 700;
+            font-size: 0.9rem;
+        }
+
+        .signal-badge.buy {
+            background: rgba(63, 185, 80, 0.15);
+            color: var(--accent-green);
+        }
+
+        .signal-badge.sell {
+            background: rgba(248, 81, 73, 0.15);
+            color: var(--accent-red);
+        }
+
+        .signal-badge.hold {
+            background: rgba(139, 148, 158, 0.15);
+            color: var(--text-secondary);
+        }
+
+        .score-bar {
+            margin: 12px 0;
+        }
+
+        .score-bar-label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-bottom: 4px;
+        }
+
+        .score-bar-track {
+            height: 6px;
+            background: var(--border);
+            border-radius: 3px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .score-bar-fill {
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.5s ease;
+        }
+
+        .component-scores {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-top: 12px;
+        }
+
+        .component {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.82rem;
+            padding: 4px 8px;
+            background: var(--bg-secondary);
+            border-radius: 4px;
+        }
+
+        .component .name { color: var(--text-secondary); }
+
+        .component .val.positive { color: var(--accent-green); }
+        .component .val.negative { color: var(--accent-red); }
+
+        .signal-time {
+            margin-top: 10px;
+            font-size: 0.78rem;
+            color: var(--text-secondary);
+            text-align: right;
+        }
+
+        /* Market Context */
+        .market-bar {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 16px;
+            margin: 16px 0 30px;
+        }
+
+        .market-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 16px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .market-card .label {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        .market-card .value {
+            font-size: 1.3rem;
+            font-weight: 600;
+        }
+
+        /* Premium CTA */
+        .premium-cta {
+            background: linear-gradient(135deg, rgba(188, 140, 255, 0.1), rgba(88, 166, 255, 0.1));
+            border: 1px solid var(--accent-purple);
+            border-radius: 16px;
+            padding: 40px;
+            text-align: center;
+            margin: 40px 0;
+        }
+
+        .premium-cta h2 {
+            font-size: 1.8rem;
+            margin-bottom: 12px;
+        }
+
+        .premium-cta p {
+            color: var(--text-secondary);
+            margin-bottom: 24px;
+            max-width: 500px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .pricing-cards {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+
+        .price-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px 32px;
+            min-width: 220px;
+        }
+
+        .price-card.featured {
+            border-color: var(--accent-purple);
+            position: relative;
+        }
+
+        .price-card.featured::before {
+            content: 'おすすめ';
+            position: absolute;
+            top: -10px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--accent-purple);
+            color: white;
+            padding: 2px 12px;
+            border-radius: 10px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .price-card .plan-name {
+            font-size: 1.1rem;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+
+        .price-card .price {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--accent-blue);
+        }
+
+        .price-card .price span {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .price-card .features {
+            margin-top: 16px;
+            list-style: none;
+            text-align: left;
+        }
+
+        .price-card .features li {
+            padding: 4px 0;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+
+        .price-card .features li::before {
+            content: '✓ ';
+            color: var(--accent-green);
+        }
+
+        .subscribe-btn {
+            margin-top: 20px;
+            width: 100%;
+            padding: 10px;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            font-size: 0.95rem;
+        }
+
+        .subscribe-btn.primary {
+            background: linear-gradient(135deg, var(--accent-purple), var(--accent-blue));
+            color: white;
+        }
+
+        .subscribe-btn.secondary {
+            background: var(--bg-card);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+
+        /* Footer */
+        footer {
+            border-top: 1px solid var(--border);
+            padding: 30px 0;
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            margin-top: 40px;
+        }
+
+        footer a { color: var(--accent-blue); text-decoration: none; }
+
+        /* Loading */
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-secondary);
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 30px;
+            height: 30px;
+            border: 3px solid var(--border);
+            border-top-color: var(--accent-blue);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .hero h1 { font-size: 1.8rem; }
+            .signal-grid { grid-template-columns: 1fr; }
+            .pricing-cards { flex-direction: column; align-items: center; }
+        }
+
+        /* API Key Modal */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.7);
+            z-index: 200;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal-overlay.active { display: flex; }
+
+        .modal {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 32px;
+            max-width: 400px;
+            width: 90%;
+        }
+
+        .modal h3 { margin-bottom: 16px; }
+
+        .modal input {
+            width: 100%;
+            padding: 10px 14px;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 0.95rem;
+            margin-bottom: 16px;
+        }
+
+        .modal-btns {
+            display: flex;
+            gap: 12px;
+        }
+
+        .modal-btns button {
+            flex: 1;
+            padding: 10px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body>
+    <!-- Header -->
+    <header>
+        <div class="container header-content">
+            <div class="logo">Crypto<span>Signal</span> AI</div>
+            <div class="header-badge">
+                <div class="delay-badge" id="delayBadge">30分遅延</div>
+                <button class="premium-btn" id="apiKeyBtn">🔑 APIキー入力</button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Hero -->
+    <div class="container">
+        <div class="hero">
+            <h1>AI仮想通貨売買シグナル</h1>
+            <p>テクニカル分析 × AI予測 × センチメント × マーケット環境を統合した6通貨のリアルタイム売買判断</p>
+        </div>
+
+        <!-- Market Context -->
+        <div class="section-title">📊 マーケット環境</div>
+        <div class="market-bar" id="marketBar">
+            <div class="loading"><div class="spinner"></div></div>
+        </div>
+
+        <!-- Stats -->
+        <div class="stats-bar" id="statsBar">
+            <div class="loading"><div class="spinner"></div></div>
+        </div>
+
+        <!-- Signals -->
+        <div class="section-title">🎯 売買シグナル <span id="updateTime" style="font-size:0.8rem; color:var(--text-secondary); font-weight:400;"></span></div>
+        <div class="signal-grid" id="signalGrid">
+            <div class="loading"><div class="spinner"></div></div>
+        </div>
+
+        <!-- Premium CTA -->
+        <div class="premium-cta">
+            <h2>🚀 リアルタイムシグナルで差をつけよう</h2>
+            <p>無料版は30分遅延。有料プランならAIの売買判断をリアルタイムで受け取れます。</p>
+            <div class="pricing-cards">
+                <div class="price-card">
+                    <div class="plan-name">Free</div>
+                    <div class="price">¥0<span>/月</span></div>
+                    <ul class="features">
+                        <li>30分遅延シグナル</li>
+                        <li>6通貨ランキング</li>
+                        <li>マーケット環境</li>
+                        <li>パフォーマンス統計</li>
+                    </ul>
+                    <button class="subscribe-btn secondary">現在のプラン</button>
+                </div>
+                <div class="price-card featured">
+                    <div class="plan-name">Pro</div>
+                    <div class="price">¥2,980<span>/月</span></div>
+                    <ul class="features">
+                        <li>リアルタイムシグナル</li>
+                        <li>コンポーネント詳細スコア</li>
+                        <li>API アクセス</li>
+                        <li>Discord通知連携</li>
+                        <li>72h履歴データ</li>
+                    </ul>
+                    <button class="subscribe-btn primary" onclick="alert('Coming Soon! 準備中です')">プランを始める</button>
+                </div>
+                <div class="price-card">
+                    <div class="plan-name">Enterprise</div>
+                    <div class="price">¥9,800<span>/月</span></div>
+                    <ul class="features">
+                        <li>Pro全機能</li>
+                        <li>Webhook連携</li>
+                        <li>カスタムアラート</li>
+                        <li>優先サポート</li>
+                        <li>APIレート制限緩和</li>
+                    </ul>
+                    <button class="subscribe-btn secondary" onclick="alert('Coming Soon! 準備中です')">お問い合わせ</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <p>⚠️ 投資は自己責任です。当サイトのシグナルは参考情報であり、投資助言ではありません。</p>
+            <p style="margin-top:8px;">CryptoSignal AI © 2026 | Powered by Chronos-2 AI + Multi-Factor Analysis</p>
+        </div>
+    </footer>
+
+    <!-- API Key Modal -->
+    <div class="modal-overlay" id="apiKeyModal">
+        <div class="modal">
+            <h3>🔑 APIキー入力</h3>
+            <p style="color:var(--text-secondary); font-size:0.9rem; margin-bottom:16px;">有料プランのAPIキーを入力するとリアルタイムデータに切り替わります</p>
+            <input type="text" id="apiKeyInput" placeholder="sk-xxxxxxxxxxxxxxxxxxxx">
+            <div class="modal-btns">
+                <button style="background:var(--bg-card); color:var(--text-primary);" onclick="closeModal()">キャンセル</button>
+                <button style="background:var(--accent-blue); color:white;" onclick="saveApiKey()">接続</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    // =========================================================================
+    // Configuration
+    // =========================================================================
+    // TODO: デプロイ後にAPI GatewayのURLに変更
+    const API_BASE = localStorage.getItem('signal_api_url') || '/api';
+    let API_KEY = localStorage.getItem('signal_api_key') || '';
+    let isPremium = false;
+
+    // Auto-refresh interval (60 seconds)
+    const REFRESH_INTERVAL = 60000;
+
+    // =========================================================================
+    // API Calls
+    // =========================================================================
+    async function fetchAPI(endpoint, params = {}) {
+        const url = new URL(`${API_BASE}/signals/${endpoint}`, window.location.origin);
+        Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+
+        const headers = { 'Content-Type': 'application/json' };
+        if (API_KEY) headers['X-Api-Key'] = API_KEY;
+
+        try {
+            const res = await fetch(url.toString(), { headers });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return await res.json();
+        } catch (e) {
+            console.error(`API Error (${endpoint}):`, e);
+            return null;
+        }
+    }
+
+    // =========================================================================
+    // Render Functions
+    // =========================================================================
+    function renderSignals(data) {
+        if (!data || !data.signals) {
+            document.getElementById('signalGrid').innerHTML =
+                '<div class="loading">データ取得中...</div>';
+            return;
+        }
+
+        isPremium = data.is_realtime;
+        updatePremiumUI();
+
+        const grid = document.getElementById('signalGrid');
+        grid.innerHTML = data.signals.map(s => {
+            const signalClass = s.signal.toLowerCase();
+            const score = parseFloat(s.score || 0);
+            const scorePct = ((score + 1) / 2 * 100).toFixed(0);
+            const scoreColor = score > 0 ? 'var(--accent-green)' : score < 0 ? 'var(--accent-red)' : 'var(--text-secondary)';
+            const time = new Date(s.timestamp * 1000).toLocaleString('ja-JP');
+
+            return `
+            <div class="signal-card ${signalClass}">
+                <div class="signal-header">
+                    <div class="pair-info">
+                        <span class="pair-symbol">${s.symbol || s.pair.split('_')[0].toUpperCase()}</span>
+                        <span class="pair-name">${s.name}</span>
+                    </div>
+                    <span class="signal-badge ${signalClass}">${s.signal}</span>
+                </div>
+                <div class="score-bar">
+                    <div class="score-bar-label">
+                        <span>総合スコア</span>
+                        <span style="color:${scoreColor}; font-weight:600;">${score.toFixed(4)}</span>
+                    </div>
+                    <div class="score-bar-track">
+                        <div class="score-bar-fill" style="width:${scorePct}%; background:${scoreColor};"></div>
+                    </div>
+                </div>
+                <div class="component-scores">
+                    ${renderComponent('テクニカル', s.technical_score)}
+                    ${renderComponent('AI予測', s.chronos_score)}
+                    ${renderComponent('センチメント', s.sentiment_score)}
+                    ${renderComponent('市場環境', s.market_context_score)}
+                </div>
+                <div style="margin-top:8px; font-size:0.78rem; color:var(--text-secondary);">
+                    閾値: BUY≥${parseFloat(s.buy_threshold || 0).toFixed(3)} / SELL≤${parseFloat(s.sell_threshold || 0).toFixed(3)}
+                </div>
+                <div class="signal-time">${time}</div>
+            </div>`;
+        }).join('');
+
+        document.getElementById('updateTime').textContent =
+            `最終更新: ${new Date().toLocaleTimeString('ja-JP')}` +
+            (data.delay_minutes > 0 ? ` (${data.delay_minutes}分遅延)` : ' (リアルタイム)');
+    }
+
+    function renderComponent(name, value) {
+        const v = parseFloat(value || 0);
+        const cls = v > 0 ? 'positive' : v < 0 ? 'negative' : '';
+        return `<div class="component">
+            <span class="name">${name}</span>
+            <span class="val ${cls}">${v.toFixed(3)}</span>
+        </div>`;
+    }
+
+    function renderMarket(data) {
+        if (!data || !data.market_context) return;
+
+        const ctx = data.market_context;
+        const bar = document.getElementById('marketBar');
+
+        const cards = [];
+
+        if (ctx.fear_greed) {
+            const val = parseFloat(ctx.fear_greed.value || 50);
+            const cls = ctx.fear_greed.classification || '';
+            let emoji = '😐';
+            if (val <= 25) emoji = '😱';
+            else if (val <= 40) emoji = '😨';
+            else if (val >= 75) emoji = '🤑';
+            else if (val >= 60) emoji = '😀';
+            cards.push(`<div class="market-card">
+                <div><div class="label">Fear & Greed Index</div><div style="font-size:0.8rem; color:var(--text-secondary);">${cls}</div></div>
+                <div class="value">${emoji} ${val.toFixed(0)}</div>
+            </div>`);
+        }
+
+        if (ctx.btc_dominance) {
+            const val = parseFloat(ctx.btc_dominance.value || 0);
+            cards.push(`<div class="market-card">
+                <div class="label">BTC Dominance</div>
+                <div class="value">${val.toFixed(1)}%</div>
+            </div>`);
+        }
+
+        if (ctx.funding_rate) {
+            const val = parseFloat(ctx.funding_rate.value || 0);
+            const color = val > 0 ? 'var(--accent-green)' : val < 0 ? 'var(--accent-red)' : '';
+            cards.push(`<div class="market-card">
+                <div class="label">Funding Rate (BTC)</div>
+                <div class="value" style="color:${color}">${(val * 100).toFixed(4)}%</div>
+            </div>`);
+        }
+
+        bar.innerHTML = cards.join('') || '<div style="color:var(--text-secondary)">マーケットデータ取得中...</div>';
+    }
+
+    function renderStats(data) {
+        if (!data || !data.total) return;
+
+        const t = data.total;
+        const bar = document.getElementById('statsBar');
+
+        bar.innerHTML = `
+            <div class="stat-card">
+                <div class="label">総取引数 (${data.period_days}日)</div>
+                <div class="value">${t.trades}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">勝率</div>
+                <div class="value ${t.win_rate >= 50 ? 'positive' : 'negative'}">${t.win_rate}%</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">勝ち / 負け</div>
+                <div class="value"><span class="positive">${t.wins}</span> / <span class="negative">${t.losses}</span></div>
+            </div>
+            <div class="stat-card">
+                <div class="label">累計損益率</div>
+                <div class="value ${t.total_pnl_pct >= 0 ? 'positive' : 'negative'}">${t.total_pnl_pct > 0 ? '+' : ''}${t.total_pnl_pct}%</div>
+            </div>
+        `;
+    }
+
+    function updatePremiumUI() {
+        const badge = document.getElementById('delayBadge');
+        if (isPremium) {
+            badge.textContent = 'リアルタイム';
+            badge.classList.add('realtime');
+        } else {
+            badge.textContent = '30分遅延';
+            badge.classList.remove('realtime');
+        }
+    }
+
+    // =========================================================================
+    // Modal
+    // =========================================================================
+    document.getElementById('apiKeyBtn').addEventListener('click', () => {
+        document.getElementById('apiKeyModal').classList.add('active');
+        document.getElementById('apiKeyInput').value = API_KEY;
+    });
+
+    function closeModal() {
+        document.getElementById('apiKeyModal').classList.remove('active');
+    }
+
+    function saveApiKey() {
+        API_KEY = document.getElementById('apiKeyInput').value.trim();
+        localStorage.setItem('signal_api_key', API_KEY);
+        closeModal();
+        loadAll();
+    }
+
+    document.getElementById('apiKeyModal').addEventListener('click', (e) => {
+        if (e.target === document.getElementById('apiKeyModal')) closeModal();
+    });
+
+    // =========================================================================
+    // Data Loading
+    // =========================================================================
+    async function loadAll() {
+        const [signals, market, stats] = await Promise.all([
+            fetchAPI('latest'),
+            fetchAPI('market'),
+            fetchAPI('performance', { days: 30 }),
+        ]);
+
+        renderSignals(signals);
+        renderMarket(market);
+        renderStats(stats);
+    }
+
+    // Initial load
+    loadAll();
+
+    // Auto-refresh
+    setInterval(loadAll, REFRESH_INTERVAL);
+
+    // =========================================================================
+    // Demo Mode (API未接続時のサンプルデータ)
+    // =========================================================================
+    setTimeout(() => {
+        const grid = document.getElementById('signalGrid');
+        if (grid.querySelector('.loading')) {
+            // API無応答時はデモデータ表示
+            renderSignals({
+                signals: [
+                    { pair: 'eth_usdt', name: 'Ethereum', symbol: 'ETH', signal: 'BUY', score: 0.312, technical_score: 0.45, chronos_score: 0.28, sentiment_score: 0.15, market_context_score: 0.08, buy_threshold: 0.25, sell_threshold: -0.13, timestamp: Math.floor(Date.now()/1000) - 1800 },
+                    { pair: 'btc_usdt', name: 'Bitcoin', symbol: 'BTC', signal: 'HOLD', score: 0.089, technical_score: 0.12, chronos_score: 0.05, sentiment_score: 0.03, market_context_score: -0.01, buy_threshold: 0.25, sell_threshold: -0.13, timestamp: Math.floor(Date.now()/1000) - 1800 },
+                    { pair: 'sol_usdt', name: 'Solana', symbol: 'SOL', signal: 'HOLD', score: 0.045, technical_score: 0.08, chronos_score: 0.02, sentiment_score: -0.02, market_context_score: 0.01, buy_threshold: 0.25, sell_threshold: -0.13, timestamp: Math.floor(Date.now()/1000) - 1800 },
+                    { pair: 'xrp_usdt', name: 'XRP', symbol: 'XRP', signal: 'SELL', score: -0.185, technical_score: -0.22, chronos_score: -0.15, sentiment_score: -0.08, market_context_score: 0.03, buy_threshold: 0.25, sell_threshold: -0.13, timestamp: Math.floor(Date.now()/1000) - 1800 },
+                    { pair: 'avax_usdt', name: 'Avalanche', symbol: 'AVAX', signal: 'HOLD', score: 0.021, technical_score: 0.05, chronos_score: -0.01, sentiment_score: 0.01, market_context_score: -0.02, buy_threshold: 0.25, sell_threshold: -0.13, timestamp: Math.floor(Date.now()/1000) - 1800 },
+                    { pair: 'doge_usdt', name: 'Dogecoin', symbol: 'DOGE', signal: 'HOLD', score: -0.056, technical_score: -0.08, chronos_score: -0.03, sentiment_score: 0.02, market_context_score: 0.01, buy_threshold: 0.25, sell_threshold: -0.13, timestamp: Math.floor(Date.now()/1000) - 1800 },
+                ],
+                is_realtime: false,
+                delay_minutes: 30,
+                timestamp: Math.floor(Date.now()/1000),
+            });
+            renderMarket({
+                market_context: {
+                    fear_greed: { value: 62, classification: 'Greed' },
+                    btc_dominance: { value: 54.3 },
+                    funding_rate: { value: 0.00012 },
+                }
+            });
+            renderStats({
+                period_days: 30,
+                total: { trades: 47, wins: 28, losses: 19, win_rate: 59.6, total_pnl_pct: 8.42 }
+            });
+        }
+    }, 3000);
+    </script>
+</body>
+</html>

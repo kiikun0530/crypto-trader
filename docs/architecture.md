@@ -29,7 +29,6 @@ flowchart LR
         EB_POSITION["5分間隔<br/>position-monitor"]
         EB_NEWS["30分間隔<br/>news-collection"]
         EB_MKTCTX["30分間隔<br/>market-context"]
-        EB_DAILY["毎日23:00 JST<br/>daily-reporter"]
     end
 
     subgraph Lambda["Lambda Functions (VPC外)"]
@@ -43,7 +42,6 @@ flowchart LR
         L_NEWS["news-collector<br/>ニュース収集"]
         L_MKTCTX["market-context<br/>市場環境収集"]
         L_REMEDIATE["error-remediator<br/>エラー自動修復"]
-        L_DAILY["daily-reporter<br/>日次レポート+自動改善"]
     end
 
     subgraph StepFunctions["Step Functions (Map State)"]
@@ -309,22 +307,11 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
                                             └→ Slack通知（エラー内容）
 ```
 
-- **CloudWatch Alarms (23個)**: 全11 Lambda × (Errors + Duration) + DLQアラーム で異常検知
-- **Subscription Filters (10個)**: warm-up以外の全Lambdaのエラーログを検知
+- **CloudWatch Alarms (21個)**: 全10 Lambda × (Errors + Duration) + DLQアラーム で異常検知
+- **Subscription Filters (9個)**: warm-up以外の全Lambdaのエラーログを検知
   - フィルターパターン: `?"[ERROR]" ?Traceback ?"raise Exception" -"[INFO]" -"expected behavior" -"retrying in"`
   - SageMaker Serverless の想定内リトライログ（ThrottlingException → 自動リカバリ）を除外
 - **error-remediator Lambda**: エラー検知 → Slack通知（30分クールダウン付き）
-
-### 日次レポートパイプライン
-
-```
-EventBridge (23:00 JST) → daily-reporter Lambda
-                              ├→ S3にJSON日次レポート保存 (90日保持)
-                              └→ Slackに日次サマリー通知
-```
-
-- **データ品質評価**: Wilson信頼区間95%、最低5トレード/週
-- **コスト**: ~$0.01/日 (Lambda)
 
 ### DynamoDB
 
@@ -385,11 +372,11 @@ IAM ロールは最小権限原則で設計。各 Lambda は必要な DynamoDB �
 
 | 項目 | 月額 | 備考 |
 |---|---|---|
-| Lambda | ~$5.00 | 6通貨分析 + ONNX推論 + error-remediator + daily-reporter含む |
+| Lambda | ~$5.00 | 6通貨分析 + ONNX推論 + error-remediator含む |
 | DynamoDB | ~$0.30 | 7テーブル×6通貨分のR/W + クールダウン |
 | Bedrock | ~$2.00 | Claude 3.5 Haiku センチメント分析 (48回/日) |
 | Step Functions | ~$0.10 | Map State で遷移数増加 |
-| CloudWatch | ~$0.55 | ログ保存14日 + Metric Alarms 23個 + Subscription Filters |
+| CloudWatch | ~$0.55 | ログ保存14日 + Metric Alarms 21個 + Subscription Filters |
 | Secrets Manager | ~$0.50 | Coincheck APIキー |
 | SQS/SNS/EventBridge | ~$0.05 | 軽微 |
 | **AWS合計** | **~$9/月** | |

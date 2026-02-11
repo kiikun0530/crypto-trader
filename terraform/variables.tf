@@ -46,6 +46,15 @@ variable "trading_pairs_config" {
 EOT
 }
 
+# ============================================
+# Signal API Settings
+# ============================================
+variable "signal_api_cors_origin" {
+  description = "CORS origin for Signal API (e.g. https://your-domain.com or * for dev)"
+  type        = string
+  default     = "*"
+}
+
 # (SageMaker設定は削除 — ONNX Runtime Lambda移行済み)
 
 # ============================================

@@ -106,28 +106,4 @@ resource "aws_lambda_permission" "market_context" {
   source_arn    = aws_cloudwatch_event_rule.market_context.arn
 }
 
-# 日次レポート (毎日 23:00 JST = 14:00 UTC)
-resource "aws_cloudwatch_event_rule" "daily_reporter" {
-  name                = "${local.name_prefix}-daily-reporter"
-  description         = "Generate daily trading report at 23:00 JST"
-  schedule_expression = "cron(0 14 * * ? *)"
-  state               = "ENABLED"
 
-  tags = {
-    Name = "${local.name_prefix}-daily-reporter"
-  }
-}
-
-resource "aws_cloudwatch_event_target" "daily_reporter" {
-  rule      = aws_cloudwatch_event_rule.daily_reporter.name
-  target_id = "DailyReporterLambda"
-  arn       = aws_lambda_function.functions["daily-reporter"].arn
-}
-
-resource "aws_lambda_permission" "daily_reporter" {
-  statement_id  = "AllowEventBridgeInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.functions["daily-reporter"].function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.daily_reporter.arn
-}

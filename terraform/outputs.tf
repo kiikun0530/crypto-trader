@@ -70,6 +70,29 @@ output "alerts_topic_arn" {
 }
 
 # -----------------------------------------------------------------------------
+# Signal API Outputs
+# -----------------------------------------------------------------------------
+output "signal_api_url" {
+  description = "Signal API Gateway URL"
+  value       = "${aws_api_gateway_stage.signal_api.invoke_url}/signals"
+}
+
+output "signal_api_id" {
+  description = "Signal API Gateway ID"
+  value       = aws_api_gateway_rest_api.signal_api.id
+}
+
+output "signal_frontend_bucket" {
+  description = "Signal frontend S3 bucket name"
+  value       = aws_s3_bucket.signal_frontend.bucket
+}
+
+output "signal_frontend_url" {
+  description = "Signal frontend website URL"
+  value       = aws_s3_bucket_website_configuration.signal_frontend.website_endpoint
+}
+
+# -----------------------------------------------------------------------------
 # IAM Outputs
 # -----------------------------------------------------------------------------
 output "lambda_execution_role_arn" {

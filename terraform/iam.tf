@@ -73,7 +73,9 @@ resource "aws_iam_role_policy" "lambda_custom" {
           "${aws_dynamodb_table.trades.arn}/index/*",
           "${aws_dynamodb_table.signals.arn}/index/*",
           "${aws_dynamodb_table.analysis_state.arn}/index/*",
-          "${aws_dynamodb_table.market_context.arn}/index/*"
+          "${aws_dynamodb_table.market_context.arn}/index/*",
+          aws_dynamodb_table.api_keys.arn,
+          "${aws_dynamodb_table.api_keys.arn}/index/*"
         ]
       },
       # Secrets Managerアクセス
