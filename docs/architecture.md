@@ -25,8 +25,8 @@ flowchart LR
     end
 
     subgraph EventBridge["EventBridge Scheduler"]
-        EB_PRICE["5分間隔<br/>price-collection"]
         EB_ANALYSIS["5分間隔<br/>analysis-workflow"]
+        EB_PRICE["5分間隔<br/>price-collection"]
         EB_POSITION["5分間隔<br/>position-monitor"]
         EB_NEWS["30分間隔<br/>news-collection"]
         EB_MKTCTX["30分間隔<br/>market-context"]
@@ -118,7 +118,7 @@ flowchart LR
     L_POSITION -->|"R"| DB_POSITIONS
 
     %% 注文
-    L_AGG -->|"最高スコア通貨"| SQS_ORDER
+    L_AGG -->|"BUY/SELL バッチ送信"| SQS_ORDER
     SQS_ORDER --> L_ORDER
     SQS_ORDER -.->|"3回失敗"| SQS_DLQ
 

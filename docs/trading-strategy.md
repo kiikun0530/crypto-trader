@@ -19,22 +19,25 @@ flowchart TD
         A4["マーケットコンテキスト<br/>F&G, Funding, BTC Dom"]
     end
 
-    subgraph 判定["スコア比較 → 売買判定"]
+    subgraph 判定["スコア比較 → 通貨毎判定"]
         S["全通貨スコアリング<br/>& ランキング"]
-        SELL_CHK{"保有通貨の<br/>SELL判定"}
-        BUY_CHK{"未保有通貨の<br/>BUY判定"}
-        SELL["SELL対象を売却"]
-        BUY["最高スコアの<br/>未保有通貨をBUY"]
-        HOLD["HOLD"]
+        EACH{"通貨毎に<br/>BUY/SELL/HOLD判定<br/>(ポジション非依存)"}
+        QUEUE["BUY/SELLがあれば<br/>バッチでSQS送信"]
+        ALL_HOLD["ALL HOLD<br/>キュー送信なし"]
+    end
+
+    subgraph 実行["order-executor"]
+        SELL_EXEC["SELL: ポジションあれば売却<br/>なければスキップ"]
+        BUY_EXEC["BUY: スコア順に<br/>残高と相談して購入"]
     end
 
     収集 --> 分析
     分析 --> S
-    S --> SELL_CHK
-    SELL_CHK -->|"スコア<=sell_threshold"| SELL
-    SELL_CHK -->|"SELL対象なし"| BUY_CHK
-    BUY_CHK -->|"未保有 & スコア>=buy_threshold"| BUY
-    BUY_CHK -->|"該当なし"| HOLD
+    S --> EACH
+    EACH -->|"BUY/SELLあり"| QUEUE
+    EACH -->|"全てHOLD"| ALL_HOLD
+    QUEUE --> SELL_EXEC
+    QUEUE --> BUY_EXEC
 ```
 
 ---
@@ -168,9 +171,11 @@ market_context = fng_score × 0.30 + funding_score × 0.35 + dominance_score × 
 
 ## 売買判定ロジック
 
-### 複数ポジション同時保有（SELL優先ロジック）
+### 通貨毎のBUY/SELL/HOLD判定（ポジション非依存）
 
-**方針**: 全通貨を通じて **複数のポジションを同時に保有可能**。SELL判定を優先し、その後に未保有通貨のBUY判定を行う。
+**方針**: aggregator は全通貨を純粋にスコアと閾値で判定し、現在のポジション状況に影響されない。
+BUY/SELLがある場合のみ1つのSQSメッセージとしてバッチ送信。全てHOLDならキュー呼び出しなし。
+order-executor が残高・ポジションを確認して実際の注文を実行する。
 
 ```
 # 1. ボラティリティ適応型閾値を計算
@@ -179,21 +184,35 @@ vol_ratio = 平均BB幅 / 基準BB幅(3%)  ← クランプ: 0.67〜2.0
 buy_threshold  = BASE_BUY(0.25) × vol_ratio
 sell_threshold = BASE_SELL(-0.13) × vol_ratio
 
-# 2. SELL判定（優先）
-全保有ポジションを確認
-保有通貨のスコア <= sell_threshold → 売り  ← 複数保有中でも各通貨を個別判定
-※ BUYから30分以内のシグナルSELLは無視（SL/TPは有効）
+# 2. 通貨毎にBUY/SELL/HOLD判定（ポジション非依存）
+for each 通貨 in scored_pairs:
+    if スコア >= buy_threshold → BUY
+    elif スコア <= sell_threshold → SELL
+    else → HOLD
 
-# 3. BUY判定（未保有通貨のみ）
-全通貨をスコア降順でランキング
-未保有通貨の中で最高スコア >= buy_threshold → その通貨を買い
-※ 同一通貨はMAX_POSITIONS_PER_PAIR(1)まで（通貨分散ルール）
-※ サーキットブレーカートリップ中はBUYブロック
+# 3. SQSへバッチ送信（BUY/SELLがある場合のみ）
+if BUYまたはSELLが1件以上:
+    全てのBUY/SELL判定を1つのSQSメッセージとして送信
+
+# 4. order-executorでの実行
+SELL先（資金確保）:
+    ポジションがあれば売却、なければスキップ
+BUYをスコア降順（高い期待値の通貨を優先）:
+    残高確認 → 既にポジションがあればスキップ → 購入
 ```
 
-**SELL優先の理由**:
-- 保有ポジションの損失拡大を防ぐことが最優先
-- SELL判定後にBUYを行うため、売却で確保した資金を次のBUYに活用可能
+**aggregator（判定）と order-executor（実行）の分離**:
+- aggregator: 純粋にスコア vs 閾値で判定。記録（DynamoDB signals）。バッチ送信。
+- order-executor: ポジション確認、残高確認、サーキットブレーカー、実際の注文API呼び出し。
+
+**SELL処理（order-executor）**:
+- バッチ内の全SELL判定を処理
+- 対象通貨のポジションがあれば売却、なければスキップ（「売る対象がなければ無視」）
+
+**BUY処理（order-executor）**:
+- バッチ内の全BUY判定をスコア降順で処理
+- 各通貨: ポジション既存ならスキップ → 残高確認 → Kelly/フォールバック比率で投資額算出 → 購入
+- 残高が減るため、優先度の高い通貨から順に投資額が確保される
 
 **ポジションサイジングと複数保有**:
 - 投資額は `available_jpy`（残りの日本円残高）から計算
@@ -319,30 +338,36 @@ EventBridge が5分間隔で Step Functions を直接起動し、全通貨を一
 分析完了ごとにSlackに以下が通知される:
 
 ```
-🟢 マルチ通貨分析: BUY
-
-判定: BUY          対象: eth_jpy
+� マルチ通貨分析: BUY 1件 / SELL 1件 / HOLD 4件
 
 🌍 市場環境
 F&G: 14 (Extreme Fear) | BTC Dom: 56.9% | Scores: F&G=+0.397 Fund=+0.133 Dom=-0.457
 
 📊 通貨ランキング（期待値順）
-🥇 Ethereum:  +0.5234  ▓▓▓▓▓▓▓▓░░
-    Tech: +0.812 | AI: +0.654 | Sent: +0.321 | Mkt: +0.147
-🥈 Bitcoin:   +0.3521  ▓▓▓▓▓▓▓░░░
-    Tech: +0.534 | AI: +0.412 | Sent: +0.123 | Mkt: +0.147
-🥉 XRP:       +0.1500  ▓▓▓▓▓▓░░░░
-    Tech: +0.312 | AI: +0.123 | Sent: -0.045 | Mkt: +0.147
+🥇 Ethereum:  +0.5234  ▓▓▓▓▓▓▓▓░░ → 🟢BUY
+    Tech: +0.812(0.28) | AI: +0.654(0.42) | Sent: +0.321 | Mkt: +0.147
+🥈 Bitcoin:   +0.3521  ▓▓▓▓▓▓▓░░░ → ⚪HOLD
+    Tech: +0.534(0.35) | AI: +0.412(0.35) | Sent: +0.123 | Mkt: +0.147
+🥉 XRP:       +0.1500  ▓▓▓▓▓▓░░░░ → ⚪HOLD
+    Tech: +0.312(0.35) | AI: +0.123(0.35) | Sent: -0.045 | Mkt: +0.147
+4. Avalanche:  -0.1800  ▓▓▓▓░░░░░░ → 🔴SELL
+    Tech: -0.400(0.35) | AI: -0.200(0.35) | Sent: -0.100 | Mkt: +0.147
 ...
 
 💼 ポジション (2件)
 📈 Ethereum (eth_jpy) 参入: ¥320,000 → 現在: ¥333,057 | P/L: +¥13,057 (+4.08%) | 保有45分
-📈 Bitcoin (btc_jpy) 参入: ¥14,500,000 → 現在: ¥14,800,000 | P/L: +¥300,000 (+2.07%) | 保有120分
-💰 合計含み損益: +¥313,057
+📉 Avalanche (avax_jpy) 参入: ¥5,000 → 現在: ¥4,800 | P/L: -¥200 (-4.00%) | 保有120分
+💰 合計含み損益: +¥12,857
 
 BUY閾値: +0.250 / SELL閾値: -0.130 | 重み: Tech=0.35 AI=0.35 Sent=0.15 Mkt=0.15
 
-⚡ BUY注文をキューに送信しました (xrp_jpy)
+⚡ 注文キューに送信済み: BUY Ethereum, SELL Avalanche
+```
+
+全てHOLDの場合:
+```
+⚪ マルチ通貨分析: ALL HOLD
+（キュー送信なし）
 ```
 
 ---
@@ -362,7 +387,7 @@ BUY閾値: +0.250 / SELL閾値: -0.130 | 重み: Tech=0.35 AI=0.35 Sent=0.15 Mkt
 
 ### マルチポジション化
 
-✅ **実装済み**: 複数通貨の同時保有に対応。SELL優先ロジックで保有ポジションの損切りを優先し、その後に未保有通貨のBUY判定を行う。投資額は `available_jpy`（残りJPY残高）から自然に分配される。
+✅ **実装済み**: 複数通貨の同時保有に対応。aggregator は通貨毎にポジション非依存でBUY/SELL/HOLD判定し、BUY/SELLをバッチでSQS送信。order-executor がポジション・残高を確認して実際の注文を実行。投資額は `available_jpy`（残りJPY残高）から自然に分配される。
 
 ### より大きなモデルへの移行
 

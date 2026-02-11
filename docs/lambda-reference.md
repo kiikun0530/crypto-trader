@@ -364,14 +364,14 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
 
 ## aggregator
 
-全通貨の分析結果を統合、マーケットコンテキストを加味してスコアランキングを作成し、最適な売買判定を行う。
+全通貨の分析結果を統合、マーケットコンテキストを加味してスコアランキングを作成し、通貨毎にBUY/SELL/HOLDを判定。
 
 | 項目 | 値 |
 |---|---|
 | トリガー | Step Functions (Map完了後) |
 | メモリ | 512MB |
 | タイムアウト | 120秒 |
-| DynamoDB | signals (W), positions (R), market-context (R) |
+| DynamoDB | signals (W), market-context (R) |
 
 ### 入力 (Step Functions Map の出力)
 
@@ -402,41 +402,65 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
    - `vol_ratio = avg_bb_width / baseline(0.03)` → クランプ 0.67〜2.0
    - `buy_threshold = 0.25 × vol_ratio`, `sell_threshold = -0.13 × vol_ratio`
    - F&G連動補正: F&G≤20 → `buy_threshold × 1.35`, F&G≥80 → `buy_threshold × 1.20` (SELL不変)
-3. モメンタム減速チェック: 保有中通貨のMACDヒストグラムが正→縮小中(slope<-0.3)なら、SELL閾値を50%緩和して早期利確
 3. 全通貨のシグナルを DynamoDB に保存（動的閾値・BB幅・market_context_scoreも記録）
 4. 全通貨をスコア降順でランキング
-5. 全通貨のアクティブポジションを取得（複数保有対応）
-6. 売買判定（SELL優先、動的閾値で判定）:
-   - SELL判定: 保有中の全ポジションについて、スコア <= sell_threshold → SELL
-   - BUY判定: 未保有通貨の中で最高スコア >= buy_threshold → BUY
+5. **通貨毎にBUY/SELL/HOLD判定（ポジション非依存）**:
+   - スコア >= buy_threshold → BUY
+   - スコア <= sell_threshold → SELL
    - それ以外 → HOLD
-7. シグナルがあれば SQS に注文メッセージ送信
-8. Slack にランキング + 動的閾値 + 市場環境付き分析結果を通知
+6. BUY/SELLがある場合のみ、全判定を1つのSQSメッセージとしてバッチ送信
+   - 全てHOLDの場合はキュー送信なし
+7. Slack にランキング + 通貨別判定 + 市場環境付き分析結果を通知
 
 ### 出力
 
 ```json
 {
-  "signal": "BUY",
-  "target_pair": "eth_jpy",
-  "target_score": 0.5234,
+  "decisions": [
+    {"pair": "eth_usdt", "coincheck_pair": "eth_jpy", "signal": "BUY", "score": 0.5234},
+    {"pair": "btc_usdt", "coincheck_pair": "btc_jpy", "signal": "HOLD", "score": 0.3521},
+    {"pair": "avax_usdt", "coincheck_pair": "avax_jpy", "signal": "SELL", "score": -0.1800}
+  ],
+  "summary": {"buy": 1, "sell": 1, "hold": 4},
   "has_signal": true,
   "ranking": [
     {"pair": "eth_usdt", "name": "Ethereum", "score": 0.5234},
     {"pair": "btc_usdt", "name": "Bitcoin", "score": 0.3521},
     ...
   ],
-  "active_positions": ["eth_jpy", "btc_jpy"],
+  "active_positions": ["eth_jpy"],
   "buy_threshold": 0.2800,
   "sell_threshold": -0.1500,
-  "market_context": {
-    "market_score": 0.1468,
-    "components": {
-      "fear_greed": {"value": 14, "score": 0.397},
-      "funding_rate": {"avg_rate": -0.0066, "score": 0.133},
-      "btc_dominance": {"value": 56.86, "score": -0.457}
+  "timestamp": 1234567890
+}
+```
+
+### SQSバッチメッセージ形式
+
+```json
+{
+  "batch": true,
+  "timestamp": 1234567890,
+  "orders": [
+    {
+      "pair": "eth_jpy",
+      "signal": "BUY",
+      "score": 0.5234,
+      "analysis_context": {
+        "components": {"technical": 0.812, "chronos": 0.654, ...},
+        "buy_threshold": 0.2800,
+        "sell_threshold": -0.1500,
+        "weights": {"technical": 0.28, "chronos": 0.42, ...},
+        "chronos_confidence": 0.85
+      }
+    },
+    {
+      "pair": "avax_jpy",
+      "signal": "SELL",
+      "score": -0.1800,
+      "analysis_context": { ... }
     }
-  }
+  ]
 }
 ```
 
@@ -444,7 +468,7 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
 
 ## order-executor
 
-SQSから注文メッセージを受信し、Coincheck APIで成行注文を実行。
+SQSからバッチ注文メッセージを受信し、Coincheck APIで成行注文を実行。
 
 | 項目 | 値 |
 |---|---|
@@ -453,6 +477,24 @@ SQSから注文メッセージを受信し、Coincheck APIで成行注文を実�
 | タイムアウト | 60秒 |
 | DynamoDB | positions (R/W), trades (W) |
 | 外部API | Coincheck |
+
+### バッチ注文処理
+
+aggregatorが1つのSQSメッセージで全通貨のBUY/SELL判定を送信。order-executorはポジション・残高を確認して実際の注文を実行する。
+
+**処理順序**:
+1. **SELL先**: ポジションがあれば売却、なければスキップ（資金確保）
+2. **BUY**: スコア降順で処理、各通貨のポジション・残高を確認して購入
+
+**BUYが複数ある場合**:
+- スコア順（期待値の高い通貨が優先）
+- 各BUYで残高確認 → Kelly/フォールバック比率で投資額算出
+- 残高が減るため、優先度の低い通貨は自然と投資額が小さくなる
+- MIN_ORDER_JPY(¥500)未満になると購入されない
+
+**SELLが複数ある場合**:
+- ポジションがあれば順に売却
+- ポジションがない通貨はスキップ（無視）
 
 ### 同一通貨重複防止
 

@@ -1,15 +1,15 @@
 """
 アグリゲーター Lambda
 全通貨のテクニカル、Chronos、センチメントスコアを統合
-最も期待値の高い通貨を特定し、売買シグナルを生成
+通貨毎にBUY/SELL/HOLDを判定して記録・送信
 
 マルチ通貨ロジック:
 - 全通貨をスコアリングしてランキング
-- SELL優先: 保有ポジションでSELL閾値以下があれば売り
-- BUY: 未保有通貨でBUY閾値超えがあれば買い（複数同時保有OK）
+- 通貨毎にポジション非依存でBUY/SELL/HOLD判定
+- 判定結果をDynamoDB(signals)に記録
+- BUY/SELLがある場合のみSQSにバッチ送信（1メッセージ）
 - ボラティリティ適応型閾値（市場状況に応じて動的調整）
-- 最低保有時間: BUYから30分はシグナルSELLを無視（SL/TPは有効）
-- 通貨分散: 同一通貨の同時保有はMAX_POSITIONS_PER_PAIRまで
+- order-executorが残高・ポジション確認して実際の注文を実行
 """
 import json
 import os
@@ -50,12 +50,8 @@ BASELINE_BB_WIDTH = float(os.environ.get('BASELINE_BB_WIDTH', '0.03'))
 VOL_CLAMP_MIN = 0.67
 VOL_CLAMP_MAX = 2.0
 
-# 最低保有時間（秒）: BUYから一定時間はシグナルSELLを無視（SL/TPは有効）
-# BUY→即SELL往復ビンタ防止
+# 最低保有時間（秒）: 表示用（実際の制御はorder-executorで実施）
 MIN_HOLD_SECONDS = int(os.environ.get('MIN_HOLD_SECONDS', '1800'))  # デフォルト30分
-
-# 同一通貨の最大同時保有ポジション数（通貨分散ルール）
-MAX_POSITIONS_PER_PAIR = int(os.environ.get('MAX_POSITIONS_PER_PAIR', '1'))
 
 
 def handler(event, context):
@@ -89,47 +85,45 @@ def handler(event, context):
         # 4. スコア順にソート（期待値の高い順）
         scored_pairs.sort(key=lambda x: x['total_score'], reverse=True)
 
-        # 5. 現在のポジション確認（複数対応）
-        active_positions = find_all_active_positions()
-
-        # 6. 売買判定（動的閾値で判定）
-        signal, target_pair, target_score = decide_action(
-            scored_pairs, active_positions, buy_threshold, sell_threshold
+        # 5. 通貨毎のBUY/SELL/HOLD判定（ポジション非依存）
+        per_currency_decisions = decide_per_currency_signals(
+            scored_pairs, buy_threshold, sell_threshold
         )
 
-        has_signal = signal in ['BUY', 'SELL']
+        # 6. 非HOLDの判定を抽出
+        actionable_decisions = [d for d in per_currency_decisions if d['signal'] != 'HOLD']
+        has_signal = len(actionable_decisions) > 0
 
-        # 7. 注文送信（分析コンテキスト付き）
+        # 7. キューにバッチ送信（BUY/SELLがある場合のみ）
         if has_signal and ORDER_QUEUE_URL:
-            # 対象通貨のコンポーネントスコアを取得
-            target_scored = None
-            for s in scored_pairs:
-                coincheck = TRADING_PAIRS.get(s['pair'], {}).get('coincheck', '')
-                if coincheck == target_pair or s['pair'] == target_pair:
-                    target_scored = s
-                    break
-            analysis_context = {}
-            if target_scored:
-                analysis_context = {
-                    'components': target_scored.get('components', {}),
-                    'bb_width': target_scored.get('bb_width', 0),
-                }
-            analysis_context['buy_threshold'] = round(buy_threshold, 4)
-            analysis_context['sell_threshold'] = round(sell_threshold, 4)
-            analysis_context['weights'] = target_scored.get('weights', {
-                'technical': TECHNICAL_WEIGHT,
-                'chronos': CHRONOS_WEIGHT,
-                'sentiment': SENTIMENT_WEIGHT,
-                'market_context': MARKET_CONTEXT_WEIGHT
-            }) if target_scored else {}
-            analysis_context['chronos_confidence'] = target_scored.get('chronos_confidence', 0.5) if target_scored else 0.5
-            send_order_message(target_pair, signal, target_score,
-                             int(time.time()), analysis_context)
+            send_batch_order_message(
+                actionable_decisions, int(time.time()),
+                buy_threshold, sell_threshold
+            )
+
+        # 8. ポジション取得（表示用）
+        active_positions = find_all_active_positions()
+
+        # 通貨別判定の集計
+        buy_decisions = [d for d in per_currency_decisions if d['signal'] == 'BUY']
+        sell_decisions = [d for d in per_currency_decisions if d['signal'] == 'SELL']
+        hold_decisions = [d for d in per_currency_decisions if d['signal'] == 'HOLD']
 
         result = {
-            'signal': signal,
-            'target_pair': target_pair,
-            'target_score': round(target_score, 4) if target_score else None,
+            'decisions': [
+                {
+                    'pair': d['analysis_pair'],
+                    'coincheck_pair': d['pair'],
+                    'signal': d['signal'],
+                    'score': round(d['score'], 4)
+                }
+                for d in per_currency_decisions
+            ],
+            'summary': {
+                'buy': len(buy_decisions),
+                'sell': len(sell_decisions),
+                'hold': len(hold_decisions),
+            },
             'has_signal': has_signal,
             'ranking': [
                 {
@@ -145,8 +139,9 @@ def handler(event, context):
             'timestamp': int(time.time())
         }
 
-        # 8. Slack通知（ランキング付き + 動的閾値 + 含み損益表示）
-        notify_slack(result, scored_pairs, active_positions, buy_threshold, sell_threshold)
+        # 9. Slack通知（ランキング付き + 通貨別判定 + 含み損益表示）
+        notify_slack(result, scored_pairs, active_positions,
+                     buy_threshold, sell_threshold, per_currency_decisions)
 
         return result
 
@@ -419,110 +414,48 @@ def calculate_dynamic_thresholds(scored_pairs: list, market_context: dict = None
     return buy_threshold, sell_threshold
 
 
-def decide_action(scored_pairs: list, active_positions: list,
-                   buy_threshold: float, sell_threshold: float) -> tuple:
+def decide_per_currency_signals(scored_pairs: list,
+                                 buy_threshold: float, sell_threshold: float) -> list:
     """
-    全通貨のスコアから最適なアクションを決定（動的閾値対応・複数ポジション対応）
+    通貨毎のBUY/SELL/HOLDを判定（ポジション非依存）
 
-    ルール:
-    1. SELL判定: 保有中ポジションでSELL閾値以下のものがあれば売り（最悪スコア優先）
-    2. BUY判定: 未保有の通貨でBUY閾値以上のものがあれば買い（最高スコア優先）
-    3. それ以外 → HOLD
+    現在のポジション状況に関わらず、純粋にスコアと閾値で判定する。
+    実際の注文可否はorder-executorが残高・ポジションを確認して決定する。
 
-    複数ポジション同時保有可。SELLがBUYより優先される。
-
-    Returns: (signal, target_pair, target_score)
+    Returns: list of {pair, analysis_pair, signal, score, components, weights, ...}
     """
-    if not scored_pairs:
-        return 'HOLD', None, None
+    decisions = []
+    for scored in scored_pairs:
+        pair = scored['pair']
+        coincheck_pair = TRADING_PAIRS.get(pair, {}).get('coincheck', pair)
+        score = scored['total_score']
 
-    # 保有中のペアをセット化（BUY判定で使用）
-    held_coincheck_pairs = set()
-    if active_positions:
-        held_coincheck_pairs = {p['pair'] for p in active_positions}
-
-    # --- SELL判定（優先） ---
-    # ⚠️ 最低保有時間ルール: BUYからMIN_HOLD_SECONDS以内のポジションは
-    #    シグナルSELLを無視（SL/TPはposition-monitorが別途処理するため安全）
-    now = int(time.time())
-    if active_positions:
-        sell_candidates = []
-        hold_skipped = []
-        for position in active_positions:
-            position_pair = position['pair']
-            entry_time = int(position.get('entry_time', 0))
-            hold_elapsed = now - entry_time if entry_time else 999999
-
-            analysis_pair = None
-            for pair, config in TRADING_PAIRS.items():
-                if config['coincheck'] == position_pair:
-                    analysis_pair = pair
-                    break
-
-            if analysis_pair:
-                pair_data = next((s for s in scored_pairs if s['pair'] == analysis_pair), None)
-                if not pair_data:
-                    continue
-
-                # --- モメンタム減速SELL ---
-                # MACDヒストグラムが正→縮小中（利確方向へバイアス）
-                # ヒストグラムが正 = まだ上昇トレンド中だが、傾き < -0.3 = 勢い減速
-                # → SELL閾値を緩和してより早くSELLを発動
-                histogram_slope = pair_data.get('macd_histogram_slope', 0)
-                histogram_val = pair_data.get('macd_histogram', 0)
-                effective_sell_threshold = sell_threshold
-
-                # モメンタム減速条件: ヒストグラム正 + 傾き強い負
-                # この場合、SELL閾値を50%緩和（0になりやすく）
-                if histogram_val > 0 and histogram_slope < -0.3 and hold_elapsed >= MIN_HOLD_SECONDS:
-                    effective_sell_threshold = sell_threshold * 0.5  # 例: -0.10 → -0.05
-                    print(f"  ⚡ Momentum deceleration for {position_pair}: "
-                          f"MACD hist=+{histogram_val:.4f} slope={histogram_slope:+.3f} "
-                          f"→ sell_th relaxed to {effective_sell_threshold:+.3f}")
-
-                if pair_data['total_score'] <= effective_sell_threshold:
-                    if hold_elapsed < MIN_HOLD_SECONDS:
-                        remaining = MIN_HOLD_SECONDS - hold_elapsed
-                        hold_skipped.append((position_pair, pair_data['total_score'], remaining))
-                        print(f"SELL skipped for {position_pair}: score={pair_data['total_score']:.4f} "
-                              f"but hold period active (elapsed={hold_elapsed}s, "
-                              f"remaining={remaining}s / {remaining/60:.0f}min)")
-                    else:
-                        reason = 'momentum_decel' if effective_sell_threshold != sell_threshold else 'threshold'
-                        sell_candidates.append((position_pair, pair_data['total_score'], reason))
-
-        if sell_candidates:
-            sell_candidates.sort(key=lambda x: x[1])
-            target_pair, target_score, sell_reason = sell_candidates[0]
-            reason_text = ' [momentum deceleration]' if sell_reason == 'momentum_decel' else ''
-            print(f"SELL signal for {target_pair}: score={target_score:.4f} "
-                  f"(threshold: {sell_threshold:.3f}){reason_text}")
-            return 'SELL', target_pair, target_score
-
-        if hold_skipped:
-            pairs_text = ', '.join(f"{p}(残{r//60}分)" for p, _, r in hold_skipped)
-            print(f"SELL suppressed by hold period: {pairs_text}")
-
-    # --- BUY判定（未保有の通貨から最高スコアを選定） ---
-    # 通貨分散ルール: 同一通貨はMAX_POSITIONS_PER_PAIRまで
-    from collections import Counter
-    held_pair_counts = Counter(p['pair'] for p in active_positions) if active_positions else Counter()
-
-    for candidate in scored_pairs:
-        coincheck_pair = TRADING_PAIRS.get(candidate['pair'], {}).get('coincheck', candidate['pair'])
-        current_count = held_pair_counts.get(coincheck_pair, 0)
-        if current_count >= MAX_POSITIONS_PER_PAIR:
-            continue  # 同一通貨の保有上限に達している
-        if candidate['total_score'] >= buy_threshold:
-            print(f"BUY signal for {candidate['pair']} ({coincheck_pair}): "
-                  f"score={candidate['total_score']:.4f} (threshold: {buy_threshold:.3f})")
-            return 'BUY', coincheck_pair, candidate['total_score']
+        if score >= buy_threshold:
+            signal = 'BUY'
+        elif score <= sell_threshold:
+            signal = 'SELL'
         else:
-            break  # スコア降順なので、閾値未満なら以降も未満
+            signal = 'HOLD'
 
-    held_text = ', '.join(held_coincheck_pairs) if held_coincheck_pairs else 'none'
-    print(f"HOLD: no actionable signals (held: {held_text})")
-    return 'HOLD', None, None
+        print(f"  {pair} ({coincheck_pair}): score={score:+.4f} → {signal}")
+
+        decisions.append({
+            'pair': coincheck_pair,
+            'analysis_pair': pair,
+            'signal': signal,
+            'score': score,
+            'components': scored.get('components', {}),
+            'weights': scored.get('weights', {}),
+            'chronos_confidence': scored.get('chronos_confidence', 0.5),
+            'bb_width': scored.get('bb_width', 0),
+        })
+
+    buy_count = sum(1 for d in decisions if d['signal'] == 'BUY')
+    sell_count = sum(1 for d in decisions if d['signal'] == 'SELL')
+    hold_count = sum(1 for d in decisions if d['signal'] == 'HOLD')
+    print(f"Per-currency signals: BUY={buy_count} SELL={sell_count} HOLD={hold_count}")
+
+    return decisions
 
 
 def find_all_active_positions() -> list:
@@ -598,41 +531,76 @@ def save_signal(scored: dict, buy_threshold: float, sell_threshold: float):
         print(f"Error saving signal for {scored.get('pair', 'unknown')}: {e}")
 
 
-def send_order_message(pair: str, signal: str, score: float, timestamp: int,
-                       analysis_context: dict = None):
-    """​SQSに注文メッセージ送信（分析コンテキスト付き）"""
+def send_batch_order_message(decisions: list, timestamp: int,
+                              buy_threshold: float, sell_threshold: float):
+    """SQSにバッチ注文メッセージ送信（全通貨の判定を1メッセージで）"""
     try:
+        orders = []
+        for d in decisions:
+            order = {
+                'pair': d['pair'],
+                'signal': d['signal'],
+                'score': d['score'],
+                'analysis_context': {
+                    'components': d.get('components', {}),
+                    'bb_width': d.get('bb_width', 0),
+                    'buy_threshold': round(buy_threshold, 4),
+                    'sell_threshold': round(sell_threshold, 4),
+                    'weights': d.get('weights', {}),
+                    'chronos_confidence': d.get('chronos_confidence', 0.5),
+                }
+            }
+            orders.append(order)
+
         message = {
-            'pair': pair,
-            'signal': signal,
-            'score': score,
-            'timestamp': timestamp
+            'batch': True,
+            'timestamp': timestamp,
+            'orders': orders
         }
-        if analysis_context:
-            message['analysis_context'] = analysis_context
+
         sqs.send_message(
             QueueUrl=ORDER_QUEUE_URL,
             MessageBody=json.dumps(message)
         )
-        print(f"Order message sent to SQS: {signal} {pair}")
+        signals = [f"{d['signal']} {d['pair']}" for d in decisions]
+        print(f"Batch order message sent to SQS: {', '.join(signals)}")
     except Exception as e:
-        print(f"Error sending order message: {e}")
+        print(f"Error sending batch order message: {e}")
 
 
 def notify_slack(result: dict, scored_pairs: list, active_positions: list,
-                 buy_threshold: float = None, sell_threshold: float = None):
-    """Slackに分析結果を通知（通貨ランキング + 複数ポジションP/L表示）"""
+                 buy_threshold: float = None, sell_threshold: float = None,
+                 per_currency_decisions: list = None):
+    """Slackに分析結果を通知（通貨別判定 + ランキング + 含み損益表示）"""
     buy_threshold = buy_threshold or BASE_BUY_THRESHOLD
     sell_threshold = sell_threshold or BASE_SELL_THRESHOLD
     if not SLACK_WEBHOOK_URL:
         return
 
     try:
-        signal = result.get('signal', 'HOLD')
-        target_pair = result.get('target_pair', '-')
+        # 通貨別判定マップ
+        decision_map = {}
+        if per_currency_decisions:
+            for d in per_currency_decisions:
+                decision_map[d.get('analysis_pair', '')] = d['signal']
 
-        emoji_map = {'BUY': '🟢', 'SELL': '🔴', 'HOLD': '⚪'}
-        emoji = emoji_map.get(signal, '❓')
+        # 判定サマリー
+        summary = result.get('summary', {})
+        buy_count = summary.get('buy', 0)
+        sell_count = summary.get('sell', 0)
+        hold_count = summary.get('hold', 0)
+
+        if buy_count > 0 or sell_count > 0:
+            parts = []
+            if buy_count > 0:
+                parts.append(f"BUY {buy_count}件")
+            if sell_count > 0:
+                parts.append(f"SELL {sell_count}件")
+            if hold_count > 0:
+                parts.append(f"HOLD {hold_count}件")
+            header_text = f"📊 マルチ通貨分析: {' / '.join(parts)}"
+        else:
+            header_text = "⚪ マルチ通貨分析: ALL HOLD"
 
         # スコアバー
         def score_bar(score):
@@ -640,7 +608,7 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
             pos = max(0, min(10, pos))
             return '▓' * pos + '░' * (10 - pos)
 
-        # ランキング表示
+        # ランキング表示（通貨別判定付き）
         ranking_text = ""
         for i, s in enumerate(scored_pairs):
             name = TRADING_PAIRS.get(s['pair'], {}).get('name', s['pair'])
@@ -648,8 +616,13 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
             conf = s.get('chronos_confidence', 0.5)
             conf_bar = '🟢' if conf >= 0.7 else '🟡' if conf >= 0.4 else '🔴'
             weights = s.get('weights', {})
+
+            # 通貨別判定表示
+            pair_signal = decision_map.get(s['pair'], 'HOLD')
+            signal_emoji = {'BUY': '🟢BUY', 'SELL': '🔴SELL', 'HOLD': '⚪HOLD'}.get(pair_signal, '⚪HOLD')
+
             ranking_text += (
-                f"{medal} *{name}*: `{s['total_score']:+.4f}` {score_bar(s['total_score'])}\n"
+                f"{medal} *{name}*: `{s['total_score']:+.4f}` {score_bar(s['total_score'])} → {signal_emoji}\n"
                 f"    Tech: `{s['components']['technical']:+.3f}`({weights.get('technical', TECHNICAL_WEIGHT):.2f}) | "
                 f"AI: `{s['components']['chronos']:+.3f}`({weights.get('chronos', CHRONOS_WEIGHT):.2f}){conf_bar} | "
                 f"Sent: `{s['components']['sentiment']:+.3f}` | "
@@ -674,22 +647,17 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
                         break
 
                 # 現在価格をCoincheck APIから取得（JPY建て）
-                # scored_pairsのcurrent_priceはBinance USDT建てなのでP/L計算に使えない
                 current_price = 0
                 try:
                     current_price = get_current_price(pos_pair)
                 except Exception as e:
                     print(f"Failed to get current price for {pos_pair}: {e}")
 
-                # 保有時間と最低保有期間ステータス
+                # 保有時間
                 entry_time = int(pos.get('entry_time', 0))
                 hold_elapsed = int(time.time()) - entry_time if entry_time else 0
                 hold_min = hold_elapsed // 60
-                if hold_elapsed < MIN_HOLD_SECONDS:
-                    remaining_min = (MIN_HOLD_SECONDS - hold_elapsed) // 60
-                    hold_status = f" | 🔒 保有{hold_min}分 (あと{remaining_min}分)"
-                else:
-                    hold_status = f" | 保有{hold_min}分"
+                hold_status = f" | 保有{hold_min}分"
 
                 if entry_price > 0 and current_price > 0:
                     pnl = (current_price - entry_price) * amount
@@ -734,16 +702,9 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
                 "type": "header",
                 "text": {
                     "type": "plain_text",
-                    "text": f"{emoji} マルチ通貨分析: {signal}",
+                    "text": header_text,
                     "emoji": True
                 }
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*判定*\n{signal}"},
-                    {"type": "mrkdwn", "text": f"*対象*\n{target_pair or '-'}"}
-                ]
             },
             {
                 "type": "section",
@@ -776,12 +737,14 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
             }
         ]
 
-        if signal in ['BUY', 'SELL']:
+        if buy_count > 0 or sell_count > 0:
+            action_pairs = [f"{d['signal']} {TRADING_PAIRS.get(d.get('analysis_pair', ''), {}).get('name', d['pair'])}"
+                           for d in (per_currency_decisions or []) if d['signal'] != 'HOLD']
             blocks.append({
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"⚡ *{signal}注文をキューに送信しました* ({target_pair})"
+                    "text": f"⚡ *注文キューに送信済み*: {', '.join(action_pairs)}"
                 }
             })
 
