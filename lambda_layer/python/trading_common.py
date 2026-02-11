@@ -25,6 +25,7 @@ POSITIONS_TABLE = os.environ.get('POSITIONS_TABLE', 'eth-trading-positions')
 TRADES_TABLE = os.environ.get('TRADES_TABLE', 'eth-trading-trades')
 SIGNALS_TABLE = os.environ.get('SIGNALS_TABLE', 'eth-trading-signals')
 SENTIMENT_TABLE = os.environ.get('SENTIMENT_TABLE', 'eth-trading-sentiment')
+ANALYSIS_STATE_TABLE = os.environ.get('ANALYSIS_STATE_TABLE', 'eth-trading-analysis-state')
 
 # -----------------------------------------------------------------------------
 # 通貨ペア設定 (TRADING_PAIRS_CONFIG 環境変数から読み込み)
@@ -126,3 +127,41 @@ def find_all_active_positions(table_name: str = None) -> list:
 def get_currency_from_pair(pair: str) -> str:
     """通貨ペアから通貨コードを抽出 (例: 'eth_jpy' -> 'eth')"""
     return pair.split('_')[0]
+
+
+# -----------------------------------------------------------------------------
+# パイプライン状態更新 (CryptoSignal フロントエンド可視化用)
+# -----------------------------------------------------------------------------
+import time as _time
+
+
+def update_pipeline_status(stage: str, status: str, detail: str = ''):
+    """
+    AI分析パイプラインの実行状態を記録する。
+    CryptoSignal フロントエンドがポーリングして
+    ニューラルネットワーク風アニメーションをリアルタイム表示する。
+
+    stage: price_collector | news_collector | market_context |
+           technical | chronos | sentiment | aggregator
+    status: running | completed | failed
+    detail: 追加情報 (省略可)
+    """
+    try:
+        table = dynamodb.Table(ANALYSIS_STATE_TABLE)
+        now = int(_time.time())
+        table.update_item(
+            Key={'pair': 'pipeline_status'},
+            UpdateExpression='SET #stage = :info, updated_at = :ts',
+            ExpressionAttributeNames={'#stage': stage},
+            ExpressionAttributeValues={
+                ':info': {
+                    'status': status,
+                    'timestamp': now,
+                    'detail': detail,
+                },
+                ':ts': now,
+            },
+        )
+    except Exception as e:
+        # パイプライン状態の記録失敗は本来の処理に影響させない
+        print(f"[pipeline_status] Failed to update {stage}={status}: {e}")

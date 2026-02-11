@@ -19,7 +19,8 @@ from decimal import Decimal, ROUND_HALF_UP
 import urllib.request
 from trading_common import (
     TRADING_PAIRS, POSITIONS_TABLE, SLACK_WEBHOOK_URL,
-    get_current_price, get_active_position, send_slack_notification, dynamodb
+    get_current_price, get_active_position, send_slack_notification, dynamodb,
+    update_pipeline_status
 )
 
 sqs = boto3.client('sqs')
@@ -65,6 +66,7 @@ def handler(event, context):
         pairs_results = [event]
 
     try:
+        update_pipeline_status('aggregator', 'running', f'{len(pairs_results)}通貨のスコア統合判定中')
         # 0. マーケットコンテキスト取得（全通貨共通のマクロ情報）
         market_context = fetch_market_context()
 
@@ -141,6 +143,9 @@ def handler(event, context):
         # 9. Slack通知（ランキング付き + 通貨別判定 + 含み損益表示）
         notify_slack(result, scored_pairs, active_positions,
                      thresholds_map, per_currency_decisions)
+
+        decisions_summary = f"BUY:{len(buy_decisions)} SELL:{len(sell_decisions)} HOLD:{len(hold_decisions)}"
+        update_pipeline_status('aggregator', 'completed', decisions_summary)
 
         return result
 

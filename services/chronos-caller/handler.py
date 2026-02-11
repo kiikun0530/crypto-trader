@@ -39,6 +39,7 @@ sagemaker_client = boto3.client('sagemaker', config=sagemaker_config)
 
 PRICES_TABLE = os.environ.get('PRICES_TABLE', 'eth-trading-prices')
 SAGEMAKER_ENDPOINT = os.environ.get('SAGEMAKER_ENDPOINT', 'eth-trading-chronos-base')
+ANALYSIS_STATE_TABLE = os.environ.get('ANALYSIS_STATE_TABLE', 'eth-trading-analysis-state')
 PREDICTION_LENGTH = int(os.environ.get('PREDICTION_LENGTH', '12'))
 INPUT_LENGTH = int(os.environ.get('INPUT_LENGTH', '336'))  # 336 × 5min = 28h (日次サイクル1周+α)
 
@@ -51,9 +52,27 @@ BASE_DELAY = 3.0   # 基本待機時間（秒）- SageMaker Serverlessの冷起�
 MAX_DELAY = 45.0   # 最大待機時間（秒）- 十分な回復時間を確保
 
 
+def _update_pipeline(stage, status, detail=''):
+    try:
+        table = dynamodb.Table(ANALYSIS_STATE_TABLE)
+        now = int(time.time())
+        table.update_item(
+            Key={'pair': 'pipeline_status'},
+            UpdateExpression='SET #s = :info, updated_at = :ts',
+            ExpressionAttributeNames={'#s': stage},
+            ExpressionAttributeValues={
+                ':info': {'status': status, 'timestamp': now, 'detail': detail},
+                ':ts': now,
+            },
+        )
+    except Exception:
+        pass
+
+
 def handler(event, context):
     """Chronos SageMaker予測取得"""
     pair = event.get('pair', 'eth_usdt')
+    _update_pipeline('chronos', 'running', f'{pair} AI価格予測中')
 
     try:
         prices = get_price_history(pair, limit=INPUT_LENGTH)
@@ -88,6 +107,7 @@ def handler(event, context):
                 print(f"SageMaker inference OK: {pair}, score={score:.3f}, "
                       f"confidence={confidence:.3f}, data_points={len(prices)}")
 
+                _update_pipeline('chronos', 'completed', f'{pair} score={score:.3f}')
                 return {
                     'pair': pair,
                     'chronos_score': round(score, 3),

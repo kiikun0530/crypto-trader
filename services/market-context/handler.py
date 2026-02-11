@@ -20,14 +20,33 @@ from botocore.exceptions import ClientError
 
 dynamodb = boto3.resource('dynamodb')
 MARKET_CONTEXT_TABLE = os.environ.get('MARKET_CONTEXT_TABLE', 'eth-trading-market-context')
+ANALYSIS_STATE_TABLE = os.environ.get('ANALYSIS_STATE_TABLE', 'eth-trading-analysis-state')
 
 # 6通貨のBinance先物シンボル
 FUNDING_SYMBOLS = ['ETHUSDT', 'BTCUSDT', 'XRPUSDT', 'SOLUSDT', 'DOGEUSDT', 'AVAXUSDT']
 
 
+def _update_pipeline(stage, status, detail=''):
+    try:
+        table = dynamodb.Table(ANALYSIS_STATE_TABLE)
+        now = int(time.time())
+        table.update_item(
+            Key={'pair': 'pipeline_status'},
+            UpdateExpression='SET #s = :info, updated_at = :ts',
+            ExpressionAttributeNames={'#s': stage},
+            ExpressionAttributeValues={
+                ':info': {'status': status, 'timestamp': now, 'detail': detail},
+                ':ts': now,
+            },
+        )
+    except Exception:
+        pass
+
+
 def handler(event, context):
     """マーケットコンテキスト収集メイン"""
     timestamp = int(time.time())
+    _update_pipeline('market_context', 'running', 'F&G, Funding, BTC Dom収集中')
     print(f"Starting market context collection at timestamp: {timestamp}")
 
     try:
@@ -60,6 +79,7 @@ def handler(event, context):
         print("Saving to DynamoDB...")
         save_market_context(timestamp, market_score, components, fng_data, funding_data, dominance_data)
         print("Successfully saved market context data")
+        _update_pipeline('market_context', 'completed', f'score={market_score:+.4f}')
 
         return {
             'statusCode': 200,
