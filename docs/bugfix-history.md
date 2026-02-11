@@ -18,6 +18,7 @@
 9. [02/12 TP/トレーリングストップ矛盾（デッドコード）](#9-0212-tpトレーリングストップ矛盾デッドコード)
 10. [02/12 DynamoDB Limit+FilterExpression アンチパターン](#10-0212-dynamodb-limitfilterexpression-アンチパターン)
 11. [02/12 Bedrock Claude 3 Haiku → Amazon Nova Micro 移行](#11-0212-bedrock-claude-3-haiku--amazon-nova-micro-apac-移行)
+12. [02/12 シグナル根拠データの保存拡張](#12-0212-シグナル根拠データの保存拡張)
 
 ---
 
@@ -648,3 +649,41 @@ Anthropicモデル（Claude 3 Haiku）は AWS Bedrock の Model Access ページ
 - `ap-northeast-1` では `apac.*` プレフィックスの inference profile を使用（`us.*` は不可）
 - Cross-region inference profile はルーティング先リージョン（例: `ap-southeast-2`）の foundation model ARN にもアクセス権が必要
 - IAMの foundation model リソースはリージョンワイルドカード (`arn:aws:bedrock:*::foundation-model/amazon.nova-*`) にすると安全
+
+---
+
+## 12. 02/12 シグナル根拠データの保存拡張
+
+### 概要
+
+signals テーブルに保存される各シグナルレコードに、判定の根拠となる詳細データを追加保存するようにした。
+従来はスコア数値のみ（`technical_score: 0.32` 等）で、なぜそのスコアになったかの根拠が失われていた。
+
+### 追加データ
+
+| フィールド | 内容 | サイズ目安 |
+|------------|------|-----------|
+| `indicators` (map) | RSI, MACD, MACDヒストグラム, SMA20/200, BB上下限, ADX, レジーム等 | ~200B |
+| `chronos_detail` (map) | 確信度, モデル名, 予測変化率(%), q10/q90変化率(%) | ~100B |
+| `news_headlines` (list) | 影響度上位3件のニュースタイトル+スコア | ~500B |
+| `market_detail` (map) | F&G値+分類, 平均Funding Rate, BTC Dominance% | ~150B |
+
+### 変更箇所
+
+| ファイル | 変更内容 |
+|----------|----------|
+| `services/news-collector/handler.py` | `extract_top_headlines()` 追加。センチメント分析時に影響度上位3件のニュースタイトルを抽出し `save_sentiment()` で保存 |
+| `services/sentiment-getter/handler.py` | `get_latest_sentiment()` が `top_headlines` も返すように拡張 |
+| `services/aggregator/handler.py` | `score_pair()` でテクニカル指標・Chronos詳細・ニュースヘッドラインを抽出。`save_signal()` で signals テーブルに追加保存。`to_dynamo_map()` ヘルパー追加 |
+
+### コスト影響
+
+- DynamoDB書き込み: ~$0.07/月（レコードサイズ増による追加WCU）
+- DynamoDB読み取り: ~$0.02/月
+- ストレージ: ~$0.04/月
+- **合計: ~$0.13/月（ほぼ無視できる）**
+
+### 教訓
+
+- DynamoDBのネストされたmap/list型にはfloat→Decimal変換が必須。再帰的変換ヘルパー(`to_dynamo_map`)で一括処理
+- Chronos予測のraw配列（12要素×3系列）は保存サイズが大きいため、予測変化率(%)に集約して保存

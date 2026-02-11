@@ -16,13 +16,14 @@ def handler(event, context):
     
     try:
         # 最新のセンチメントスコア取得
-        score, timestamp = get_latest_sentiment(pair)
+        score, timestamp, top_headlines = get_latest_sentiment(pair)
         
         return {
             'pair': pair,
             'sentiment_score': score,
             'last_updated': timestamp,
-            'source': 'cryptopanic'
+            'source': 'cryptopanic',
+            'top_headlines': top_headlines
         }
         
     except Exception as e:
@@ -30,11 +31,12 @@ def handler(event, context):
         return {
             'pair': pair,
             'sentiment_score': 0.5,
+            'top_headlines': [],
             'error': str(e)
         }
 
 def get_latest_sentiment(pair: str) -> tuple:
-    """最新センチメント取得"""
+    """最新センチメント取得（top_headlines含む）"""
     table = dynamodb.Table(SENTIMENT_TABLE)
     response = table.query(
         KeyConditionExpression='pair = :pair',
@@ -45,7 +47,17 @@ def get_latest_sentiment(pair: str) -> tuple:
     
     items = response.get('Items', [])
     if items:
-        return float(items[0].get('score', 0.5)), int(items[0].get('timestamp', 0))
+        item = items[0]
+        headlines = item.get('top_headlines', [])
+        # DynamoDB Decimal → float 変換
+        parsed_headlines = []
+        for h in headlines:
+            parsed_headlines.append({
+                'title': h.get('title', ''),
+                'score': float(h.get('score', 0.5)),
+                'source': h.get('source', ''),
+            })
+        return float(item.get('score', 0.5)), int(item.get('timestamp', 0)), parsed_headlines
     
     # デフォルト値（中立）
-    return 0.5, 0
+    return 0.5, 0, []

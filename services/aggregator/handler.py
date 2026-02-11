@@ -202,6 +202,7 @@ def score_pair(pair: str, result: dict, market_context: dict = None) -> dict:
             'funding_score': float(market_context.get('funding_score', 0)),
             'dominance_score': float(market_context.get('dominance_score', 0)),
             'btc_dominance': float(market_context.get('btc_dominance', 50)),
+            'avg_funding_rate': float(market_context.get('avg_funding_rate', 0)),
         }
 
     # BTC Dominanceによるアルトコイン追加補正
@@ -252,6 +253,16 @@ def score_pair(pair: str, result: dict, market_context: dict = None) -> dict:
     macd_histogram_slope = extract_indicator(technical_result, 'macd_histogram_slope', 0.0)
     macd_histogram = extract_indicator(technical_result, 'macd_histogram', 0.0)
 
+    # === 根拠データ抽出（シグナル解説用） ===
+    # テクニカル指標の生データ
+    indicators_detail = _extract_raw_indicators(technical_result)
+
+    # Chronos予測の詳細
+    chronos_detail = _extract_chronos_detail(chronos_result)
+
+    # ニュースヘッドライン（sentiment-getterがtop_headlinesを含む）
+    news_headlines = _extract_news_headlines(sentiment_result)
+
     return {
         'pair': pair,
         'total_score': total_score,
@@ -275,7 +286,10 @@ def score_pair(pair: str, result: dict, market_context: dict = None) -> dict:
         # Coincheck JPY建てのポジション価格と比較してはいけない
         # P/L計算にはget_current_price()でJPY価格を別途取得すること
         'current_price_usd': result.get('technical', {}).get('current_price', 0),
-        'bb_width': bb_width
+        'bb_width': bb_width,
+        'indicators_detail': indicators_detail,
+        'chronos_detail': chronos_detail,
+        'news_headlines': news_headlines,
     }
 
 
@@ -518,6 +532,91 @@ def safe_decimal(value: float, precision: int = 4) -> Decimal:
         return Decimal(str(round(value, precision)))
     except Exception as e:
         print(f"Decimal conversion error for {value}: {e}")
+
+
+def to_dynamo_map(data: dict) -> dict:
+    """Python dictをDynamoDB互換のmap型に再帰変換（float→Decimal）"""
+    result = {}
+    for k, v in data.items():
+        if isinstance(v, float):
+            result[k] = safe_decimal(v)
+        elif isinstance(v, dict):
+            result[k] = to_dynamo_map(v)
+        elif isinstance(v, list):
+            result[k] = [to_dynamo_map(i) if isinstance(i, dict)
+                         else safe_decimal(i) if isinstance(i, float)
+                         else i
+                         for i in v]
+        else:
+            result[k] = v
+    return result
+
+
+def _extract_raw_indicators(technical_result: dict) -> dict:
+    """テクニカル結果から主要指標の生データを抽出"""
+    try:
+        indicators = {}
+        if isinstance(technical_result, dict):
+            if 'body' in technical_result:
+                body = json.loads(technical_result['body']) if isinstance(technical_result['body'], str) else technical_result['body']
+                indicators = body.get('indicators', {})
+            else:
+                indicators = technical_result.get('indicators', {})
+
+        # 必要なキーのみ抽出（保存サイズ制御）
+        keep_keys = ['rsi', 'macd', 'macd_signal', 'macd_histogram', 'macd_histogram_slope',
+                     'sma_20', 'bb_upper', 'bb_lower', 'adx', 'regime',
+                     'current_price', 'volume_multiplier', 'sma_200', 'golden_cross']
+        return {k: indicators[k] for k in keep_keys if k in indicators}
+    except Exception as e:
+        print(f"Raw indicators extraction error: {e}")
+        return {}
+
+
+def _extract_chronos_detail(chronos_result: dict) -> dict:
+    """Chronos予測の詳細を抽出（予測変化率を算出）"""
+    try:
+        cr = chronos_result
+        if isinstance(cr, dict) and 'body' in cr:
+            cr = json.loads(cr['body']) if isinstance(cr['body'], str) else cr['body']
+        if not isinstance(cr, dict):
+            return {}
+
+        detail = {
+            'confidence': float(cr.get('confidence', 0.5)),
+            'model': cr.get('model', 'unknown'),
+        }
+
+        current = float(cr.get('current_price', 0))
+        prediction = cr.get('prediction')
+        if prediction and current > 0 and isinstance(prediction, list):
+            avg_pred = sum(prediction) / len(prediction)
+            detail['predicted_change_pct'] = round((avg_pred - current) / current * 100, 3)
+            q10 = cr.get('prediction_q10')
+            q90 = cr.get('prediction_q90')
+            if q10 and isinstance(q10, list):
+                detail['q10_change_pct'] = round((sum(q10)/len(q10) - current) / current * 100, 3)
+            if q90 and isinstance(q90, list):
+                detail['q90_change_pct'] = round((sum(q90)/len(q90) - current) / current * 100, 3)
+
+        return detail
+    except Exception as e:
+        print(f"Chronos detail extraction error: {e}")
+        return {}
+
+
+def _extract_news_headlines(sentiment_result: dict) -> list:
+    """センチメント結果からニュースヘッドライン上位を抽出"""
+    try:
+        sr = sentiment_result
+        if isinstance(sr, dict) and 'body' in sr:
+            sr = json.loads(sr['body']) if isinstance(sr['body'], str) else sr['body']
+        if isinstance(sr, dict):
+            return sr.get('top_headlines', [])
+        return []
+    except Exception as e:
+        print(f"News headlines extraction error: {e}")
+        return []
         return Decimal('0')
 
 
@@ -533,7 +632,7 @@ def save_signal(scored: dict, buy_threshold: float, sell_threshold: float):
         elif scored['total_score'] <= sell_threshold:
             signal = 'SELL'
 
-        table.put_item(Item={
+        item = {
             'pair': scored['pair'],
             'timestamp': timestamp,
             'score': safe_decimal(scored['total_score']),
@@ -546,7 +645,26 @@ def save_signal(scored: dict, buy_threshold: float, sell_threshold: float):
             'sell_threshold': safe_decimal(sell_threshold),
             'bb_width': safe_decimal(scored.get('bb_width', BASELINE_BB_WIDTH), 6),
             'ttl': timestamp + 7776000  # 90日後に削除
-        })
+        }
+
+        # 根拠データ（シグナル解説用）
+        indicators = scored.get('indicators_detail', {})
+        if indicators:
+            item['indicators'] = to_dynamo_map(indicators)
+
+        chronos_detail = scored.get('chronos_detail', {})
+        if chronos_detail:
+            item['chronos_detail'] = to_dynamo_map(chronos_detail)
+
+        news_headlines = scored.get('news_headlines', [])
+        if news_headlines:
+            item['news_headlines'] = to_dynamo_map({'h': news_headlines[:3]})['h']
+
+        market_detail = scored.get('market_context_detail', {})
+        if market_detail:
+            item['market_detail'] = to_dynamo_map(market_detail)
+
+        table.put_item(Item=item)
     except Exception as e:
         print(f"Error saving signal for {scored.get('pair', 'unknown')}: {e}")
 

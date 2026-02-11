@@ -111,9 +111,10 @@ def handler(event, context):
                 # センチメント分析
                 print(f"Analyzing sentiment for {pair} with {len(weighted_articles)} articles...")
                 score, fresh_count, stats = analyze_sentiment_weighted(weighted_articles, llm_scores)
+                top_headlines = extract_top_headlines(weighted_articles, llm_scores)
                 
                 print(f"Saving sentiment for {pair}...")
-                save_sentiment(pair, timestamp, score, len(weighted_articles), fresh_count)
+                save_sentiment(pair, timestamp, score, len(weighted_articles), fresh_count, top_headlines)
 
                 results[pair] = {
                     'score': round(score, 3),
@@ -559,11 +560,46 @@ def estimate_sentiment_from_title(title: str) -> float:
         return 0.5
 
 
-def save_sentiment(pair: str, timestamp: int, score: float, news_count: int, fresh_count: int):
+def extract_top_headlines(articles: list, llm_scores: dict, top_n: int = 3) -> list:
+    """影響度の高いニュースタイトル上位N件を抽出（スコアの根拠説明用）"""
+    scored_articles = []
+    for article in articles:
+        title = article.get('title', '').strip()
+        if not title:
+            continue
+
+        votes = article.get('votes', {})
+        positive = votes.get('positive', 0) + votes.get('important', 0) * 1.5
+        negative = votes.get('negative', 0) + votes.get('toxic', 0) * 1.5
+        liked = votes.get('liked', 0)
+        disliked = votes.get('disliked', 0)
+        total_votes = positive + negative + liked + disliked
+
+        if total_votes >= MIN_RELIABLE_VOTES:
+            article_score = (positive + liked) / total_votes
+        else:
+            article_id = article.get('id')
+            if article_id and article_id in llm_scores:
+                article_score = llm_scores[article_id]
+            else:
+                article_score = estimate_sentiment_from_title(title)
+
+        scored_articles.append({
+            'title': title[:120],
+            'score': round(article_score, 2),
+            'source': article.get('_source_currency', ''),
+        })
+
+    # 中立(0.5)から離れているものほど影響度大
+    scored_articles.sort(key=lambda x: abs(x['score'] - 0.5), reverse=True)
+    return scored_articles[:top_n]
+
+
+def save_sentiment(pair: str, timestamp: int, score: float, news_count: int, fresh_count: int, top_headlines: list = None):
     """センチメント保存"""
     try:
         table = dynamodb.Table(SENTIMENT_TABLE)
-        table.put_item(Item={
+        item = {
             'pair': pair,
             'timestamp': timestamp,
             'score': Decimal(str(round(score, 4))),
@@ -571,7 +607,17 @@ def save_sentiment(pair: str, timestamp: int, score: float, news_count: int, fre
             'fresh_news_count': fresh_count,
             'source': 'cryptopanic',
             'ttl': timestamp + 1209600  # 14日後に削除
-        })
+        }
+        if top_headlines:
+            item['top_headlines'] = [
+                {
+                    'title': h['title'],
+                    'score': Decimal(str(h['score'])),
+                    'source': h.get('source', ''),
+                }
+                for h in top_headlines
+            ]
+        table.put_item(Item=item)
     except Exception as e:
         print(f"Error saving sentiment for {pair}: {str(e)}")
         raise
