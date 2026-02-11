@@ -51,11 +51,8 @@ logs/
 *.pem
 *.key
 
-# ONNX models (large binary files - regenerate with scripts/convert_chronos_onnx.py)
-models/chronos-onnx/*.onnx
-models/chronos-onnx/centers.json
-models/chronos-onnx/boundaries.json
-models/chronos-onnx/tokenizer_config.json
+# ONNX models (migrated to SageMaker Chronos-2)
+models/chronos-onnx/
 
 # Lambda Layer build artifacts
 onnx_layer/
@@ -63,6 +60,10 @@ onnx_layer.zip
 terraform/*.out
 
 terraform/*-output.json
+terraform/response.json
+
+# Terraform temp files
+tf_state.txt
 
 # Lambda deployment zips
 *.zip
