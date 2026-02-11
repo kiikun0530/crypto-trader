@@ -14,6 +14,7 @@
 import json
 import os
 import time
+import traceback
 import boto3
 from decimal import Decimal, ROUND_HALF_UP
 import urllib.request
@@ -23,6 +24,8 @@ from trading_common import (
 )
 
 sqs = boto3.client('sqs')
+bedrock = boto3.client('bedrock-runtime')
+BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'apac.amazon.nova-micro-v1:0')
 
 SIGNALS_TABLE = os.environ.get('SIGNALS_TABLE', 'eth-trading-signals')
 MARKET_CONTEXT_TABLE = os.environ.get('MARKET_CONTEXT_TABLE', 'eth-trading-market-context')
@@ -78,9 +81,11 @@ def handler(event, context):
         # 2. 通貨別ボラティリティ適応型閾値を計算（F&G連動補正付き）
         thresholds_map = calculate_per_currency_thresholds(scored_pairs, market_context)
 
-        # 3. シグナル保存（通貨別閾値を使用）
+        # 3. AI総合コメント生成 + シグナル保存（通貨別閾値を使用）
         for scored in scored_pairs:
             pair_th = thresholds_map.get(scored['pair'], {'buy': BASE_BUY_THRESHOLD, 'sell': BASE_SELL_THRESHOLD})
+            ai_comment = generate_ai_comment(scored, pair_th)
+            scored['ai_comment'] = ai_comment
             save_signal(scored, pair_th['buy'], pair_th['sell'])
 
         # 4. スコア順にソート（期待値の高い順）
@@ -620,6 +625,74 @@ def _extract_news_headlines(sentiment_result: dict) -> list:
         return Decimal('0')
 
 
+def generate_ai_comment(scored: dict, thresholds: dict) -> str:
+    """Bedrock (Nova Micro) で総合評価コメントを日本語で生成"""
+    try:
+        pair = scored.get('pair', 'unknown')
+        coin_name = TRADING_PAIRS.get(pair, {}).get('name', pair.upper())
+        comp = scored.get('components', {})
+        total = scored.get('total_score', 0)
+
+        # シグナル判定
+        signal = 'HOLD'
+        if total >= thresholds.get('buy', BASE_BUY_THRESHOLD):
+            signal = 'BUY'
+        elif total <= thresholds.get('sell', BASE_SELL_THRESHOLD):
+            signal = 'SELL'
+
+        # 根拠データ
+        ind = scored.get('indicators_detail', {})
+        chr_d = scored.get('chronos_detail', {})
+        news = scored.get('news_headlines', [])
+        mkt = scored.get('market_context_detail', {})
+
+        # プロンプトに渡す材料
+        materials = f"""通貨: {coin_name}
+総合スコア: {total:+.3f} (シグナル: {signal})
+テクニカル: {comp.get('technical', 0):+.3f} (RSI={ind.get('rsi', 'N/A')}, ADX={ind.get('adx', 'N/A')}, レジーム={ind.get('regime', 'N/A')})
+AI予測: {comp.get('chronos', 0):+.3f} (変化率={chr_d.get('predicted_change_pct', 'N/A')}%, 確信度={chr_d.get('confidence', 'N/A')})
+センチメント: {comp.get('sentiment', 0):+.3f}
+市場環境: {comp.get('market_context', 0):+.3f} (F&G={mkt.get('fng_value', 'N/A')}, BTC Dom={mkt.get('btc_dominance', 'N/A')}%)"""
+
+        if news:
+            headlines = '\n'.join(f"  - {n.get('title', '')} (score: {n.get('score', 0.5)})" for n in news[:3])
+            materials += f"\n主要ニュース:\n{headlines}"
+
+        prompt = f"""あなたは仮想通貨のアナリストです。以下の分析データから、個人投資家向けに2-3文の簡潔な日本語コメントを生成してください。
+
+{materials}
+
+ルール:
+- 敬体（です・ます調）で書く
+- データに基づいた客観的な分析を述べる
+- 最も影響力の大きい要因を強調する
+- 「買い推奨」「売り推奨」など直接的な投資助言は避ける
+- 100文字以内に収める"""
+
+        response = bedrock.converse(
+            modelId=BEDROCK_MODEL_ID,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": 200, "temperature": 0.3},
+        )
+
+        comment = response['output']['message']['content'][0]['text'].strip()
+        # 改行を除去して1行にする
+        comment = comment.replace('\n', ' ').strip()
+        # 長すぎる場合は切り詰め
+        if len(comment) > 200:
+            comment = comment[:197] + '...'
+
+        tokens_in = response.get('usage', {}).get('inputTokens', 0)
+        tokens_out = response.get('usage', {}).get('outputTokens', 0)
+        print(f"AI comment for {pair}: {comment} (tokens: in={tokens_in}, out={tokens_out})")
+        return comment
+
+    except Exception as e:
+        print(f"AI comment generation failed for {scored.get('pair', '?')}: {e}")
+        traceback.print_exc()
+        return ''
+
+
 def save_signal(scored: dict, buy_threshold: float, sell_threshold: float):
     """全通貨のシグナルを保存（分析履歴・動的閾値対応）"""
     try:
@@ -663,6 +736,10 @@ def save_signal(scored: dict, buy_threshold: float, sell_threshold: float):
         market_detail = scored.get('market_context_detail', {})
         if market_detail:
             item['market_detail'] = to_dynamo_map(market_detail)
+
+        ai_comment = scored.get('ai_comment', '')
+        if ai_comment:
+            item['ai_comment'] = ai_comment
 
         table.put_item(Item=item)
     except Exception as e:
