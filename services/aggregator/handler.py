@@ -697,7 +697,9 @@ def save_signal(scored: dict, buy_threshold: float, sell_threshold: float):
     """全通貨のシグナルを保存（分析履歴・動的閾値対応）"""
     try:
         table = dynamodb.Table(SIGNALS_TABLE)
-        timestamp = int(time.time())
+        # 5分区切りに丸めて重複保存を防止（手動再実行時に上書き）
+        now = int(time.time())
+        timestamp = now - (now % 300)
 
         signal = 'HOLD'
         if scored['total_score'] >= buy_threshold:
