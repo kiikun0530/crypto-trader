@@ -18,8 +18,12 @@ import time
 import urllib.request
 import boto3
 import traceback
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from trading_common import TRADING_PAIRS, SENTIMENT_TABLE, dynamodb
+
+# 日本標準時 (UTC+9)
+JST = timezone(timedelta(hours=9))
 
 # Bedrock クライアント (LLMセンチメント分析用)
 bedrock = boto3.client('bedrock-runtime')
@@ -402,13 +406,25 @@ def analyze_sentiment_weighted(news: list, llm_scores: dict = None) -> tuple:
     return final_score, fresh_count, stats
 
 
+def convert_to_jst(published_at: str) -> str:
+    """ISO 8601 の published_at を JST (UTC+9) 文字列に変換"""
+    if not published_at:
+        return ''
+    try:
+        dt = datetime.fromisoformat(published_at.replace('Z', '+00:00'))
+        dt_jst = dt.astimezone(JST)
+        return dt_jst.strftime('%Y-%m-%d %H:%M:%S JST')
+    except Exception as e:
+        print(f"Error converting to JST '{published_at}': {str(e)}")
+        return ''
+
+
 def get_article_age_hours(published_at: str) -> float:
     """記事の経過時間（時間単位）"""
     if not published_at:
         return 24
 
     try:
-        from datetime import datetime
         published = datetime.fromisoformat(published_at.replace('Z', '+00:00'))
         now = datetime.now(published.tzinfo)
         age_seconds = (now - published).total_seconds()
@@ -594,6 +610,7 @@ def extract_top_headlines(articles: list, llm_scores: dict, top_n: int = 3, over
             'title': title[:120],
             'score': round(article_score, 2),
             'source': article.get('_source_currency', ''),
+            'published_at_jst': convert_to_jst(article.get('published_at', '')),
         })
 
     # overall_score の方向に沿った記事を優先
@@ -628,6 +645,7 @@ def save_sentiment(pair: str, timestamp: int, score: float, news_count: int, fre
                     'title': h['title'],
                     'score': Decimal(str(h['score'])),
                     'source': h.get('source', ''),
+                    'published_at_jst': h.get('published_at_jst', ''),
                 }
                 for h in top_headlines
             ]
