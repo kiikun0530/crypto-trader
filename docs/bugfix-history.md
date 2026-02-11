@@ -17,7 +17,7 @@
 8. [02/11 SageMaker Serverless ThrottlingException 頻発](#8-0211-sagemaker-serverless-throttlingexception-頻発)
 9. [02/12 TP/トレーリングストップ矛盾（デッドコード）](#9-0212-tpトレーリングストップ矛盾デッドコード)
 10. [02/12 DynamoDB Limit+FilterExpression アンチパターン](#10-0212-dynamodb-limitfilterexpression-アンチパターン)
-11. [02/12 Bedrock nova-micro オンデマンド呼び出し廃止](#11-0212-bedrock-nova-micro-オンデマンド呼び出し廃止)
+11. [02/12 Bedrock Claude 3 Haiku → Amazon Nova Micro 移行](#11-0212-bedrock-claude-3-haiku--amazon-nova-micro-apac-移行)
 
 ---
 
@@ -599,41 +599,52 @@ DynamoDB は **Limit を FilterExpression の前に適用する**ため、最新
 
 ---
 
-## 11. 02/12 Bedrock Nova Micro → Claude 3 Haiku 移行
+## 11. 02/12 Bedrock Claude 3 Haiku → Amazon Nova Micro (APAC) 移行
 
 ### 発生日時
 
-2026-02-12 01:18（news-collector 30分サイクルでエラー）
+2026-02-12 02:18（news-collector 30分サイクルでエラー）
 
 ### エラー
 
 ```
-botocore.errorfactory.ValidationException: An error occurred (ValidationException)
-when calling the Converse operation: The provided model identifier is invalid.
+botocore.errorfactory.ResourceNotFoundException: An error occurred (ResourceNotFoundException)
+when calling the Converse operation: Model use case details have not been submitted
+for this account.
 ```
 
 ### 原因
 
-`us.amazon.nova-micro-v1:0` は US リージョン向けの cross-region inference profile ID であり、
-本システムのデプロイリージョン `ap-northeast-1`（東京）では無効な model identifier として拒否された。
+Anthropicモデル（Claude 3 Haiku）は AWS Bedrock の Model Access ページ廃止後、
+初回利用時に use case details フォームの提出が必要になった。
+しかしフォーム提出方法が不明確なため、AWS自社モデルへの切り替えで対応。
 
-元々は `amazon.nova-micro-v1:0`（直接モデルID）を使用していたが、AWS がオンデマンド呼び出しを廃止し
-推論プロファイルID 経由を必須化。しかし `us.*` プレフィックスの推論プロファイルは東京リージョンでは利用不可。
+### 修正過程（3段階）
+
+1. **モデル切り替え**: `anthropic.claude-3-haiku-20240307-v1:0` → `amazon.nova-micro-v1:0`
+   - → `ValidationException`: オンデマンド呼び出し非対応、inference profile 経由が必須
+2. **inference profile 適用**: → `apac.amazon.nova-micro-v1:0`
+   - → `AccessDeniedException`: IAMポリシーにinference profileリソースが未許可
+3. **IAM修正**: inference profile ARN + cross-region foundation model ARN を追加
+   - → 成功: 28/31記事をLLMスコアリング（tokens: in=879, out=170）
 
 ### 影響
 
-- `news-collector` のLLMセンチメント分析が全て失敗
-- フォールバック（ルールベースNLP）で動作は継続していたが、センチメント精度が低下
+- Bedrock失敗時はルールベースNLPにフォールバックしていたため、Lambda自体はエラー終了せず
+- LLMセンチメント分析の精度のみ一時的に低下
 
 ### 修正箇所
 
 | ファイル | 修正 |
 |----------|------|
-| `terraform/lambda.tf` | `BEDROCK_MODEL_ID` を `us.amazon.nova-micro-v1:0` → `anthropic.claude-3-haiku-20240307-v1:0` に変更 |
+| `terraform/lambda.tf` | `BEDROCK_MODEL_ID` を `apac.amazon.nova-micro-v1:0` に変更 |
 | `services/news-collector/handler.py` | デフォルト値を同様に変更 |
+| `terraform/iam.tf` | inference profile ARN (`apac.amazon.nova-*`) を追加、foundation model をリージョンワイルドカード (`*`) に変更 |
 
 ### 教訓
 
-- `us.*` プレフィックスの推論プロファイルは US リージョン専用。東京リージョンでは使用不可
-- `ap-northeast-1` で利用可能なモデル（Claude 3 Haiku 等）を選択する必要がある
-- IAMポリシーには `anthropic.claude-*` が既に許可されていたため追加変更不要だった
+- Anthropicモデルはuse caseフォームが必要。AWS自社モデル（Nova）はフォーム不要で即利用可能
+- Nova Micro は直接 model ID では呼べず、inference profile ID 経由が必須
+- `ap-northeast-1` では `apac.*` プレフィックスの inference profile を使用（`us.*` は不可）
+- Cross-region inference profile はルーティング先リージョン（例: `ap-southeast-2`）の foundation model ARN にもアクセス権が必要
+- IAMの foundation model リソースはリージョンワイルドカード (`arn:aws:bedrock:*::foundation-model/amazon.nova-*`) にすると安全

@@ -354,7 +354,7 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
 | 優先度 | 条件 | スコア決定方法 |
 |---|---|---|
 | 1 | 投票数 ≥ 5 | 賛否比率 × 信頼度係数 |
-| 2 | 投票数 < 5 | AWS Bedrock (Claude 3.5 Haiku) によるLLMセンチメント分析 |
+| 2 | 投票数 < 5 | AWS Bedrock (Amazon Nova Micro) によるLLMセンチメント分析 |
 | 3 | LLM失敗時 | ルールベースNLPフォールバック（キーワード分析） |
 | 補助 | `panic_score` 存在時 | ±0.10 の微調整（0=ネガ, 2=中立, 4=ポジ） |
 
