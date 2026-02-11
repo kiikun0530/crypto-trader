@@ -111,7 +111,7 @@ def handler(event, context):
                 # センチメント分析
                 print(f"Analyzing sentiment for {pair} with {len(weighted_articles)} articles...")
                 score, fresh_count, stats = analyze_sentiment_weighted(weighted_articles, llm_scores)
-                top_headlines = extract_top_headlines(weighted_articles, llm_scores)
+                top_headlines = extract_top_headlines(weighted_articles, llm_scores, overall_score=score)
                 
                 print(f"Saving sentiment for {pair}...")
                 save_sentiment(pair, timestamp, score, len(weighted_articles), fresh_count, top_headlines)
@@ -560,8 +560,14 @@ def estimate_sentiment_from_title(title: str) -> float:
         return 0.5
 
 
-def extract_top_headlines(articles: list, llm_scores: dict, top_n: int = 3) -> list:
-    """影響度の高いニュースタイトル上位N件を抽出（スコアの根拠説明用）"""
+def extract_top_headlines(articles: list, llm_scores: dict, top_n: int = 3, overall_score: float = 0.5) -> list:
+    """センチメント方向を説明するニュースタイトル上位N件を抽出
+
+    overall_score の方向に沿ったヘッドラインを優先表示:
+    - bearish (< 0.45): スコアが低い順（なぜ弱気かを説明）
+    - bullish (> 0.55): スコアが高い順（なぜ強気かを説明）
+    - neutral: 影響度（中立からの乖離）順
+    """
     scored_articles = []
     for article in articles:
         title = article.get('title', '').strip()
@@ -590,8 +596,16 @@ def extract_top_headlines(articles: list, llm_scores: dict, top_n: int = 3) -> l
             'source': article.get('_source_currency', ''),
         })
 
-    # 中立(0.5)から離れているものほど影響度大
-    scored_articles.sort(key=lambda x: abs(x['score'] - 0.5), reverse=True)
+    # overall_score の方向に沿った記事を優先
+    if overall_score < 0.45:
+        # 弱気: スコアが低い記事を優先表示（なぜ弱気かを説明）
+        scored_articles.sort(key=lambda x: x['score'])
+    elif overall_score > 0.55:
+        # 強気: スコアが高い記事を優先表示（なぜ強気かを説明）
+        scored_articles.sort(key=lambda x: x['score'], reverse=True)
+    else:
+        # 中立: 影響度（中立からの乖離）順
+        scored_articles.sort(key=lambda x: abs(x['score'] - 0.5), reverse=True)
     return scored_articles[:top_n]
 
 
