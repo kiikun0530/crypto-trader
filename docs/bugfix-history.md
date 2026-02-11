@@ -599,25 +599,26 @@ DynamoDB は **Limit を FilterExpression の前に適用する**ため、最新
 
 ---
 
-## 11. 02/12 Bedrock nova-micro オンデマンド呼び出し廃止
+## 11. 02/12 Bedrock Nova Micro → Claude 3 Haiku 移行
 
 ### 発生日時
 
-2026-02-12 00:18〜00:48（news-collector 30分サイクルで連続エラー）
+2026-02-12 01:18（news-collector 30分サイクルでエラー）
 
 ### エラー
 
 ```
 botocore.errorfactory.ValidationException: An error occurred (ValidationException)
-when calling the Converse operation: Invocation of model ID amazon.nova-micro-v1:0
-with on-demand throughput isn't supported. Retry your request with the ID or ARN
-of an inference profile that contains this model.
+when calling the Converse operation: The provided model identifier is invalid.
 ```
 
 ### 原因
 
-AWSがBedrock基盤モデルの直接モデルID（`amazon.nova-micro-v1:0`）でのオンデマンド呼び出しを廃止。
-**推論プロファイルID**（`us.amazon.nova-micro-v1:0`）経由のみサポートする仕様に変更された。
+`us.amazon.nova-micro-v1:0` は US リージョン向けの cross-region inference profile ID であり、
+本システムのデプロイリージョン `ap-northeast-1`（東京）では無効な model identifier として拒否された。
+
+元々は `amazon.nova-micro-v1:0`（直接モデルID）を使用していたが、AWS がオンデマンド呼び出しを廃止し
+推論プロファイルID 経由を必須化。しかし `us.*` プレフィックスの推論プロファイルは東京リージョンでは利用不可。
 
 ### 影響
 
@@ -628,11 +629,11 @@ AWSがBedrock基盤モデルの直接モデルID（`amazon.nova-micro-v1:0`）�
 
 | ファイル | 修正 |
 |----------|------|
-| `terraform/lambda.tf` | `BEDROCK_MODEL_ID` を `amazon.nova-micro-v1:0` → `us.amazon.nova-micro-v1:0` に変更 |
+| `terraform/lambda.tf` | `BEDROCK_MODEL_ID` を `us.amazon.nova-micro-v1:0` → `anthropic.claude-3-haiku-20240307-v1:0` に変更 |
 | `services/news-collector/handler.py` | デフォルト値を同様に変更 |
-| `terraform/iam.tf` | IAMポリシーに推論プロファイル用ARN (`arn:aws:bedrock:...:inference-profile/us.amazon.nova-*`) を追加 |
 
 ### 教訓
 
-- AWS Bedrockの基盤モデル呼び出しは推論プロファイルID経由が必須になった
-- IAMポリシーも `foundation-model/*` だけでなく `inference-profile/*` のリソースARNが必要
+- `us.*` プレフィックスの推論プロファイルは US リージョン専用。東京リージョンでは使用不可
+- `ap-northeast-1` で利用可能なモデル（Claude 3 Haiku 等）を選択する必要がある
+- IAMポリシーには `anthropic.claude-*` が既に許可されていたため追加変更不要だった
