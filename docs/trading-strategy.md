@@ -1,44 +1,118 @@
 # 売買戦略設計書
 
-マルチ通貨選定ロジック、スコアリング、売買判定の詳細。
+マルチタイムフレーム・マルチ通貨戦略のスコアリング、売買判定の詳細。
 
 ---
 
-## マルチ通貨戦略の全体像
+## マルチタイムフレーム戦略の全体像
 
 ```mermaid
 flowchart TD
-    subgraph 収集["5分毎: 価格収集"]
-        P1["ETH/USDT"] & P2["BTC/USDT"] & P3["XRP/USDT"] & P4["SOL/USDT"] & P5["DOGE/USDT"] & P6["AVAX/USDT"]
+    subgraph TF別分析["TF別分析 (各TFのStep Functions)"]
+        subgraph TF15m["15分毎"]
+            P15["価格収集 15m"]
+            A15["Tech + Sent並列<br/>Chronos直列"]
+            S15["TFスコア保存"]
+        end
+        subgraph TF1h["1時間毎"]
+            P1h["価格収集 1h"]
+            A1h["Tech + Sent並列<br/>Chronos直列"]
+            S1h["TFスコア保存"]
+        end
+        subgraph TF4h["4時間毎"]
+            P4h["価格収集 4h"]
+            A4h["Tech + Sent並列<br/>Chronos直列"]
+            S4h["TFスコア保存"]
+        end
+        subgraph TF1d["日次"]
+            P1d["価格収集 1d"]
+            A1d["Tech + Sent並列<br/>Chronos直列"]
+            S1d["TFスコア保存"]
+        end
     end
 
-    subgraph 分析["5分毎: 全通貨一括分析"]
-        A1["テクニカル分析<br/>RSI, MACD, SMA, BB"]
-        A2["AI価格予測<br/>Chronos/モメンタム"]
-        A3["センチメント<br/>CryptoPanicニュース"]
-        A4["マーケットコンテキスト<br/>F&G, Funding, BTC Dom"]
+    subgraph メタ集約["15分毎: メタアグリゲーター"]
+        READ["全TFスコア読み取り<br/>(DynamoDB tf-scores)"]
+        MKT["マーケットコンテキスト<br/>F&G, Funding, BTC Dom"]
+        WEIGHT["マルチTF加重平均<br/>15m:20% 1h:35% 4h:30% 1d:15%"]
+        ALIGN["TF間整合性チェック<br/>aligned/mixed/conflicting"]
+        EACH{"通貨毎に<br/>BUY/SELL/HOLD判定"}
+        SAVE["signalsテーブルに保存"]
+        ALL_HOLD["ALL HOLD"]
     end
 
-    subgraph 判定["スコア比較 → 通貨毎判定"]
-        S["全通貨スコアリング<br/>& ランキング"]
-        EACH{"通貨毎に<br/>BUY/SELL/HOLD判定<br/>(ポジション非依存)"}
-        QUEUE["BUY/SELLがあれば<br/>バッチでSQS送信"]
-        ALL_HOLD["ALL HOLD<br/>キュー送信なし"]
+    subgraph 実行["order-executor (EventBridge 15分毎)"]
+        READ_SIG["signalsテーブルから<br/>最新シグナル読み取り"]
+        SELL_EXEC["SELL: 全対象を売却"]
+        BUY_EXEC["BUY: 最高スコア1通貨のみ購入"]
     end
 
-    subgraph 実行["order-executor"]
-        SELL_EXEC["SELL: ポジションあれば売却<br/>なければスキップ"]
-        BUY_EXEC["BUY: スコア順に<br/>残高と相談して購入"]
-    end
+    P15 --> A15 --> S15
+    P1h --> A1h --> S1h
+    P4h --> A4h --> S4h
+    P1d --> A1d --> S1d
 
-    収集 --> 分析
-    分析 --> S
-    S --> EACH
-    EACH -->|"BUY/SELLあり"| QUEUE
+    S15 & S1h & S4h & S1d --> READ
+    READ --> MKT --> WEIGHT --> ALIGN --> EACH
+    EACH -->|"BUY/SELLあり"| SAVE
     EACH -->|"全てHOLD"| ALL_HOLD
-    QUEUE --> SELL_EXEC
-    QUEUE --> BUY_EXEC
+    SAVE --> READ_SIG
+    READ_SIG --> SELL_EXEC
+    READ_SIG --> BUY_EXEC
 ```
+
+---
+
+## マルチタイムフレーム設定
+
+| TF | Binance間隔 | 実行頻度 | TTL | Chronos入力 | 予測先 | スコアスケール |
+|---|---|---|---|---|---|---|
+| 15m | 15m | 15分毎 | 14日 | 336本 (3.5日) | 3時間 | ±3% |
+| 1h | 1h | 1時間毎 | 30日 | 336本 (14日) | 12時間 | ±5% |
+| 4h | 4h | 4時間毎 | 90日 | 336本 (56日) | 48時間 | ±10% |
+| 1d | 1d | 日次 | 365日 | 250本 (250日) | 12日 | ±20% |
+
+### TF加重ウェイト
+
+| TF | ウェイト | 役割 |
+|---|---|---|
+| 15m | 20% | エントリータイミング |
+| 1h | **35%** | 中期トレンド方向（最重要） |
+| 4h | 30% | 大局観 |
+| 1d | 15% | 長期トレンド確認 |
+
+### TF間整合性チェック
+
+- **aligned** (75%以上同方向): スコア × 1.15 ボーナス
+- **mixed** (50-75%): そのまま
+- **conflicting** (50%以下): スコア × 0.85 ペナルティ
+
+### TF別テクニカルパラメータ
+
+各TFの足の特性に合わせて、スコアリングの正規化基準を調整:
+
+| パラメータ | 15m | 1h | 4h | 1d | 概要 |
+|---|---|---|---|---|---|
+| RSI減衰(穏やか) | 4本(1h) | 3本(3h) | 2本(8h) | 2本(2d) | 50%減衰開始バー数 |
+| RSI減衰(強い) | 12本(3h) | 6本(6h) | 4本(16h) | 3本(3d) | 25%減衰バー数 |
+| MACD histスケール | ±0.10% | ±0.20% | ±0.50% | ±1.00% | 価格比で±1.0になる値 |
+| SMA乖離スケール | ±1.5% | ±3.0% | ±5.0% | ±10.0% | フルスコアになる乖離率 |
+| BB幅ベースライン | 3.0% | 4.5% | 7.0% | 12.0% | ボラ補正の基準値 |
+
+**設計根拠**: 5分足でのハードコード値（RSI減衰 12/36bars, MACD ±0.1%, SMA ±2%, BB 3%）は
+その足の典型的な変動幅に合わせたものだった。マルチTFでは同じロジックを
+各足の典型的変動幅に合わせてスケーリング。
+
+### TF別 BUY/SELL/HOLD判定
+
+各TFにStep Functionsが分析完了時に、TF別のBUY/SELL/HOLDを算出:
+- TF別BBベースラインでボラ補正（マーケットコンテキストなし、F&G補正なし）
+- DynamoDB tf-scoresテーブルに signal フィールドとして保存
+- メタアグリゲーターのSlack通知でTF別シグナルを表示
+
+**最終判定はメタアグリゲーターが行う**:
+- 全TFスコアの加重平均 + 整合性チェック + マーケットコンテキスト + F&G補正
+- TF別シグナルは参考情報（人間が各足の状況を把握するため）
 
 ---
 
@@ -68,7 +142,7 @@ total_score = technical × 0.35 + chronos × 0.35 + sentiment × 0.15 + market_c
 |---|---|---|
 | RSI (14) | 15-35% | 4ゾーン制: <30/>70はフルウェイト、30-40/60-70は30%上限グラデーション、40-60はデッドバンド(≈0)。継続時間減衰 + トレンド方向抑制付き |
 | MACD (12,26,9) | 15-35% | ヒストグラム振幅ベースのグラデーションスコア |
-| SMA20 vs SMA200 | 15-35% | SMA20/SMA200乖離率グラデーション（±2%でフルスコア、±0.2%未満はほぼゼロ） |
+| SMA20 vs SMA200 | 15-35% | SMA20/SMA200乖離率グラデーション（TF別スケール: 15m=±1.5%, 1h=±3%, 4h=±5%, 1d=±10%） |
 | Bollinger Bands (20,2) | 15-35% | 二乗カーブ（中央付近は穏やか、バンド端のみ急激なスコア） |
 | ADX (14) | - | レジーム検知に使用 (>25:トレンド, <20:レンジ)。正式OHLC対応 |
 | ATR (14) | - | ボラティリティ指標。正式True Range (H-L, |H-PrevC|, |L-PrevC|) |
@@ -83,12 +157,12 @@ total_score = technical × 0.35 + chronos × 0.35 + sentiment × 0.15 + market_c
 > - **<30 / >70**: フルウェイト (±w_rsi) ← 明確な売られすぎ/買われすぎ
 > - **30-40 / 60-70**: 最大30%のグラデーション (±w_rsi×0.3) ← 接近中だが確定前
 > - **40-60**: デッドバンド (≈0) ← 中立帯、スコアにほぼ影響しない
-> - **継続時間減衰**: RSI<30が1h(12bars)以上継続→50%減衰、3h(36bars)以上→25%減衰
+> - **継続時間減衰**: TF別バー数で「落ちるナイフ」検知（15m: 4bars/12bars, 1h: 3/6, 4h: 2/4, 1d: 2/3）
 > - **トレンド方向抑制**: トレンド相場でMACDが下向きなのにRSIが「売られすぎ買い」→70%抑制（落ちるナイフ防止）
 >
 > **SMAスコアリング（乖離率グラデーション）**:
-> - SMA20とSMA200の乖離率を計算し、±2%でフルスコアとして線形スケール
-> - 乖離率 0.3%程度のデッドクロスでは w_sma×0.15 程度の軽微な影響に留まる
+> - SMA20とSMA200の乖離率を計算し、TF別スケールでフルスコアとして線形スケール
+> - 例: 1h足で乖離率 0.3%程度のデッドクロスでは w_sma×0.10 程度の軽微な影響に留まる
 > - 旧方式のバイナリ(±w_sma固定)による過剰反応を解消
 >
 > **BBスコアリング（二乗カーブ）**:
@@ -101,9 +175,13 @@ total_score = technical × 0.35 + chronos × 0.35 + sentiment × 0.15 + market_c
 
 - **SageMaker Serverless Endpoint**: Chronos-2 (120Mパラメータ) を SageMaker Serverless Endpoint で推論。冷起動時に ~25-30秒のレイテンシが発生するが Lambda Timeout=180s で吸収
 - **入力**: **Typical Price (H+L+C)/3** を使用。close のみよりローソク足の値動きの重心を反映。OHLCがない古いレコードは close にフォールバック
-- 時系列予測で±1.5%以上の変動予測を最大スコアに変換（12ステップ先、加重平均）
-  - `SCORE_SCALE_PERCENT = 1.5` — ±1.5% の変動で ±1.0 のスコア
-  - 旧±3%スケールでは5分足12本先(1h)の予測で常にゼロ付近だったため縮小
+- **TF別スコアスケール**: タイムフレームに応じた変動スケールで予測を正規化
+  - 15m: ±3% — 短期の小さな変動を捉える
+  - 1h: ±5% — 中期トレンドの標準スケール
+  - 4h: ±10% — 大きなトレンド変動
+  - 1d: ±20% — 日足レベルの大局的変動
+- **TF別入力長**: 15m/1h/4h=336本、1d=250本
+- **Step Functions MaxConcurrency=1**: SageMaker同時リクエスト制限を遵守するため、Chronosフェーズは通貨を直列実行
 - SageMaker推論失敗時の代替: **モメンタムベーススコア**
   - 短期モメンタム（5期間）× 60% + 中期モメンタム（10期間）× 40%
   - ±2%の変動で±1のスコア
@@ -169,8 +247,8 @@ total_score = technical × 0.35 + chronos × 0.35 + sentiment × 0.15 + market_c
 50%を中立として ±15% で ±1.0
 
 # アルトコイン追加補正
-BTC Dom > 60%: ETH/XRP/SOL/DOGE/AVAXに -0.05 ペナルティ
-BTC Dom < 40%: ETH/XRP/SOL/DOGE/AVAXに +0.05 ボーナス
+BTC Dom > 60%: ETH/XRPに -0.05 ペナルティ
+BTC Dom < 40%: ETH/XRPに +0.05 ボーナス
 (BTC自身は補正なし)
 
 market_context = fng_score × 0.30 + funding_score × 0.35 + dominance_score × 0.35
@@ -188,14 +266,14 @@ market_context = fng_score × 0.30 + funding_score × 0.35 + dominance_score × 
 ### 通貨毎のBUY/SELL/HOLD判定（ポジション非依存）
 
 **方針**: aggregator は全通貨を純粋にスコアと閾値で判定し、現在のポジション状況に影響されない。
-BUY/SELLがある場合のみ1つのSQSメッセージとしてバッチ送信。全てHOLDならキュー呼び出しなし。
-order-executor が残高・ポジションを確認して実際の注文を実行する。
+判定結果は DynamoDB signals テーブルに保存され、EventBridge 定期起動の order-executor が最新シグナルを読み取って注文を執行する。
+BUY対象が複数ある場合は最もスコアの高い1通貨のみ購入、SELLは全対象を売却する。
 
 ```
-# 1. ボラティリティ適応型閾値を計算
-全通貨のBB幅（ボリンジャーバンド幅）の平均を算出
-vol_ratio = 平均BB幅 / 基準BB幅(3%)  ← クランプ: 0.67〜2.0
-buy_threshold  = BASE_BUY(0.25) × vol_ratio
+# 1. ボラティリティ適応型閾値を計算（通貨別ボラ補正 + F&G加算補正）
+vol_ratio = 通貨別BB幅 / 基準BB幅(3%)  ← クランプ: 0.67〜2.0
+fng_adder = +0.06 (Extreme Fear) / +0.04 (Extreme Greed) / 0 (その他)
+buy_threshold  = min(BASE_BUY(0.25) × vol_ratio + fng_adder, 0.45)  ← 上限キャップ
 sell_threshold = BASE_SELL(-0.13) × vol_ratio
 
 # 2. 通貨毎にBUY/SELL/HOLD判定（ポジション非依存）
@@ -204,29 +282,26 @@ for each 通貨 in scored_pairs:
     elif スコア <= sell_threshold → SELL
     else → HOLD
 
-# 3. SQSへバッチ送信（BUY/SELLがある場合のみ）
-if BUYまたはSELLが1件以上:
-    全てのBUY/SELL判定を1つのSQSメッセージとして送信
+# 3. DynamoDB signalsテーブルに保存済み（save_signal()で自動保存）
 
-# 4. order-executorでの実行
+# 4. order-executorでの実行（EventBridge 15分毎起動）
 SELL先（資金確保）:
-    ポジションがあれば売却、なければスキップ
-BUYをスコア降順（高い期待値の通貨を優先）:
-    残高確認 → 既にポジションがあればスキップ → 購入
+    全対象のポジションがあれば売却、なければスキップ
+BUY:
+    最もスコアの高い1通貨のみ購入（集中投資）
 ```
 
 **aggregator（判定）と order-executor（実行）の分離**:
-- aggregator: 純粋にスコア vs 閾値で判定。記録（DynamoDB signals）。バッチ送信。
-- order-executor: ポジション確認、残高確認、サーキットブレーカー、実際の注文API呼び出し。
+- aggregator: 純粋にスコア vs 閾値で判定。記録（DynamoDB signals）。
+- order-executor: EventBridge 15分毎起動。signalsテーブルから読み取り、ポジション確認、残高確認、サーキットブレーカー、実際の注文API呼び出し。
 
 **SELL処理（order-executor）**:
-- バッチ内の全SELL判定を処理
+- 全SELL判定を処理
 - 対象通貨のポジションがあれば売却、なければスキップ（「売る対象がなければ無視」）
 
 **BUY処理（order-executor）**:
-- バッチ内の全BUY判定をスコア降順で処理
-- 各通貨: ポジション既存ならスキップ → 残高確認 → Kelly/フォールバック比率で投資額算出 → 購入
-- 残高が減るため、優先度の高い通貨から順に投資額が確保される
+- BUY判定が複数あっても最もスコアの高い1通貨のみ購入（集中投資）
+- ポジション既存ならスキップ → 残高確認 → Kelly/フォールバック比率で投資額算出 → 購入
 
 **ポジションサイジングと複数保有**:
 - 投資額は `available_jpy`（残りの日本円残高）から計算
@@ -234,9 +309,15 @@ BUYをスコア降順（高い期待値の通貨を優先）:
 - MIN_ORDER_JPY(¥500) 未満になると新規BUYは実行されない
 
 **ボラティリティ適応の意味**:
-- **高ボラ時（BB幅 > 3%）**: 閾値を厳しく → ノイズに反応しない（例: BB幅6% → BUY閾値 +0.56）
+- **高ボラ時（BB幅 > 3%）**: 閾値を厳しく → ノイズに反応しない（例: BB幅6% → BUY閾値 +0.45 [CAP]）
 - **低ボラ時（BB幅 < 3%）**: 閾値を緩く → 小さな確実なシグナルを拾う（例: BB幅2% → BUY閾値 +0.19）
 - **平均時（BB幅 ≈ 3%）**: 基準閾値をそのまま使用（BUY +0.25 / SELL -0.13）
+- **上限キャップ (0.45)**: どんなに高ボラ+Extreme環境でもBUY閾値は0.45を超えない
+
+> **F&G補正方式変更根拠 (Phase 4.1)**: 旧方式（乗算: BASE×vol_ratio×fng_multiplier）では
+> ボラ補正×F&G補正の二重効果で高ボラ通貨のBUY閾値が0.6超に達し、
+> Tech+AIが共に強い買いシグナルでも絶対に届かない「永遠に買えない」状態が発生していた。
+> 加算方式（BASE×vol_ratio + fng_adder） + 上限キャップ(0.45)で両補正を独立させ解消。
 
 > **Phase 4 閾値調整根拠**: Tech/AI均等化(0.35/0.35)でTechの大きなスコア振幅の影響が縮小。
 > スコア分布が約10%圧縮するため、BUY/SELL閾値を10-13%緩和してシグナル頻度を維持。
@@ -313,7 +394,7 @@ f* = 最適投資比率
   - 含み益 12%+: ピークから1.0%下にSL（最狭、大利確保）
   - 最低でも建値+0.1%以上を保証（手数料分）
 - Take Profit (+30%) は異常時の最終防衛線。通常はトレーリングストップが主な利確手段
-- トリガー時は SQS 経由で order-executor に売り指示（確実な実行を保証）
+- トリガー時は position-monitor が直接 Coincheck API で売り指示（確実な実行を保証）
 
 ### サーキットブレーカー
 
@@ -330,62 +411,59 @@ order-executorにBUY注文前の安全装置として実装（デフォルトOFF
 ### 注文の確実性
 
 ```
-aggregator → SQS → order-executor
-                      ↓ (失敗時)
-              自動リトライ (最大3回)
-                      ↓ (3回失敗)
-              DLQ → CloudWatch Alarm → Slack通知
+aggregator → DynamoDB (signals) ← order-executor (EventBridge 15分毎)
+                                       ↓ (失敗時)
+                                 CloudWatch Alarm → Slack通知
 ```
 
 ---
 
 ## 分析サイクル
 
-EventBridge が5分間隔で Step Functions を直接起動し、全通貨を一括分析する。price-collector とは独立して動作。
+4つのタイムフレーム (15m, 1h, 4h, 1d) がそれぞれ独立した EventBridge スケジュールで Step Functions を起動する。各TFの Step Functions は4フェーズ構成:
 
-**設計根拠**: 価格が変動しなくても、AI予測・センチメント・マーケットコンテキストは常に変化するため、毎回分析を実行することで最新の市場状況を反映した判断が可能。
+1. **PriceCollection**: 対象TFの価格を収集
+2. **AnalyzeTechSentiment**: 通貨毎にテクニカル+センチメント並列 (MaxConcurrency=3)
+3. **ChronosSequential**: 通貨毎にChronos推論直列 (MaxConcurrency=1)
+4. **SaveTFScores**: aggregator (tf_score モード) でTFスコアをDynamoDBに保存
+
+加えて、15分間隔の **メタアグリゲーター** が全TFスコアを読み取り、加重平均+整合性チェックで最終スコアを算出し、売買判定を行う。
+
+**設計根拠**: TFごとに独立実行することで、1hや4hの分析が15m分析をブロックしない。メタアグリゲーターは最新のTFスコアを常に使い、古いスコアは陳腐化判定 (staleness) で除外する。
 
 ---
 
 ## Slack通知のフォーマット
 
-分析完了ごとにSlackに以下が通知される:
+メタアグリゲーター完了ごとにSlackに以下が通知される:
 
 ```
-� マルチ通貨分析: BUY 1件 / SELL 1件 / HOLD 4件
+📊 マルチTF通貨分析: BUY 1件 / SELL 0件 / HOLD 2件
 
 🌍 市場環境
 F&G: 14 (Extreme Fear) | BTC Dom: 56.9% | Scores: F&G=+0.397 Fund=+0.133 Dom=-0.457
 
 📊 通貨ランキング（期待値順）
-🥇 Ethereum:  +0.5234  ▓▓▓▓▓▓▓▓░░ → 🟢BUY
-    Tech: +0.812(0.28) | AI: +0.654(0.42) | Sent: +0.321 | Mkt: +0.147
-    閾値: BUY≥+0.220 / SELL≤-0.115
-🥈 Bitcoin:   +0.3521  ▓▓▓▓▓▓▓░░░ → ⚪HOLD
-    Tech: +0.534(0.35) | AI: +0.412(0.35) | Sent: +0.123 | Mkt: +0.147
-    閾値: BUY≥+0.185 / SELL≤-0.097
-🥉 XRP:       +0.1500  ▓▓▓▓▓▓░░░░ → ⚪HOLD
-    Tech: +0.312(0.35) | AI: +0.123(0.35) | Sent: -0.045 | Mkt: +0.147
-    閾値: BUY≥+0.310 / SELL≤-0.163
-4. Avalanche:  -0.1800  ▓▓▓▓░░░░░░ → 🔴SELL
-    Tech: -0.400(0.35) | AI: -0.200(0.35) | Sent: -0.100 | Mkt: +0.147
-    閾値: BUY≥+0.280 / SELL≤-0.147
-...
+🥇 Ethereum:  +0.4234  ▓▓▓▓▓▓▓▓░░ → 🟢BUY
+    15m: +0.32🟢 | 1h: +0.48🟢 | 4h: +0.52🟢 | 1d: +0.38⚪ | 🟢aligned
+    Mkt: +0.147 | 閾値: BUY≥+0.220 / SELL≤-0.115
+🥈 Bitcoin:   +0.2521  ▓▓▓▓▓▓▓░░░ → ⚪PHOLD
+    15m: +0.15⚪ | 1h: +0.31⚪ | 4h: +0.28⚪ | 1d: +0.22⚪ | 🟡mixed
+    Mkt: +0.147 | 閾値: BUY≥+0.185 / SELL≤-0.097
+🥉 XRP:       +0.0800  ▓▓▓▓▓▓░░░░ → ⚪HOLD
+    15m: -0.10🔴 | 1h: +0.15⚪ | 4h: +0.12⚪ | 1d: +0.05⚪ | 🔴conflicting
+    Mkt: +0.147 | 閾値: BUY≥+0.310 / SELL≤-0.163
 
-💼 ポジション (2件)
+💼 ポジション (1件)
 📈 Ethereum (eth_jpy) 参入: ¥320,000 → 現在: ¥333,057 | P/L: +¥13,057 (+4.08%) | 保有45分
-📉 Avalanche (avax_jpy) 参入: ¥5,000 → 現在: ¥4,800 | P/L: -¥200 (-4.00%) | 保有120分
-💰 合計含み損益: +¥12,857
+💰 合計含み損益: +¥13,057
 
-基準閾値: BUY≥+0.250 / SELL≤-0.130 (通貨別ボラ補正あり) | 基準重み: Tech=0.35 AI=0.35 Sent=0.15 Mkt=0.15
-
-⚡ 注文キューに送信済み: BUY Ethereum, SELL Avalanche
+基準閾値: BUY≥+0.250 / SELL≤-0.130 (通貨別ボラ補正あり) | TFウェイト: 15m=20% 1h=35% 4h=30% 1d=15%
 ```
 
 全てHOLDの場合:
 ```
-⚪ マルチ通貨分析: ALL HOLD
-（キュー送信なし）
+⚪ マルチTF通貨分析: ALL HOLD
 ```
 
 ---
@@ -399,13 +477,13 @@ F&G: 14 (Extreme Fear) | BTC Dom: 56.9% | Scores: F&G=+0.397 Fund=+0.133 Dom=-0.
 ```json
 {
   "eth_usdt": {"binance": "ETHUSDT", "coincheck": "eth_jpy", "news": "ETH", "name": "Ethereum"},
-  "sol_usdt": {"binance": "SOLUSDT", "coincheck": "sol_jpy", "news": "SOL", "name": "Solana"}
+  "xrp_usdt": {"binance": "XRPUSDT", "coincheck": "xrp_jpy", "news": "XRP", "name": "XRP"}
 }
 ```
 
 ### マルチポジション化
 
-✅ **実装済み**: 複数通貨の同時保有に対応。aggregator は通貨毎にポジション非依存でBUY/SELL/HOLD判定し、BUY/SELLをバッチでSQS送信。order-executor がポジション・残高を確認して実際の注文を実行。投資額は `available_jpy`（残りJPY残高）から自然に分配される。
+✅ **実装済み**: 複数通貨の同時保有に対応。aggregator は通貨毎にポジション非依存でBUY/SELL/HOLD判定し、DynamoDB signalsテーブルに保存。order-executor が EventBridge 15分毎起動でシグナルを読み取り、ポジション・残高を確認して実際の注文を実行。BUYは最高スコアの1通貨のみ、SELLは全対象。投資額は `available_jpy`（残りJPY残高）から自然に分配される。
 
 ### より大きなモデルへの移行
 
@@ -430,24 +508,24 @@ F&G: 14 (Extreme Fear) | BTC Dom: 56.9% | Scores: F&G=+0.397 Fund=+0.133 Dom=-0.
 
 ### AI予測スコアのスケーリング
 
-Chronos-2 は価格の「方向」を予測する点で優秀。±3%のスケーリングでChronosの35%ウェイトが実質的に機能:
+Chronos-2 は価格の「方向」を予測する点で優秀。TF別のスケーリングで各時間軸の変動幅に適応:
 
-| スケール | 効果 | 備考 |
+| TF | スケール | 榹拠 |
 |---|---|---|
-| ±5% (旧) | スコアが常にほぼ0 | 1hで5%変動は稀、実質無機能 |
-| ±1% (旧) | 頻繁にクリップ | 過度に敏感 |
-| **±3% (現行)** | **適度なスコア分散** | **バランスの取れたスケール** |
+| 15m | ±3% | 短期では小幅変動が典型 |
+| 1h | ±5% | 中期トレンドの標準的なスケール |
+| 4h | ±10% | マクロトレンドの変動幅 |
+| 1d | ±20% | 日足レベルでは大きな変動が範囲内 |
 
 ### 売りシグナルの発生条件
 
-売りシグナルには `total_score <= sell_threshold` が必要。閾値は通貨ごとのBB幅（ボラティリティ）に基づいて個別計算される（基準: -0.13）。高ボラ通貨はより厳しい閾値、低ボラ通貨はより緩い閾値が適用される。
+売りシグナルには `total_score <= sell_threshold` が必要。メタアグリゲーターが全TFの加重平均スコアにマーケットコンテキストを加味した最終スコアで判定する。閾値は通貨ごとのBB幅（ボラティリティ）に基づいて個別計算される（基準: -0.13）。
 
-| テクニカル | AI予測 | センチメント | マーケットCtx | 合計スコア | 判定 |
-|---|---|---|---|---|---|
-| -0.6 | -0.5 | +0.18 | +0.15 | -0.369 | ✅ SELL |
-| -0.3 | -0.4 | +0.15 | +0.15 | -0.213 | ✅ SELL |
-| -0.2 | -0.2 | +0.18 | +0.15 | -0.081 | ❌ HOLD |
-| +0.1 | -0.8 | +0.10 | -0.30 | -0.180 | ✅ SELL |
+| 15m | 1h | 4h | 1d | 整合性 | Mkt | 最終スコア | 判定 |
+|---|---|---|---|---|---|---|---|
+| -0.4 | -0.5 | -0.6 | -0.3 | aligned(×1.15) | +0.10 | -0.456 | ✅ SELL |
+| -0.2 | -0.3 | -0.4 | +0.1 | mixed | -0.10 | -0.255 | ✅ SELL |
+| +0.1 | -0.2 | -0.1 | +0.2 | conflicting(×0.85) | +0.05 | -0.001 | ❌ HOLD |
+| -0.3 | -0.5 | -0.4 | -0.6 | aligned(×1.15) | -0.20 | -0.643 | ✅ SELL |
 
-4成分体制ではテクニカルとAI予測だけでなく、**市場環境全体**がネガティブな場合にもSELLが発動しやすくなる。
-旧3成分では4番目のケース (Tech微正+AI強い売り) はHOLDだったが、Market Contextが売り方向なら補強される。
+マルチTF体制ではTF間の整合性が重要。全TFが揃って下向きなら alignment bonus で SELL が発動しやすくなり、TF間で方向がバラバラなら penalty で慎重判定となる。

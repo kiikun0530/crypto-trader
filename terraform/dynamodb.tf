@@ -181,4 +181,33 @@ resource "aws_dynamodb_table" "market_context" {
   }
 }
 
+# TFスコアテーブル (マルチタイムフレーム分析結果)
+# PK: pair_tf (e.g., "btc_usdt#1h"), SK: timestamp
+# 各TFの分析ワークフローが結果を書き込み、meta-aggregatorが読み取る
+resource "aws_dynamodb_table" "tf_scores" {
+  name         = "${local.name_prefix}-tf-scores"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pair_tf"
+  range_key    = "timestamp"
+
+  attribute {
+    name = "pair_tf"
+    type = "S"
+  }
+
+  attribute {
+    name = "timestamp"
+    type = "N"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = {
+    Name = "${local.name_prefix}-tf-scores"
+  }
+}
+
 

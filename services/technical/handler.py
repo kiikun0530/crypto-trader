@@ -1,7 +1,11 @@
 """
-テクニカル分析 Lambda
+テクニカル分析 Lambda (マルチタイムフレーム対応)
 RSI, MACD, SMA20/200, ボリンジャーバンド, ADX, ATRを計算
-5分足250本 = 約20時間分のデータを使用
+
+マルチTF対応:
+  timeframe パラメータで分析対象のタイムフレームを指定
+  DynamoDB キーは pair#timeframe 形式（例: "btc_usdt#1h"）
+  データ取得件数はTFに応じて自動調整
 
 レジーム検知:
 - ADXでトレンド強度を判定
@@ -12,22 +16,35 @@ import json
 import os
 import boto3
 from decimal import Decimal
+from trading_common import (
+    PRICES_TABLE, TIMEFRAME_CONFIG, make_pair_tf_key, dynamodb
+)
 
-dynamodb = boto3.resource('dynamodb')
-PRICES_TABLE = os.environ.get('PRICES_TABLE', 'eth-trading-prices')
+# TF別のデータ取得件数（SMA200 + 余裕分）
+TF_DATA_LIMITS = {
+    "15m": 300,   # SMA200 + RSI初期化 + 余裕
+    "1h":  300,
+    "4h":  300,
+    "1d":  250,   # 250日分（ちょうどSMA200に対応）
+}
 
 
 def handler(event, context):
-    """テクニカル分析実行"""
+    """テクニカル分析実行（マルチTF対応）"""
     pair = event.get('pair', 'eth_usdt')
+    timeframe = event.get('timeframe', '1h')
     
     try:
-        # 価格履歴取得（直近250件 - 余裕を持って）
-        prices = get_price_history(pair, limit=250)
+        # TFに応じたデータ取得件数
+        data_limit = TF_DATA_LIMITS.get(timeframe, 250)
+        
+        # 価格履歴取得（pair#timeframe キーで取得）
+        prices = get_price_history(pair, timeframe, limit=data_limit)
         
         if len(prices) < 50:
             return {
                 'pair': pair,
+                'timeframe': timeframe,
                 'technical_score': 0.0,
                 'indicators': {},
                 'reason': 'insufficient_data',
@@ -80,7 +97,8 @@ def handler(event, context):
         score = calculate_score(close_prices[-1], rsi, macd, signal, sma_20, sma_200,
                                 bb_upper, bb_lower, regime,
                                 rsi_oversold_bars=rsi_oversold_bars,
-                                rsi_overbought_bars=rsi_overbought_bars)
+                                rsi_overbought_bars=rsi_overbought_bars,
+                                timeframe=timeframe)
         
         # Volume による確認: 出来高増加時にスコアの方向性を強化
         if volume_multiplier > 1.0:
@@ -104,7 +122,8 @@ def handler(event, context):
             'current_price': close_prices[-1],
             'data_count': len(prices),
             'has_ohlc': has_ohlc,
-            'volume_multiplier': round(volume_multiplier, 3)
+            'volume_multiplier': round(volume_multiplier, 3),
+            'timeframe': timeframe,
         }
         
         if sma_200:
@@ -113,6 +132,7 @@ def handler(event, context):
         
         return {
             'pair': pair,
+            'timeframe': timeframe,
             'technical_score': round(score, 3),
             'indicators': indicators,
             'current_price': close_prices[-1]
@@ -122,17 +142,19 @@ def handler(event, context):
         print(f"Error: {str(e)}")
         return {
             'pair': pair,
+            'timeframe': timeframe,
             'technical_score': 0.0,
             'error': str(e),
             'current_price': 0
         }
 
-def get_price_history(pair: str, limit: int = 100) -> list:
-    """価格履歴取得（OHLCV対応）"""
+def get_price_history(pair: str, timeframe: str, limit: int = 100) -> list:
+    """価格履歴取得（pair#timeframe キー、OHLCV対応）"""
     table = dynamodb.Table(PRICES_TABLE)
+    pair_tf_key = make_pair_tf_key(pair, timeframe)
     response = table.query(
         KeyConditionExpression='pair = :pair',
-        ExpressionAttributeValues={':pair': pair},
+        ExpressionAttributeValues={':pair': pair_tf_key},
         ScanIndexForward=False,
         Limit=limit
     )
@@ -267,9 +289,10 @@ def calculate_rsi_duration(prices: list, period: int = 14) -> tuple:
     
     Returns:
         (oversold_bars, overbought_bars):
-        - oversold_bars: RSI < 30 が連続している5分足バー数 (0 = 現在は非売られすぎ)
-        - overbought_bars: RSI > 70 が連続している5分足バー数
-        5分足なので 12bars = 1時間、144bars = 12時間
+        - oversold_bars: RSI < 30 が連続しているバー数 (0 = 現在は非売られすぎ)
+        - overbought_bars: RSI > 70 が連続しているバー数
+        各TFのバー数は TIMEFRAME_CONFIG の rsi_decay_mild/strong_bars で
+        時間換算される（15m: 4bars=1h, 1h: 3bars=3h, 4h: 2bars=8h, 1d: 2bars=2d）
     """
     if len(prices) < period + 2:
         return 0, 0
@@ -319,7 +342,8 @@ def calculate_rsi_duration(prices: list, period: int = 14) -> tuple:
 def calculate_score(current_price: float, rsi: float, macd: float, signal: float,
                    sma_20: float, sma_200: float, bb_upper: float, bb_lower: float,
                    regime: str = 'neutral',
-                   rsi_oversold_bars: int = 0, rsi_overbought_bars: int = 0) -> float:
+                   rsi_oversold_bars: int = 0, rsi_overbought_bars: int = 0,
+                   timeframe: str = '1h') -> float:
     """
     総合スコア計算 (-1 to 1)
     
@@ -328,10 +352,17 @@ def calculate_score(current_price: float, rsi: float, macd: float, signal: float
     - レンジ相場 (ADX<20): RSI/BB重視 (逆張り)
     - 中立: 均等ウェイト
     
-    改善点:
-    - RSI売られすぎ/買われすぎ継続時間による減衰
-    - トレンド相場でのRSI逆張り抑制
+    TF別パラメータ:
+    - RSI継続減衰: TFごとのバー数で「落ちるナイフ」検知
+    - MACD histogram正規化: TFごとの価格変動幅に合わせたスケール
+    - SMA乖離率: TFごとの典型的乖離幅で正規化
     """
+    # TF別パラメータ取得
+    tf_config = TIMEFRAME_CONFIG.get(timeframe, TIMEFRAME_CONFIG.get('1h', {}))
+    rsi_mild = tf_config.get('rsi_decay_mild_bars', 3)
+    rsi_strong = tf_config.get('rsi_decay_strong_bars', 6)
+    macd_scale = tf_config.get('macd_hist_scale', 0.20)
+    sma_scale = tf_config.get('sma_divergence_scale', 3.0)
     # レジーム別ウェイト
     if regime == 'trending':
         # トレンド相場: MACD/SMA重視、RSI/BB軽視
@@ -363,29 +394,29 @@ def calculate_score(current_price: float, rsi: float, macd: float, signal: float
         # 40-60: 中立帯 → ほぼゼロ（微小な傾きのみ）
         rsi_raw = (50 - rsi) / 500 * (w_rsi / 0.25)
     
-    # 改善1: 売られすぎ/買われすぎ継続時間による減衰
-    # 12bars(1h)以上継続 → 50%に減衰、36bars(3h)以上 → 25%に減衰
+    # 改善1: 売られすぎ/買われすぎ継続時間による減衰 (TF別バー数)
+    # rsi_mild以上継続 → 50%に減衰、rsi_strong以上 → 25%に減衰
     # 長期間の売られすぎは「落ちるナイフ」の可能性が高い
     if rsi_oversold_bars > 0 and rsi_raw > 0:
-        if rsi_oversold_bars >= 36:  # 3時間以上
+        if rsi_oversold_bars >= rsi_strong:
             duration_damping = 0.25
-        elif rsi_oversold_bars >= 12:  # 1時間以上
-            # 12bars→0.5, 36bars→0.25 の線形補間
-            duration_damping = 0.5 - (rsi_oversold_bars - 12) / (36 - 12) * 0.25
+        elif rsi_oversold_bars >= rsi_mild:
+            # rsi_mild→ 0.5, rsi_strong→0.25 の線形補間
+            duration_damping = 0.5 - (rsi_oversold_bars - rsi_mild) / (rsi_strong - rsi_mild) * 0.25
         else:
             duration_damping = 1.0
         rsi_raw *= duration_damping
-        print(f"RSI oversold for {rsi_oversold_bars} bars, damping={duration_damping:.2f}")
+        print(f"RSI oversold for {rsi_oversold_bars} bars (TF={timeframe}, mild={rsi_mild}, strong={rsi_strong}), damping={duration_damping:.2f}")
     
     if rsi_overbought_bars > 0 and rsi_raw < 0:
-        if rsi_overbought_bars >= 36:
+        if rsi_overbought_bars >= rsi_strong:
             duration_damping = 0.25
-        elif rsi_overbought_bars >= 12:
-            duration_damping = 0.5 - (rsi_overbought_bars - 12) / (36 - 12) * 0.25
+        elif rsi_overbought_bars >= rsi_mild:
+            duration_damping = 0.5 - (rsi_overbought_bars - rsi_mild) / (rsi_strong - rsi_mild) * 0.25
         else:
             duration_damping = 1.0
         rsi_raw *= duration_damping
-        print(f"RSI overbought for {rsi_overbought_bars} bars, damping={duration_damping:.2f}")
+        print(f"RSI overbought for {rsi_overbought_bars} bars (TF={timeframe}, mild={rsi_mild}, strong={rsi_strong}), damping={duration_damping:.2f}")
     
     # 改善2: トレンド相場でのRSI逆張り抑制
     # トレンド中にMACDが下向き(MACD<signal)なのにRSIが「買い」を出す場合は信用しない
@@ -408,8 +439,8 @@ def calculate_score(current_price: float, rsi: float, macd: float, signal: float
     if current_price > 0:
         # ヒストグラムを価格比で正規化 (ATR%相当のスケール)
         norm_hist = histogram_val / current_price * 100  # % of price
-        # ±0.1% で ±1.0 にスケール (5分足のMACD histogram典型値)
-        hist_score = max(-1.0, min(1.0, norm_hist / 0.1))
+        # TF別スケール: macd_scale% で ±1.0 にスケール
+        hist_score = max(-1.0, min(1.0, norm_hist / macd_scale))
         score += hist_score * w_macd
     else:
         # フォールバック: バイナリ
@@ -421,9 +452,9 @@ def calculate_score(current_price: float, rsi: float, macd: float, signal: float
     # SMA20/200 ゴールデン/デッドクロス（距離グラデーション）
     if sma_200 and sma_200 > 0:
         # SMA20とSMA200の乖離率でグラデーションスコア
-        # 乖離率 ±2% でフルスコア、±0.2%未満はほぼゼロ
+        # TF別スケール: sma_scale% でフルスコア
         divergence_pct = (sma_20 - sma_200) / sma_200 * 100  # %単位
-        sma_factor = max(-1.0, min(1.0, divergence_pct / 2.0))  # ±2%でクランプ
+        sma_factor = max(-1.0, min(1.0, divergence_pct / sma_scale))
         score += w_sma * sma_factor
     else:
         # SMA200がない場合はSMA20との位置関係で判断

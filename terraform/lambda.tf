@@ -105,8 +105,8 @@ locals {
       handler     = "handler.handler"
     }
     warm-up = {
-      description = "初回データ投入（手動実行）"
-      timeout     = 300
+      description = "初回データ投入（手動実行・マルチTF対応）"
+      timeout     = 600
       memory      = 512
       handler     = "handler.handler"
     }
@@ -120,11 +120,12 @@ locals {
     SIGNALS_TABLE        = aws_dynamodb_table.signals.name
     ANALYSIS_STATE_TABLE = aws_dynamodb_table.analysis_state.name
     MARKET_CONTEXT_TABLE = aws_dynamodb_table.market_context.name
+    TF_SCORES_TABLE      = aws_dynamodb_table.tf_scores.name
     COINCHECK_SECRET_ARN = "arn:aws:secretsmanager:${var.aws_region}:${local.account_id}:secret:coincheck/api-credentials"
     MAX_POSITION_JPY     = tostring(var.max_position_jpy)
     CRYPTOPANIC_API_KEY  = var.cryptopanic_api_key
-    ORDER_QUEUE_URL      = "https://sqs.${var.aws_region}.amazonaws.com/${local.account_id}/${local.name_prefix}-order-queue"
     SLACK_WEBHOOK_URL      = var.slack_webhook_url
+    ORDER_EXECUTOR_FUNCTION = "${local.name_prefix}-order-executor"
     TRADING_PAIRS_CONFIG   = trimspace(var.trading_pairs_config)
     MODEL_BUCKET           = "${local.name_prefix}-sagemaker-models-${local.account_id}"
     MODEL_PREFIX           = "chronos-onnx"

@@ -199,26 +199,5 @@ resource "aws_lambda_permission" "alerts_slack" {
   source_arn    = aws_sns_topic.alerts.arn
 }
 
-# -----------------------------------------------------------------------------
-# DLQ CloudWatch Alarm → alerts SNS → Slack
-# -----------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "dlq_messages" {
-  alarm_name          = "${local.name_prefix}-dlq-messages"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "ApproximateNumberOfMessagesVisible"
-  namespace           = "AWS/SQS"
-  period              = 60
-  statistic           = "Sum"
-  threshold           = 0
-  alarm_description   = "DLQにメッセージが入りました - 注文失敗の可能性"
-  alarm_actions       = [aws_sns_topic.alerts.arn]
-
-  dimensions = {
-    QueueName = aws_sqs_queue.order_dlq.name
-  }
-
-  tags = {
-    Name = "${local.name_prefix}-dlq-alarm"
-  }
-}
+# DLQ CloudWatch Alarm は SQS 削除に伴い不要 (Phase 6)
+# order-executor のエラーは Lambda エラーアラームで検知

@@ -38,7 +38,7 @@ resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
 #   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 # }
 
-# Lambda用カスタムポリシー (DynamoDB, S3, Secrets Manager, SQS, SNS)
+# Lambda用カスタムポリシー (DynamoDB, S3, Secrets Manager, SNS, Lambda)
 resource "aws_iam_role_policy" "lambda_custom" {
   name = "${local.name_prefix}-lambda-custom"
   role = aws_iam_role.lambda_execution.id
@@ -67,13 +67,15 @@ resource "aws_iam_role_policy" "lambda_custom" {
           aws_dynamodb_table.signals.arn,
           aws_dynamodb_table.analysis_state.arn,
           aws_dynamodb_table.market_context.arn,
+          aws_dynamodb_table.tf_scores.arn,
           "${aws_dynamodb_table.prices.arn}/index/*",
           "${aws_dynamodb_table.sentiment.arn}/index/*",
           "${aws_dynamodb_table.positions.arn}/index/*",
           "${aws_dynamodb_table.trades.arn}/index/*",
           "${aws_dynamodb_table.signals.arn}/index/*",
           "${aws_dynamodb_table.analysis_state.arn}/index/*",
-          "${aws_dynamodb_table.market_context.arn}/index/*"
+          "${aws_dynamodb_table.market_context.arn}/index/*",
+          "${aws_dynamodb_table.tf_scores.arn}/index/*"
         ]
       },
       # Secrets Managerアクセス
@@ -86,19 +88,6 @@ resource "aws_iam_role_policy" "lambda_custom" {
           "arn:aws:secretsmanager:${var.aws_region}:${local.account_id}:secret:coincheck/*"
         ]
       },
-      # SQSアクセス
-      {
-        Effect = "Allow"
-        Action = [
-          "sqs:SendMessage",
-          "sqs:ReceiveMessage",
-          "sqs:DeleteMessage",
-          "sqs:GetQueueAttributes"
-        ]
-        Resource = [
-          "arn:aws:sqs:${var.aws_region}:${local.account_id}:${local.name_prefix}-*"
-        ]
-      },
       # SNSアクセス
       {
         Effect = "Allow"
@@ -107,6 +96,16 @@ resource "aws_iam_role_policy" "lambda_custom" {
         ]
         Resource = [
           "arn:aws:sns:${var.aws_region}:${local.account_id}:${local.name_prefix}-*"
+        ]
+      },
+      # Lambda間呼び出し (position-monitor → order-executor)
+      {
+        Effect = "Allow"
+        Action = [
+          "lambda:InvokeFunction"
+        ]
+        Resource = [
+          "arn:aws:lambda:${var.aws_region}:${local.account_id}:function:${local.name_prefix}-order-executor"
         ]
       },
       # S3: ONNXモデル読み取り (Chronos AI価格予測) + モデルアーティファクト

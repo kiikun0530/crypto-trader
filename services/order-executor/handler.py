@@ -1,12 +1,12 @@
 """
 注文実行 Lambda
-SQSからシグナルを受信し、Coincheck APIで注文実行
+EventBridge定期起動 → DynamoDBから最新シグナルを読み取り → Coincheck APIで注文実行
 
 マルチ通貨対応:
 - pair（eth_jpy, btc_jpy等）から通貨シンボルを動的に判定
 - 任意の通貨ペアで買い・売りが可能
-- バッチ注文: aggregatorが1メッセージで全通貨のBUY/SELL判定を送信
-  → SELL先に処理（資金確保）→ BUYをスコア順に処理（残高と相談）
+- DynamoDB signalsテーブルから直近の判定を読み取り
+  → SELL先に全対象を処理（資金確保）→ BUYは最もスコアの高い1通貨のみ
 - スコアに応じた投資金額調整（期待値連動）
 
 ⚠️ Coincheck成行注文の重要な仕様:
@@ -16,12 +16,6 @@ SQSからシグナルを受信し、Coincheck APIで注文実行
   → レスポンスを order_id でPython側フィルタ必須
 - 各fundsの値は正負が混在するため abs() で処理する
 - 詳細: docs/bugfix-history.md
-
-⚠️ SQSバッチ処理の注意点:
-- handler()でraiseすると未処理レコード含むバッチ全体が再配信される
-- 注文成功後にDB保存で失敗→raise→再配信→二重注文のリスク
-- エラーはログ+Slack通知のみ、raiseしない設計
-- _just_bought_pairs: 同一バッチ内のBUY→即SELL防止
 
 🛑 サーキットブレーカー:
 - 日次累計損失 or 連敗回数が閾値超過でBUY停止（SELLは許可）
@@ -49,6 +43,7 @@ secrets = boto3.client('secretsmanager')
 _cached_credentials = None
 
 COINCHECK_SECRET_ARN = os.environ.get('COINCHECK_SECRET_ARN', '')
+SIGNALS_TABLE = os.environ.get('SIGNALS_TABLE', 'eth-trading-signals')
 MAX_POSITION_JPY = float(os.environ.get('MAX_POSITION_JPY', '15000'))
 
 # 手数料設定（Coincheck取引所: 対象通貨は全て0%）
@@ -108,10 +103,8 @@ def get_currency_name(pair: str) -> str:
     return currency.upper()
 
 
-# 同一Lambda呼び出し内で買った通貨を追跡（バッチ内即売り防止）
-# SQSバッチにBUY+SELLが同居すると、BUY直後にSELLが実行される問題の対策
-# execute_buy()成功時にペアを追加、process_order()のSELL分岐でチェック
-_just_bought_pairs = set()
+# シグナル有効期間（これより古いシグナルは無視）
+SIGNAL_MAX_AGE_SEC = int(os.environ.get('SIGNAL_MAX_AGE_SEC', '1200'))  # 20分
 
 # トレード統計・サーキットブレーカーのキャッシュ（同一Lambda実行内で再利用）
 # BUY毎にpositionsテーブルのフルスキャンを避けるため
@@ -123,176 +116,209 @@ STATS_CACHE_TTL = 300  # 5分（position-monitorと同じ間隔）
 
 
 def handler(event, context):
-    """注文実行（バッチ注文対応）"""
-    global _just_bought_pairs
+    """
+    注文実行（EventBridge定期起動 + Lambda直接起動の両対応）
+
+    1. EventBridge定期起動: DynamoDB signalsテーブルから最新シグナルを読み取り
+       - SELL: 全対象を先に処理（資金確保）
+       - BUY: 最もスコアの高い1通貨のみ（集中投資）
+    2. Lambda直接起動 (position-monitorからのSL/TP): イベントペイロードの売り注文を即実行
+    """
     global _cached_trade_stats, _cached_trade_stats_time
     global _cached_circuit_breaker, _cached_circuit_breaker_time
-    _just_bought_pairs = set()
     _cached_trade_stats = None
     _cached_trade_stats_time = 0
     _cached_circuit_breaker = None
     _cached_circuit_breaker_time = 0
-    errors = []
 
-    for record in event.get('Records', []):
-        try:
-            body = json.loads(record['body'])
-            if body.get('batch'):
-                # バッチ注文: aggregatorが1メッセージで全通貨の判定を送信
-                process_batch_orders(body)
-            else:
-                # 後方互換: 単一注文メッセージ
-                process_order(body)
-        except Exception as e:
-            print(f"Error processing order: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            errors.append(str(e))
-            # ⚠️ 絶対にraiseしない（SQSバッチ再配信→二重注文防止）
-            send_notification('System', f'❌ 注文処理エラー\n{str(e)}')
+    try:
+        # === モード判定 ===
+        # position-monitorからの直接売り指示（SL/TP発動時）
+        if event.get('direct_sell'):
+            return _handle_direct_sell(event)
 
-    if errors:
-        print(f"Completed with {len(errors)} error(s): {errors}")
+        # === EventBridge定期起動モード ===
+        # 1. DynamoDB signalsテーブルから最新シグナルを読み取り
+        signals = read_latest_signals()
 
-    return {'statusCode': 200, 'body': 'OK'}
+        if not signals:
+            print("No actionable signals found")
+            return {'statusCode': 200, 'body': 'No signals'}
 
+        sell_signals = [s for s in signals if s['signal'] == 'SELL']
+        buy_signals = [s for s in signals if s['signal'] == 'BUY']
 
-def process_batch_orders(batch_data: dict):
-    """
-    バッチ注文処理（全通貨の判定を一括処理）
+        print(f"Actionable signals: SELL={len(sell_signals)} BUY={len(buy_signals)}")
 
-    aggregatorが通貨毎にポジション非依存でBUY/SELL/HOLD判定し、
-    BUY/SELLのみを1つのSQSメッセージとして送信。
+        # 2. SELL処理（全対象・先に実行して資金確保）
+        for sig in sell_signals:
+            pair = sig['pair']
+            score = sig['score']
+            analysis_context = sig.get('analysis_context', {})
+            name = get_currency_name(pair)
 
-    処理順序:
-    1. SELL先（資金確保 + ポジションがなければスキップ）
-    2. BUYをスコア降順（高い期待値の通貨を優先、残高と相談）
-    """
-    orders = batch_data.get('orders', [])
-    timestamp = batch_data.get('timestamp', int(time.time()))
+            current_position = get_active_position(pair)
+            if not current_position or current_position.get('side') != 'long':
+                print(f"No position to sell for {pair}, skipping")
+                continue
 
-    sell_orders = [o for o in orders if o['signal'] == 'SELL']
-    buy_orders = [o for o in orders if o['signal'] == 'BUY']
+            try:
+                execute_sell(pair, current_position, score, analysis_context)
+            except Exception as e:
+                print(f"Error executing SELL for {pair}: {e}")
+                send_notification(name, f"❌ {name}売り注文エラー\n{str(e)}")
 
-    # BUYをスコア降順にソート（高い期待値の通貨を優先）
-    buy_orders.sort(key=lambda x: x.get('score', 0), reverse=True)
+        # 3. BUY処理（最もスコアの高い1通貨のみ）
+        if buy_signals:
+            buy_signals.sort(key=lambda x: x.get('score', 0), reverse=True)
+            best = buy_signals[0]
+            pair = best['pair']
+            score = best['score']
+            analysis_context = best.get('analysis_context', {})
+            name = get_currency_name(pair)
 
-    print(f"Batch orders: SELL={len(sell_orders)} BUY={len(buy_orders)}")
-
-    # --- SELL処理（先に実行して資金確保） ---
-    for order in sell_orders:
-        pair = order['pair']
-        score = order.get('score', 0)
-        analysis_context = order.get('analysis_context', {})
-        name = get_currency_name(pair)
-
-        current_position = get_active_position(pair)
-        if not current_position or current_position.get('side') != 'long':
-            print(f"No position to sell for {pair}, skipping")
-            continue
-
-        # 同一バッチ内で買ったばかりの通貨は売らない
-        if pair in _just_bought_pairs:
-            print(f"Skipping sell for {pair}: just bought in this batch")
-            continue
-
-        try:
-            execute_sell(pair, current_position, score, analysis_context)
-        except Exception as e:
-            print(f"Error executing SELL for {pair}: {e}")
-            send_notification(name, f"❌ {name}売り注文エラー\n{str(e)}")
-
-    # --- BUY処理（スコア順に残高確認して注文） ---
-    for order in buy_orders:
-        pair = order['pair']
-        score = order.get('score', 0)
-        analysis_context = order.get('analysis_context', {})
-        name = get_currency_name(pair)
-
-        # 既にポジションがあればスキップ
-        current_position = get_active_position(pair)
-        if current_position and current_position.get('side') == 'long':
-            print(f"Already have position for {pair}, skipping BUY")
-            continue
-
-        # 同一バッチ内で既に買った通貨はスキップ
-        if pair in _just_bought_pairs:
-            print(f"Skipping buy for {pair}: already bought in this batch")
-            continue
-
-        # サーキットブレーカーチェック（BUYのみブロック）
-        if CIRCUIT_BREAKER_ENABLED:
-            tripped, reason = check_circuit_breaker()
-            if tripped:
-                print(f"Circuit breaker TRIPPED: {reason}")
-                send_notification(
-                    name,
-                    f"🛑 サーキットブレーカー発動\n"
-                    f"通貨: {name}\n"
-                    f"理由: {reason}\n"
-                    f"BUY注文をブロックしました"
+            if len(buy_signals) > 1:
+                skipped = ', '.join(
+                    f"{s['pair']}({s['score']:.4f})" for s in buy_signals[1:]
                 )
-                break  # 以降のBUYも全てスキップ
+                print(f"Best BUY candidate: {pair} (score={score:.4f}), skipped: {skipped}")
+            else:
+                print(f"BUY candidate: {pair} (score={score:.4f})")
 
+            # ポジション重複チェック
+            current_position = get_active_position(pair)
+            if current_position and current_position.get('side') == 'long':
+                print(f"Already have position for {pair}, skipping BUY")
+            else:
+                # サーキットブレーカーチェック（BUYのみブロック）
+                buy_blocked = False
+                if CIRCUIT_BREAKER_ENABLED:
+                    tripped, reason = check_circuit_breaker()
+                    if tripped:
+                        print(f"Circuit breaker TRIPPED: {reason}")
+                        send_notification(
+                            name,
+                            f"🛑 サーキットブレーカー発動\n"
+                            f"通貨: {name}\n"
+                            f"理由: {reason}\n"
+                            f"BUY注文をブロックしました"
+                        )
+                        buy_blocked = True
+
+                if not buy_blocked:
+                    try:
+                        execute_buy(pair, score, analysis_context)
+                    except Exception as e:
+                        print(f"Error executing BUY for {pair}: {e}")
+                        send_notification(name, f"❌ {name}買い注文エラー\n{str(e)}")
+
+        return {'statusCode': 200, 'body': 'OK'}
+
+    except Exception as e:
+        print(f"Error in order-executor: {e}")
+        import traceback
+        traceback.print_exc()
+        send_notification('System', f'❌ 注文処理エラー\n{str(e)}')
+        return {'statusCode': 500, 'body': str(e)}
+
+
+def read_latest_signals() -> list:
+    """
+    DynamoDB signalsテーブルから各通貨の最新シグナルを読み取る。
+
+    aggregator(meta_aggregate)が15分毎に保存したシグナルのうち、
+    SIGNAL_MAX_AGE_SEC（デフォルト20分）以内のものを有効とみなす。
+    BUY/SELLのみ返す（HOLDは除外）。
+    """
+    table = dynamodb.Table(SIGNALS_TABLE)
+    now = int(time.time())
+    min_timestamp = now - SIGNAL_MAX_AGE_SEC
+
+    signals = []
+    for pair, config in TRADING_PAIRS.items():
+        coincheck_pair = config['coincheck']
         try:
-            execute_buy(pair, score, analysis_context)
+            # signalsテーブルのPKはanalysis pair (btc_usdt等)
+            response = table.query(
+                KeyConditionExpression='pair = :pair AND #ts >= :min_ts',
+                ExpressionAttributeNames={'#ts': 'timestamp'},
+                ExpressionAttributeValues={
+                    ':pair': pair,  # analysis pair (btc_usdt等)
+                    ':min_ts': min_timestamp
+                },
+                ScanIndexForward=False,  # 新しい順
+                Limit=1
+            )
+            items = response.get('Items', [])
+            if items:
+                item = items[0]
+                signal = item.get('signal', 'HOLD')
+                score = float(item.get('score', 0))
+                age_min = (now - int(item.get('timestamp', 0))) / 60
+
+                if signal != 'HOLD':
+                    signals.append({
+                        'pair': coincheck_pair,
+                        'analysis_pair': pair,
+                        'signal': signal,
+                        'score': score,
+                        'timestamp': int(item.get('timestamp', 0)),
+                        'analysis_context': {
+                            'components': {
+                                'technical': float(item.get('technical_score', 0)),
+                                'chronos': float(item.get('chronos_score', 0)),
+                                'sentiment': float(item.get('sentiment_score', 0)),
+                                'market_context': float(item.get('market_context_score', 0)),
+                            },
+                            'buy_threshold': float(item.get('buy_threshold', 0)),
+                            'sell_threshold': float(item.get('sell_threshold', 0)),
+                            'bb_width': float(item.get('bb_width', 0)),
+                        }
+                    })
+                    print(f"  {coincheck_pair}: {signal} (score={score:+.4f}, age={age_min:.0f}min)")
+                else:
+                    print(f"  {coincheck_pair}: HOLD (score={score:+.4f})")
+            else:
+                print(f"  {coincheck_pair}: no recent signal (>{SIGNAL_MAX_AGE_SEC//60}min)")
         except Exception as e:
-            print(f"Error executing BUY for {pair}: {e}")
-            send_notification(name, f"❌ {name}買い注文エラー\n{str(e)}")
+            print(f"Error reading signal for {coincheck_pair}: {e}")
+
+    return signals
 
 
-def process_order(order: dict):
-    """注文処理"""
-    pair = order['pair']
-    signal = order['signal']
-    score = order['score']
-    analysis_context = order.get('analysis_context', {})
-    currency = get_currency_from_pair(pair)
+def _handle_direct_sell(event: dict) -> dict:
+    """
+    position-monitorからの直接売り指示を処理（SL/TP即時実行）
+
+    event例:
+    {
+        "direct_sell": true,
+        "pair": "btc_jpy",
+        "score": -1.0,
+        "reason": "stop_loss"
+    }
+    """
+    pair = event['pair']
+    score = event.get('score', -1.0)
+    reason = event.get('reason', 'direct_sell')
     name = get_currency_name(pair)
 
-    # 1. 現在のポジション確認
+    print(f"Direct sell request: {pair} (reason={reason})")
+
     current_position = get_active_position(pair)
+    if not current_position or current_position.get('side') != 'long':
+        print(f"No position to sell for {pair}")
+        return {'statusCode': 200, 'body': 'No position'}
 
-    # 2. 注文判定
-    if signal == 'BUY':
-        if current_position and current_position.get('side') == 'long':
-            print(f"Already have long position for {pair}")
-            return
-
-        # サーキットブレーカーチェック（BUYのみブロック、SELLは常に許可）
-        if CIRCUIT_BREAKER_ENABLED:
-            tripped, reason = check_circuit_breaker()
-            if tripped:
-                print(f"Circuit breaker TRIPPED: {reason}")
-                send_notification(
-                    name,
-                    f"🛑 サーキットブレーカー発動\n"
-                    f"通貨: {name}\n"
-                    f"理由: {reason}\n"
-                    f"BUY注文をブロックしました"
-                )
-                return
-
-        # 買い注文
-        execute_buy(pair, score, analysis_context)
-
-    elif signal == 'SELL':
-        if not current_position or current_position.get('side') != 'long':
-            print(f"No long position to sell for {pair}")
-            return
-
-        # 同一バッチ内で買ったばかりの通貨は売らない（BUY→即SELL防止）
-        if pair in _just_bought_pairs:
-            print(f"Skipping sell for {pair}: just bought in this batch")
-            send_notification(
-                name,
-                f"⚠️ {name}売りスキップ\n"
-                f"理由: 同一実行内でBUY直後のため"
-            )
-            return
-
-        # 売り注文
-        execute_sell(pair, current_position, score, analysis_context)
+    try:
+        execute_sell(pair, current_position, score, {'reason': reason})
+        return {'statusCode': 200, 'body': f'Sold {pair}'}
+    except Exception as e:
+        print(f"Error executing direct sell for {pair}: {e}")
+        import traceback
+        traceback.print_exc()
+        send_notification(name, f"❌ {name}直接売り失敗\n{str(e)}")
+        return {'statusCode': 500, 'body': str(e)}
 
 
 def get_balance() -> dict:
@@ -558,7 +584,7 @@ def execute_buy(pair: str, score: float, analysis_context: dict = None):
     print(f"Order amount: ¥{order_amount:,.0f} (score: {score:.3f}, "
           f"ratio: {order_amount/available_jpy*100:.1f}%)")
 
-    # 2.5. 既に暗号通貨を保有していないかチェック（SQSリトライによる重複購入防止）
+    # 2.5. 既に暗号通貨を保有していないかチェック（重複購入防止）
     currency = get_currency_from_pair(pair)
     crypto_balance = balance.get(currency, 0)
     if crypto_balance > 0:
@@ -626,9 +652,6 @@ def execute_buy(pair: str, score: float, analysis_context: dict = None):
 
         # 取引履歴保存（分析コンテキスト付き）
         save_trade(pair, timestamp, 'BUY', result, analysis_context=analysis_context)
-
-        # 同一バッチ内即売り防止フラグ
-        _just_bought_pairs.add(pair)
 
         # 通知
         ratio_pct = (order_amount / available_jpy) * 100

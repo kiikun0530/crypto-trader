@@ -1,18 +1,17 @@
 """
-Chronos呼び出し Lambda (SageMaker Endpoint版)
+Chronos呼び出し Lambda (SageMaker Endpoint版 + マルチタイムフレーム対応)
 SageMaker Serverless Endpoint 上の Chronos-2 (120M) を呼び出し
 確信度 (confidence) 付きのスコアを返す
+
+マルチTF対応:
+  timeframe パラメータで分析対象のタイムフレームを指定
+  入力データ長・スコアスケールは TIMEFRAME_CONFIG から自動取得
+  DynamoDB キーは pair#timeframe 形式
 
 モデル遷移履歴:
   v1: ONNX Tiny(8M)  — 軽量低精度
   v2: T5-Base(200M)  — 50回サンプリング、高精度低速
   v3: Chronos-2(120M) — 分位数直接出力、250倍高速、10%高精度
-
-改善点 (vs v2 T5-Base):
-- モデル: T5-Base(200M) → Chronos-2(120M) — 軽量化+高精度
-- 推論: 50回サンプリング → 分位数直接出力 — 250倍高速
-- 出力: q10/q50/q90 の分位数予測を追加
-- スコアリング: ±3%スケール + 分位数ベースの確信度
 """
 import json
 import os
@@ -22,6 +21,9 @@ import boto3
 import traceback
 from botocore.exceptions import ClientError
 from botocore.config import Config
+from trading_common import (
+    PRICES_TABLE, TIMEFRAME_CONFIG, make_pair_tf_key, dynamodb
+)
 
 # SageMaker用のリトライ設定を修正（無効なパラメータを削除）
 sagemaker_config = Config(
@@ -37,13 +39,12 @@ dynamodb = boto3.resource('dynamodb')
 sagemaker_runtime = boto3.client('sagemaker-runtime', config=sagemaker_config)
 sagemaker_client = boto3.client('sagemaker', config=sagemaker_config)
 
-PRICES_TABLE = os.environ.get('PRICES_TABLE', 'eth-trading-prices')
 SAGEMAKER_ENDPOINT = os.environ.get('SAGEMAKER_ENDPOINT', 'eth-trading-chronos-base')
 PREDICTION_LENGTH = int(os.environ.get('PREDICTION_LENGTH', '12'))
-INPUT_LENGTH = int(os.environ.get('INPUT_LENGTH', '336'))  # 336 × 5min = 28h (日次サイクル1周+α)
 
-# スコアリング設定
-SCORE_SCALE_PERCENT = 1.5    # ±1.5%変動で±1.0 (旧: ±3%では5分足12本先で常にゼロ付近だった)
+# 5m レガシー設定（TIMEFRAME_CONFIG にないTFのフォールバック）
+DEFAULT_INPUT_LENGTH = int(os.environ.get('INPUT_LENGTH', '336'))
+DEFAULT_SCORE_SCALE_PERCENT = 1.5
 
 # リトライ設定 (SageMaker Serverlessは冷起動に時間がかかるため長めに設定)
 MAX_RETRIES = 5
@@ -52,15 +53,22 @@ MAX_DELAY = 45.0   # 最大待機時間（秒）- 十分な回復時間を確保
 
 
 def handler(event, context):
-    """Chronos SageMaker予測取得"""
+    """Chronos SageMaker予測取得（マルチTF対応）"""
     pair = event.get('pair', 'eth_usdt')
+    timeframe = event.get('timeframe', '1h')
+
+    # TF設定から入力長・スコアスケールを取得
+    tf_config = TIMEFRAME_CONFIG.get(timeframe, {})
+    input_length = tf_config.get('chronos_input_length', DEFAULT_INPUT_LENGTH)
+    score_scale = tf_config.get('score_scale_percent', DEFAULT_SCORE_SCALE_PERCENT)
 
     try:
-        prices = get_price_history(pair, limit=INPUT_LENGTH)
+        prices = get_price_history(pair, timeframe, limit=input_length)
 
         if not prices or len(prices) < 30:
             return {
                 'pair': pair,
+                'timeframe': timeframe,
                 'chronos_score': 0.0,
                 'confidence': 0.0,
                 'prediction': None,
@@ -73,23 +81,25 @@ def handler(event, context):
         endpoint_status = check_endpoint_availability()
         if endpoint_status in ['not_found', 'permission_error']:
             print(f"[INFO] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' unavailable ({endpoint_status}), using fallback")
-            return _fallback_response(pair, prices, endpoint_status)
+            return _fallback_response(pair, timeframe, prices, endpoint_status)
         elif endpoint_status == 'not_ready':
             print(f"[INFO] SageMaker endpoint '{SAGEMAKER_ENDPOINT}' not ready, using fallback")
-            return _fallback_response(pair, prices, 'endpoint_not_ready')
+            return _fallback_response(pair, timeframe, prices, 'endpoint_not_ready')
 
         # SageMaker Endpoint で推論（リトライ機能付き）
         try:
             result = invoke_sagemaker_with_retry(prices, PREDICTION_LENGTH)
             if result and 'median' in result:
-                score = predictions_to_score(result, prices[-1])
+                score = predictions_to_score(result, prices[-1], score_scale)
                 confidence = result.get('confidence', 0.5)
 
-                print(f"SageMaker inference OK: {pair}, score={score:.3f}, "
-                      f"confidence={confidence:.3f}, data_points={len(prices)}")
+                print(f"SageMaker inference OK: {pair}@{timeframe}, score={score:.3f}, "
+                      f"confidence={confidence:.3f}, data_points={len(prices)}, "
+                      f"score_scale={score_scale}%")
 
                 return {
                     'pair': pair,
+                    'timeframe': timeframe,
                     'chronos_score': round(score, 3),
                     'confidence': round(confidence, 3),
                     'prediction': result.get('median'),
@@ -101,17 +111,17 @@ def handler(event, context):
                     'model': result.get('model', 'chronos-2'),
                 }
             else:
-                print(f"SageMaker returned empty, fallback to momentum: {pair}")
-                return _fallback_response(pair, prices, 'empty_response')
+                print(f"SageMaker returned empty, fallback to momentum: {pair}@{timeframe}")
+                return _fallback_response(pair, timeframe, prices, 'empty_response')
 
         except Exception as e:
-            print(f"SageMaker inference failed: {e}, fallback to momentum: {pair}")
-            return _fallback_response(pair, prices, str(e))
+            print(f"SageMaker inference failed: {e}, fallback to momentum: {pair}@{timeframe}")
+            return _fallback_response(pair, timeframe, prices, str(e))
 
     except Exception as e:
         print(f"Error in chronos-caller: {str(e)}")
         traceback.print_exc()
-        return _fallback_response(pair, [], str(e))
+        return _fallback_response(pair, timeframe, [], str(e))
 
 
 def check_endpoint_availability():
@@ -153,17 +163,18 @@ def check_endpoint_availability():
         return 'permission_error'
 
 
-def _fallback_response(pair: str, prices: list, reason: str) -> dict:
+def _fallback_response(pair: str, timeframe: str, prices: list, reason: str) -> dict:
     """フォールバック: モメンタムベーススコア"""
     try:
         if not prices:
-            prices = get_price_history(pair, limit=60)
+            prices = get_price_history(pair, timeframe, limit=60)
         score = calculate_momentum_score(prices) if prices else 0.0
     except Exception:
         score = 0.0
 
     return {
         'pair': pair,
+        'timeframe': timeframe,
         'chronos_score': round(score, 3),
         'confidence': 0.1,  # フォールバック時は低確信度
         'prediction': None,
@@ -174,18 +185,19 @@ def _fallback_response(pair: str, prices: list, reason: str) -> dict:
     }
 
 
-def get_price_history(pair: str, limit: int = 200) -> list:
+def get_price_history(pair: str, timeframe: str, limit: int = 200) -> list:
     """
-    価格履歴取得
+    価格履歴取得（pair#timeframe キー対応）
 
     OHLC データがある場合は Typical Price = (High + Low + Close) / 3 を返す。
     ローソク足の値動きの重心を使うことで、close のみより豊かな情報を Chronos に提供。
     OHLC がない古いレコードは従来通り close にフォールバック。
     """
     table = dynamodb.Table(PRICES_TABLE)
+    pair_tf_key = make_pair_tf_key(pair, timeframe)
     response = table.query(
         KeyConditionExpression='pair = :pair',
-        ExpressionAttributeValues={':pair': pair},
+        ExpressionAttributeValues={':pair': pair_tf_key},
         ScanIndexForward=False,
         Limit=limit
     )
@@ -309,14 +321,15 @@ def invoke_sagemaker(prices: list, prediction_length: int = 12) -> dict:
 # Score Calculation (改善版)
 # ==============================================================
 
-def predictions_to_score(result: dict, current_price: float) -> float:
+def predictions_to_score(result: dict, current_price: float, score_scale_percent: float = 5.0) -> float:
     """
     予測結果をスコアに変換 (-1 to +1)
 
-    改善点 (vs 旧版):
-    1. ±3%スケール (旧: ±1%で常に飽和していた)
-    2. 外れ値カット (上下10パーセンタイル除去)
-    3. 予測の傾き (トレンド加速/減速) も考慮
+    マルチTF対応: score_scale_percent はTFに応じて変動
+    - 15m: ±3% (12ステップ先 = 3h)
+    - 1h:  ±5% (12ステップ先 = 12h)
+    - 4h:  ±10% (12ステップ先 = 48h)
+    - 1d:  ±20% (12ステップ先 = 12d)
     """
     median = result.get('median', [])
     if not median or current_price <= 0:
@@ -345,8 +358,8 @@ def predictions_to_score(result: dict, current_price: float) -> float:
     # 変化率 → スコア
     change_percent = (weighted_avg - current_price) / current_price * 100
 
-    # ±3%で±1.0にスケール (仮想通貨の1h先では妥当なレンジ)
-    score = change_percent / SCORE_SCALE_PERCENT
+    # TF別スケールで±1.0にスケール
+    score = change_percent / score_scale_percent
 
     # トレンド加速ボーナス: 後半の予測が前半より強い方向に動いている場合
     if n_valid >= 6:
@@ -354,7 +367,7 @@ def predictions_to_score(result: dict, current_price: float) -> float:
         second_half_avg = sum(valid_predictions[n_valid // 2:]) / (n_valid - n_valid // 2)
         trend_acceleration = (second_half_avg - first_half_avg) / current_price * 100
         # 加速分をスコアに微加算 (最大±0.15)
-        accel_bonus = max(-0.15, min(0.15, trend_acceleration / SCORE_SCALE_PERCENT * 0.3))
+        accel_bonus = max(-0.15, min(0.15, trend_acceleration / score_scale_percent * 0.3))
         score += accel_bonus
 
     # 確信度による減衰: std が大きい場合はスコアを縮小

@@ -44,19 +44,6 @@ output "analysis_workflow_name" {
 }
 
 # -----------------------------------------------------------------------------
-# SQS Outputs
-# -----------------------------------------------------------------------------
-output "order_queue_url" {
-  description = "Order queue URL"
-  value       = aws_sqs_queue.order_queue.url
-}
-
-output "order_queue_arn" {
-  description = "Order queue ARN"
-  value       = aws_sqs_queue.order_queue.arn
-}
-
-# -----------------------------------------------------------------------------
 # SNS Outputs
 # -----------------------------------------------------------------------------
 output "notifications_topic_arn" {

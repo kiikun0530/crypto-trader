@@ -1,15 +1,17 @@
 """
-アグリゲーター Lambda
-全通貨のテクニカル、Chronos、センチメントスコアを統合
-通貨毎にBUY/SELL/HOLDを判定して記録・送信
+アグリゲーター Lambda (マルチタイムフレーム対応 / デュアルモード)
 
-マルチ通貨ロジック:
-- 全通貨をスコアリングしてランキング
-- 通貨毎にポジション非依存でBUY/SELL/HOLD判定
-- 判定結果をDynamoDB(signals)に記録
-- BUY/SELLがある場合のみSQSにバッチ送信（1メッセージ）
-- ボラティリティ適応型閾値（市場状況に応じて動的調整）
-- order-executorが残高・ポジション確認して実際の注文を実行
+モード1: tf_score (各TFのStep Functions終了時に呼ばれる)
+  - テクニカル + Chronos + センチメントのスコアを統合
+  - 通貨別にper-TFスコアを計算
+  - tf-scores DynamoDBテーブルに保存
+
+モード2: meta_aggregate (15分間隔でEventBridgeから直接呼ばれる)
+  - 全TFのスコアをDynamoDBから読み取り
+  - マルチTFウェイトで加重平均
+  - TF間整合性チェック（方向性の一致度）
+  - 通貨毎にBUY/SELL/HOLD判定
+  - Slack通知 + DynamoDB保存
 """
 import json
 import os
@@ -20,16 +22,16 @@ from decimal import Decimal, ROUND_HALF_UP
 import urllib.request
 from trading_common import (
     TRADING_PAIRS, POSITIONS_TABLE, SLACK_WEBHOOK_URL,
+    TIMEFRAME_CONFIG, ACTIVE_TIMEFRAMES, TIMEFRAME_WEIGHTS,
+    TF_SCORES_TABLE, make_pair_tf_key,
     get_current_price, get_active_position, send_slack_notification, dynamodb
 )
 
-sqs = boto3.client('sqs')
 bedrock = boto3.client('bedrock-runtime')
 BEDROCK_MODEL_ID = os.environ.get('BEDROCK_MODEL_ID', 'apac.amazon.nova-micro-v1:0')
 
 SIGNALS_TABLE = os.environ.get('SIGNALS_TABLE', 'eth-trading-signals')
 MARKET_CONTEXT_TABLE = os.environ.get('MARKET_CONTEXT_TABLE', 'eth-trading-market-context')
-ORDER_QUEUE_URL = os.environ.get('ORDER_QUEUE_URL', '')
 
 # 重み設定 (4コンポーネント: Tech + Chronos + Sentiment + MarketContext)
 # Phase 2: Tech dominant (0.55) → Phase 3: 4成分分散 → Phase 4: AI重視均等化
@@ -56,65 +58,234 @@ VOL_CLAMP_MAX = 2.0
 # 最低保有時間（秒）: 表示用（実際の制御はorder-executorで実施）
 MIN_HOLD_SECONDS = int(os.environ.get('MIN_HOLD_SECONDS', '1800'))  # デフォルト30分
 
+# マルチTF整合性チェック
+TF_ALIGNMENT_BONUS = 1.15    # 75%以上同方向 → 15%増幅
+TF_MISALIGN_PENALTY = 0.85   # 50%以下同方向 → 15%減衰
+
+# TFスコア鮮度チェック（基準の2倍以上古いデータは使わない）
+TF_STALENESS = {
+    "15m": 20 * 60,      # 20分以上で陳腐
+    "1h":  75 * 60,      # 75分以上
+    "4h":  5 * 3600,     # 5時間以上
+    "1d":  26 * 3600,    # 26時間以上
+}
+
 
 def handler(event, context):
-    """全通貨の統合スコア計算 + 最適通貨選定"""
+    """デュアルモードルーター"""
+    mode = event.get('mode', 'tf_score')
 
-    # Step Functionsから Map → analysis_results 形式で受け取る
-    pairs_results = event.get('analysis_results', [])
+    if mode == 'meta_aggregate':
+        return handle_meta_aggregate(event, context)
+    else:
+        return handle_tf_score(event, context)
 
-    # 後方互換: 単一ペアの旧形式
-    if not pairs_results and 'pair' in event:
-        pairs_results = [event]
+
+# =============================================================================
+# Mode 1: TF Score (各TFのStep Functions終了時)
+# =============================================================================
+
+def handle_tf_score(event, context):
+    """
+    各TF分析ワークフローの最終ステップ。
+    Step Functions Map の出力 (tech_sent_results + chronos_results) をマージし、
+    per-TFスコアを計算して tf-scores テーブルに保存する。
+    """
+    timeframe = event.get('timeframe', '1h')
+    pairs = event.get('pairs', list(TRADING_PAIRS.keys()))
+    tech_sent_results = event.get('tech_sent_results', [])
+    chronos_results = event.get('chronos_results', [])
+
+    # 後方互換: 旧形式 (analysis_results)
+    if not tech_sent_results and 'analysis_results' in event:
+        pairs_results = event['analysis_results']
+        return _handle_legacy_tf_score(pairs_results, timeframe)
+
+    print(f"[tf_score] Scoring {len(pairs)} pairs for timeframe={timeframe}")
 
     try:
-        # 0. マーケットコンテキスト取得（全通貨共通のマクロ情報）
-        market_context = fetch_market_context()
+        # tech_sent_results と chronos_results をペアインデックスでマージ
+        merged_results = []
+        for i, pair in enumerate(pairs):
+            result = {'pair': pair}
+            if i < len(tech_sent_results):
+                tsr = tech_sent_results[i]
+                result['technical'] = tsr.get('technical', {})
+                result['sentiment'] = tsr.get('sentiment', {})
+            if i < len(chronos_results):
+                result['chronos'] = chronos_results[i]
+            merged_results.append(result)
 
-        # 1. 全通貨のスコア計算
+        # 各通貨のper-TFスコアを計算（MarketContextはmeta_aggregateで適用）
         scored_pairs = []
-        for result in pairs_results:
+        for result in merged_results:
             pair = result.get('pair', 'unknown')
-            scored = score_pair(pair, result, market_context)
+            scored = score_pair(pair, result, market_context=None)
+            scored['timeframe'] = timeframe
             scored_pairs.append(scored)
 
-        # 2. 通貨別ボラティリティ適応型閾値を計算（F&G連動補正付き）
+        # per-TF BUY/SELL/HOLD判定（TF別BBベースラインでボラ補正、F&Gなし）
+        tf_bb_baseline = TIMEFRAME_CONFIG.get(timeframe, {}).get('bb_baseline', BASELINE_BB_WIDTH)
+        for scored in scored_pairs:
+            bb_width = scored.get('bb_width', tf_bb_baseline)
+            vol_ratio = max(VOL_CLAMP_MIN, min(VOL_CLAMP_MAX, bb_width / tf_bb_baseline))
+            buy_t = BASE_BUY_THRESHOLD * vol_ratio
+            sell_t = BASE_SELL_THRESHOLD * vol_ratio
+            if scored['total_score'] >= buy_t:
+                scored['signal'] = 'BUY'
+            elif scored['total_score'] <= sell_t:
+                scored['signal'] = 'SELL'
+            else:
+                scored['signal'] = 'HOLD'
+            scored['buy_threshold'] = round(buy_t, 4)
+            scored['sell_threshold'] = round(sell_t, 4)
+
+        # tf-scores DynamoDBテーブルに保存
+        timestamp = int(time.time())
+        for scored in scored_pairs:
+            _save_tf_score(scored, timeframe, timestamp)
+
+        print(f"[tf_score] Saved {len(scored_pairs)} TF scores for {timeframe}")
+
+        return {
+            'statusCode': 200,
+            'mode': 'tf_score',
+            'timeframe': timeframe,
+            'scores': [
+                {'pair': s['pair'], 'total_score': round(s['total_score'], 4)}
+                for s in scored_pairs
+            ]
+        }
+
+    except Exception as e:
+        print(f"[tf_score] Error: {str(e)}")
+        traceback.print_exc()
+        return {'statusCode': 500, 'mode': 'tf_score', 'error': str(e)}
+
+
+def _handle_legacy_tf_score(pairs_results, timeframe):
+    """後方互換: 旧形式の analysis_results をスコアリング"""
+    scored_pairs = []
+    for result in pairs_results:
+        pair = result.get('pair', 'unknown')
+        scored = score_pair(pair, result, market_context=None)
+        scored['timeframe'] = timeframe
+        scored_pairs.append(scored)
+
+    timestamp = int(time.time())
+    for scored in scored_pairs:
+        _save_tf_score(scored, timeframe, timestamp)
+
+    return {
+        'statusCode': 200,
+        'mode': 'tf_score',
+        'timeframe': timeframe,
+        'scores': [
+            {'pair': s['pair'], 'total_score': round(s['total_score'], 4)}
+            for s in scored_pairs
+        ]
+    }
+
+
+def _save_tf_score(scored: dict, timeframe: str, timestamp: int):
+    """per-TFスコアをDynamoDBに保存"""
+    try:
+        table = dynamodb.Table(TF_SCORES_TABLE)
+        pair = scored['pair']
+        pair_tf_key = make_pair_tf_key(pair, timeframe)
+
+        item = {
+            'pair_tf': pair_tf_key,
+            'timestamp': timestamp,
+            'pair': pair,
+            'timeframe': timeframe,
+            'total_score': safe_decimal(scored['total_score']),
+            'components': to_dynamo_map(scored.get('components', {})),
+            'weights': to_dynamo_map(scored.get('weights', {})),
+            'chronos_confidence': safe_decimal(scored.get('chronos_confidence', 0.5)),
+            'bb_width': safe_decimal(scored.get('bb_width', BASELINE_BB_WIDTH), 6),
+            'ttl': timestamp + 86400,  # 24時間で期限切れ
+        }
+
+        indicators = scored.get('indicators_detail', {})
+        if indicators:
+            item['indicators'] = to_dynamo_map(indicators)
+
+        chronos_detail = scored.get('chronos_detail', {})
+        if chronos_detail:
+            item['chronos_detail'] = to_dynamo_map(chronos_detail)
+
+        # per-TF BUY/SELL/HOLDシグナル
+        item['signal'] = scored.get('signal', 'HOLD')
+        item['buy_threshold'] = safe_decimal(scored.get('buy_threshold', BASE_BUY_THRESHOLD))
+        item['sell_threshold'] = safe_decimal(scored.get('sell_threshold', BASE_SELL_THRESHOLD))
+
+        table.put_item(Item=item)
+    except Exception as e:
+        print(f"Error saving TF score for {scored.get('pair', '?')}@{timeframe}: {e}")
+
+
+# =============================================================================
+# Mode 2: Meta Aggregate (15分間隔でEventBridgeから直接呼ばれる)
+# =============================================================================
+
+def handle_meta_aggregate(event, context):
+    """
+    全TFのスコアを統合し、最終BUY/SELL/HOLD判定を行う。
+    1. DynamoDBから全TFスコアを読み取り
+    2. マーケットコンテキスト取得
+    3. マルチTFウェイトで加重平均 + TF間整合性チェック
+    4. 通貨別閾値計算 + BUY/SELL/HOLD判定
+    5. AI総合コメント生成 + Slack通知 + DynamoDB保存
+    """
+    pairs = list(TRADING_PAIRS.keys())
+
+    try:
+        # 1. 全TFスコアを読み取り
+        all_tf_scores = _read_all_tf_scores(pairs)
+
+        if not all_tf_scores or all(not v for v in all_tf_scores.values()):
+            print("[meta_aggregate] No TF scores found in DynamoDB")
+            return {'signal': 'HOLD', 'has_signal': False, 'reason': 'no_tf_scores'}
+
+        # 2. マーケットコンテキスト取得
+        market_context = fetch_market_context()
+
+        # 3. マルチTF加重平均 + 整合性チェック
+        scored_pairs = []
+        for pair in pairs:
+            pair_scores = all_tf_scores.get(pair, {})
+            multi_tf_result = _calculate_multi_tf_score(pair, pair_scores, market_context)
+            scored_pairs.append(multi_tf_result)
+
+        # 4. 通貨別閾値計算
         thresholds_map = calculate_per_currency_thresholds(scored_pairs, market_context)
 
-        # 3. AI総合コメント生成 + シグナル保存（通貨別閾値を使用）
+        # 5. AI総合コメント + シグナル保存
         for scored in scored_pairs:
-            pair_th = thresholds_map.get(scored['pair'], {'buy': BASE_BUY_THRESHOLD, 'sell': BASE_SELL_THRESHOLD})
+            pair_th = thresholds_map.get(scored['pair'],
+                                         {'buy': BASE_BUY_THRESHOLD, 'sell': BASE_SELL_THRESHOLD})
             ai_comment = generate_ai_comment(scored, pair_th)
             scored['ai_comment'] = ai_comment
             save_signal(scored, pair_th['buy'], pair_th['sell'])
 
-        # 4. スコア順にソート（期待値の高い順）
+        # 6. スコア順ソート
         scored_pairs.sort(key=lambda x: x['total_score'], reverse=True)
 
-        # 5. 通貨毎のBUY/SELL/HOLD判定（通貨別閾値・ポジション非依存）
-        per_currency_decisions = decide_per_currency_signals(
-            scored_pairs, thresholds_map
-        )
+        # 7. BUY/SELL/HOLD判定
+        per_currency_decisions = decide_per_currency_signals(scored_pairs, thresholds_map)
 
-        # 6. 非HOLDの判定を抽出
+        # 8. ポジション取得
         actionable_decisions = [d for d in per_currency_decisions if d['signal'] != 'HOLD']
         has_signal = len(actionable_decisions) > 0
-
-        # 7. キューにバッチ送信（BUY/SELLがある場合のみ）
-        if has_signal and ORDER_QUEUE_URL:
-            send_batch_order_message(
-                actionable_decisions, int(time.time())
-            )
-
-        # 8. ポジション取得（表示用）
         active_positions = find_all_active_positions()
 
-        # 通貨別判定の集計
         buy_decisions = [d for d in per_currency_decisions if d['signal'] == 'BUY']
         sell_decisions = [d for d in per_currency_decisions if d['signal'] == 'SELL']
         hold_decisions = [d for d in per_currency_decisions if d['signal'] == 'HOLD']
 
         result = {
+            'mode': 'meta_aggregate',
             'decisions': [
                 {
                     'pair': d['analysis_pair'],
@@ -139,25 +310,236 @@ def handler(event, context):
                 for s in scored_pairs
             ],
             'active_positions': [p.get('pair') for p in active_positions],
-            'thresholds': {pair: {'buy': th['buy'], 'sell': th['sell']} for pair, th in thresholds_map.items()},
+            'thresholds': {pair: {'buy': th['buy'], 'sell': th['sell']}
+                           for pair, th in thresholds_map.items()},
             'timestamp': int(time.time())
         }
 
-        # 9. Slack通知（ランキング付き + 通貨別判定 + 含み損益表示）
+        # 10. Slack通知
         notify_slack(result, scored_pairs, active_positions,
                      thresholds_map, per_currency_decisions)
 
         return result
 
     except Exception as e:
-        print(f"Error in handler: {str(e)}")
-        import traceback
+        print(f"[meta_aggregate] Error: {str(e)}")
         traceback.print_exc()
-        return {
-            'signal': 'HOLD',
-            'has_signal': False,
-            'error': str(e)
+        return {'signal': 'HOLD', 'has_signal': False, 'error': str(e)}
+
+
+def _read_all_tf_scores(pairs: list) -> dict:
+    """
+    全通貨 × 全TFの最新スコアをDynamoDBから読み取り
+
+    Returns: {"btc_usdt": {"15m": {...}, "1h": {...}, ...}, ...}
+    """
+    table = dynamodb.Table(TF_SCORES_TABLE)
+    current_time = int(time.time())
+    result = {}
+
+    for pair in pairs:
+        result[pair] = {}
+        for tf in ACTIVE_TIMEFRAMES:
+            pair_tf_key = make_pair_tf_key(pair, tf)
+            try:
+                response = table.query(
+                    KeyConditionExpression='pair_tf = :ptf',
+                    ExpressionAttributeValues={':ptf': pair_tf_key},
+                    ScanIndexForward=False,
+                    Limit=1
+                )
+                items = response.get('Items', [])
+                if items:
+                    item = items[0]
+                    ts = int(item.get('timestamp', 0))
+                    staleness = TF_STALENESS.get(tf, 3600)
+
+                    if current_time - ts > staleness:
+                        print(f"  {pair}@{tf}: stale ({current_time - ts}s > {staleness}s)")
+                        continue
+
+                    result[pair][tf] = {
+                        'total_score': float(item.get('total_score', 0)),
+                        'components': _dynamo_to_float(item.get('components', {})),
+                        'weights': _dynamo_to_float(item.get('weights', {})),
+                        'chronos_confidence': float(item.get('chronos_confidence', 0.5)),
+                        'bb_width': float(item.get('bb_width', BASELINE_BB_WIDTH)),
+                        'timestamp': ts,
+                        'indicators': _dynamo_to_float(item.get('indicators', {})),
+                        'chronos_detail': _dynamo_to_float(item.get('chronos_detail', {})),
+                        'signal': item.get('signal', 'HOLD'),
+                    }
+                    age = current_time - ts
+                    print(f"  {pair}@{tf}: score={result[pair][tf]['total_score']:+.4f} (age={age}s)")
+                else:
+                    print(f"  {pair}@{tf}: no data")
+            except Exception as e:
+                print(f"  {pair}@{tf}: read error: {e}")
+
+    return result
+
+
+def _dynamo_to_float(data):
+    """DynamoDB Decimal → Python float 再帰変換"""
+    if isinstance(data, dict):
+        return {k: _dynamo_to_float(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [_dynamo_to_float(i) for i in data]
+    elif isinstance(data, Decimal):
+        return float(data)
+    return data
+
+
+def _calculate_multi_tf_score(pair: str, pair_tf_scores: dict,
+                               market_context: dict) -> dict:
+    """
+    マルチTF加重平均 + 整合性チェック + マーケットコンテキスト
+
+    TFスコアは各TFのStep Functionsで計算済み（Tech + Chronos + Sentiment）。
+    ここではTF間の加重平均 + 方向性一致チェック + MarketContextを加味して
+    最終スコアを算出する。
+    """
+    available_tfs = {tf: data for tf, data in pair_tf_scores.items()
+                     if tf in TIMEFRAME_WEIGHTS}
+
+    if not available_tfs:
+        return _neutral_scored_result(pair)
+
+    # ウェイト再正規化（不足TFがある場合）
+    total_weight = sum(TIMEFRAME_WEIGHTS[tf] for tf in available_tfs)
+    norm_w = {tf: TIMEFRAME_WEIGHTS[tf] / total_weight for tf in available_tfs}
+
+    # TF加重平均スコア
+    weighted_score = sum(
+        data['total_score'] * norm_w[tf] for tf, data in available_tfs.items()
+    )
+
+    # TF間方向性整合性チェック
+    directions = [1 if data['total_score'] > 0.02 else
+                  (-1 if data['total_score'] < -0.02 else 0)
+                  for data in available_tfs.values()]
+    positive = sum(1 for d in directions if d > 0)
+    negative = sum(1 for d in directions if d < 0)
+    majority = max(positive, negative)
+    agreement = majority / len(directions) if directions else 0.5
+
+    if agreement >= 0.75:
+        weighted_score *= TF_ALIGNMENT_BONUS
+        alignment = 'aligned'
+    elif agreement <= 0.5:
+        weighted_score *= TF_MISALIGN_PENALTY
+        alignment = 'conflicting'
+    else:
+        alignment = 'mixed'
+
+    # マーケットコンテキスト
+    market_context_normalized = 0.0
+    market_context_detail = {}
+    alt_dominance_adjustment = 0.0
+    if market_context:
+        market_context_normalized = float(market_context.get('market_score', 0))
+        market_context_detail = {
+            'fng_value': market_context.get('fng_value', 50),
+            'fng_classification': market_context.get('fng_classification', 'N/A'),
+            'fng_score': float(market_context.get('fng_score', 0)),
+            'funding_score': float(market_context.get('funding_score', 0)),
+            'dominance_score': float(market_context.get('dominance_score', 0)),
+            'btc_dominance': float(market_context.get('btc_dominance', 50)),
+            'avg_funding_rate': float(market_context.get('avg_funding_rate', 0)),
         }
+        if pair != 'btc_usdt':
+            btc_dom = float(market_context.get('btc_dominance', 50))
+            if btc_dom > 60:
+                alt_dominance_adjustment = -0.05
+            elif btc_dom < 40:
+                alt_dominance_adjustment = 0.05
+
+    # 最終スコア = TF加重平均 × (1-MKT_W) + MarketContext × MKT_W + alt調整
+    final_score = (weighted_score * (1 - MARKET_CONTEXT_WEIGHT) +
+                   market_context_normalized * MARKET_CONTEXT_WEIGHT +
+                   alt_dominance_adjustment)
+    final_score = max(-1.0, min(1.0, final_score))
+
+    # BB幅の加重平均
+    avg_bb = sum(data.get('bb_width', BASELINE_BB_WIDTH) * norm_w[tf]
+                 for tf, data in available_tfs.items())
+
+    # コンポーネントスコアの加重平均
+    avg_components = {}
+    for key in ['technical', 'chronos', 'sentiment']:
+        avg_components[key] = round(sum(
+            data.get('components', {}).get(key, 0) * norm_w[tf]
+            for tf, data in available_tfs.items()
+        ), 3)
+    avg_components['market_context'] = round(market_context_normalized, 3)
+
+    # Chronos確信度の加重平均
+    avg_conf = sum(data.get('chronos_confidence', 0.5) * norm_w[tf]
+                   for tf, data in available_tfs.items())
+
+    # 代表TFのindicators（1h優先）
+    rep_tf = '1h' if '1h' in available_tfs else list(available_tfs.keys())[0]
+    indicators_detail = available_tfs[rep_tf].get('indicators', {})
+    chronos_detail = available_tfs[rep_tf].get('chronos_detail', {})
+    current_price_usd = indicators_detail.get('current_price', 0)
+
+    print(f"  {pair}: multi-TF score={final_score:+.4f} "
+          f"(alignment={alignment}, tfs={list(available_tfs.keys())})")
+
+    return {
+        'pair': pair,
+        'total_score': final_score,
+        'components': avg_components,
+        'weights': {
+            'technical': TECHNICAL_WEIGHT,
+            'chronos': CHRONOS_WEIGHT,
+            'sentiment': SENTIMENT_WEIGHT,
+            'market_context': MARKET_CONTEXT_WEIGHT,
+        },
+        'chronos_confidence': round(avg_conf, 3),
+        'market_context_detail': market_context_detail,
+        'bb_width': avg_bb,
+        'current_price_usd': current_price_usd,
+        'indicators_detail': indicators_detail,
+        'chronos_detail': chronos_detail,
+        'news_headlines': [],
+        'tf_breakdown': {
+            tf: {
+                'score': round(data['total_score'], 4),
+                'weight': round(norm_w[tf], 3),
+                'components': data.get('components', {}),
+                'signal': data.get('signal', 'HOLD'),
+            }
+            for tf, data in available_tfs.items()
+        },
+        'alignment': alignment,
+        'available_timeframes': list(available_tfs.keys()),
+    }
+
+
+def _neutral_scored_result(pair: str) -> dict:
+    """データなし時の中立スコア結果"""
+    return {
+        'pair': pair,
+        'total_score': 0.0,
+        'components': {'technical': 0, 'chronos': 0, 'sentiment': 0, 'market_context': 0},
+        'weights': {
+            'technical': TECHNICAL_WEIGHT,
+            'chronos': CHRONOS_WEIGHT,
+            'sentiment': SENTIMENT_WEIGHT,
+            'market_context': MARKET_CONTEXT_WEIGHT,
+        },
+        'chronos_confidence': 0.5,
+        'market_context_detail': {},
+        'bb_width': BASELINE_BB_WIDTH,
+        'current_price_usd': 0,
+        'indicators_detail': {},
+        'chronos_detail': {},
+        'news_headlines': [],
+        'tf_breakdown': {},
+        'alignment': 'unknown',
+        'available_timeframes': [],
+    }
 
 
 def score_pair(pair: str, result: dict, market_context: dict = None) -> dict:
@@ -211,7 +593,7 @@ def score_pair(pair: str, result: dict, market_context: dict = None) -> dict:
         }
 
     # BTC Dominanceによるアルトコイン追加補正
-    # BTC自体はDominance上昇で有利、アルト（ETH, XRP, SOL, DOGE, AVAX）は不利
+    # BTC自体はDominance上昇で有利、アルト（ETH, XRP）は不利
     alt_dominance_adjustment = 0.0
     if market_context and pair != 'btc_usdt':
         btc_dom = float(market_context.get('btc_dominance', 50))
@@ -375,13 +757,17 @@ def fetch_market_context() -> dict:
         return {}
 
 
-# Fear & Greed 連動 BUY閾値補正
-# Extreme Fear (F&G < 20) ではBUY閾値を引き上げ、安易な逆張りを抑制
-# Extreme Greed (F&G > 80) でもBUY閾値を引き上げ、天井掴みを防止
+# Fear & Greed 連動 BUY閾値補正（加算方式）
+# 旧方式（乗算）: buy_t = BASE × vol_ratio × fng_multiplier
+#   → ボラ補正との二重効果で高ボラ通貨の閾値が0.6超になり事実上買えなくなる問題
+# 新方式（加算）: buy_t = BASE × vol_ratio + fng_adder
+#   → ボラ補正とF&G補正が独立し、本当に強いシグナルなら拾える
 FNG_FEAR_THRESHOLD = 20    # これ以下で BUY 閾値引き上げ
 FNG_GREED_THRESHOLD = 80   # これ以上で BUY 閾値引き上げ
-FNG_BUY_MULTIPLIER_FEAR = 1.35   # Extreme Fear: BUY閾値を1.35倍（例: 0.28→0.378）
-FNG_BUY_MULTIPLIER_GREED = 1.20  # Extreme Greed: BUY閾値を1.20倍
+FNG_BUY_ADDER_FEAR = 0.06    # Extreme Fear: BUY閾値に+0.06加算（例: 0.25→0.31）
+FNG_BUY_ADDER_GREED = 0.04   # Extreme Greed: BUY閾値に+0.04加算
+# BUY閾値の絶対上限（どんなに高ボラ+Extreme環境でもこれ以上にはならない）
+BUY_THRESHOLD_CAP = float(os.environ.get('BUY_THRESHOLD_CAP', '0.45'))
 
 
 def calculate_per_currency_thresholds(scored_pairs: list, market_context: dict = None) -> dict:
@@ -389,29 +775,33 @@ def calculate_per_currency_thresholds(scored_pairs: list, market_context: dict =
     通貨別ボラティリティ適応型閾値を計算（Fear & Greed 連動補正付き）
 
     各通貨のBB幅（ボラティリティ）に基づいて個別の閾値を計算する。
-    高ボラ通貨（DOGE, SOLなど）は閾値を厳しく（ノイズに反応しない）、
+    高ボラ通貨は閾値を厳しく（ノイズに反応しない）、
     低ボラ通貨（BTCなど）は閾値を緩く（小さな確実なシグナルを拾う）設定。
+    BB baselineはTF別加重平均を使用（異なるTFのBB幅を統一基準で比較）。
 
-    F&G連動補正は全通貨共通で適用（BUYのみ）:
-    - Extreme Fear (< 20): BUY閾値を1.35倍に引き上げ
-    - Extreme Greed (> 80): BUY閾値を1.20倍に引き上げ
+    F&G連動補正は全通貨共通で適用（BUYのみ、加算方式）:
+    - Extreme Fear (< 20): BUY閾値に+0.06加算（恐怖時の安易な逆張り抑制）
+    - Extreme Greed (> 80): BUY閾値に+0.04加算（天井掴み防止）
     - SELL閾値は変更しない（損切りは市場環境に関わらず実行すべき）
+
+    旧方式（乗算）ではボラ補正×F&G補正の二重効果で高ボラ通貨の閾値が
+    0.6超に達し事実上買えなくなっていた。加算方式+上限キャップで解消。
 
     Returns: dict[pair] = {'buy': float, 'sell': float, 'vol_ratio': float}
     """
     if not scored_pairs:
         return {}
 
-    # --- Fear & Greed 連動 BUY閾値補正（全通貨共通） ---
-    fng_multiplier = 1.0
+    # --- Fear & Greed 連動 BUY閾値補正（加算方式・全通貨共通） ---
+    fng_adder = 0.0
     fng_reason = ''
     if market_context:
         fng_value = int(market_context.get('fng_value', 50))
         if fng_value <= FNG_FEAR_THRESHOLD:
-            fng_multiplier = FNG_BUY_MULTIPLIER_FEAR
+            fng_adder = FNG_BUY_ADDER_FEAR
             fng_reason = f'ExtremeFear(F&G={fng_value}<=20)'
         elif fng_value >= FNG_GREED_THRESHOLD:
-            fng_multiplier = FNG_BUY_MULTIPLIER_GREED
+            fng_adder = FNG_BUY_ADDER_GREED
             fng_reason = f'ExtremeGreed(F&G={fng_value}>=80)'
 
     thresholds = {}
@@ -419,10 +809,29 @@ def calculate_per_currency_thresholds(scored_pairs: list, market_context: dict =
         pair = scored['pair']
         bb_width = scored.get('bb_width', BASELINE_BB_WIDTH)
 
-        vol_ratio = bb_width / BASELINE_BB_WIDTH
+        # メタ集約レベルのBB baseline: 各TFのbb_baselineの加重平均
+        # （異なるTFのBB幅を統一基準で比較するため）
+        available_tfs = scored.get('available_timeframes', [])
+        if available_tfs:
+            tf_breakdown = scored.get('tf_breakdown', {})
+            total_w = sum(tf_breakdown.get(tf, {}).get('weight', 0) for tf in available_tfs)
+            if total_w > 0:
+                meta_baseline = sum(
+                    TIMEFRAME_CONFIG.get(tf, {}).get('bb_baseline', BASELINE_BB_WIDTH)
+                    * tf_breakdown.get(tf, {}).get('weight', 0)
+                    for tf in available_tfs
+                ) / total_w
+            else:
+                meta_baseline = BASELINE_BB_WIDTH
+        else:
+            meta_baseline = BASELINE_BB_WIDTH
+
+        vol_ratio = bb_width / meta_baseline
         vol_ratio = max(VOL_CLAMP_MIN, min(VOL_CLAMP_MAX, vol_ratio))
 
-        buy_t = BASE_BUY_THRESHOLD * vol_ratio * fng_multiplier
+        # ボラ補正（乗算） + F&G補正（加算） + 上限キャップ
+        buy_t = BASE_BUY_THRESHOLD * vol_ratio + fng_adder
+        buy_t = min(buy_t, BUY_THRESHOLD_CAP)  # 絶対上限
         sell_t = BASE_SELL_THRESHOLD * vol_ratio
 
         thresholds[pair] = {
@@ -432,11 +841,12 @@ def calculate_per_currency_thresholds(scored_pairs: list, market_context: dict =
         }
 
         name = TRADING_PAIRS.get(pair, {}).get('name', pair)
+        capped = ' [CAPPED]' if buy_t >= BUY_THRESHOLD_CAP - 0.001 else ''
         print(f"  {name}({pair}) threshold: BUY={buy_t:+.4f} SELL={sell_t:+.4f} "
-              f"(bb_width={bb_width:.4f}, vol_ratio={vol_ratio:.2f})")
+              f"(bb_width={bb_width:.4f}, vol_ratio={vol_ratio:.2f}){capped}")
 
     if fng_reason:
-        print(f"  F&G correction: multiplier={fng_multiplier:.2f} [{fng_reason}]")
+        print(f"  F&G correction: adder={fng_adder:+.3f} [{fng_reason}]")
 
     return thresholds
 
@@ -646,6 +1056,10 @@ def generate_ai_comment(scored: dict, thresholds: dict) -> str:
         news = scored.get('news_headlines', [])
         mkt = scored.get('market_context_detail', {})
 
+        # マルチTFブレークダウン
+        tf_breakdown = scored.get('tf_breakdown', {})
+        alignment = scored.get('alignment', 'unknown')
+
         # レジーム別ウェイト
         regime = ind.get('regime', 'neutral')
         if regime == 'trending':
@@ -676,20 +1090,32 @@ def generate_ai_comment(scored: dict, thresholds: dict) -> str:
 テクニカル: {comp.get('technical', 0):+.3f} (RSI={ind.get('rsi', 'N/A')}, ADX={ind.get('adx', 'N/A')})
 AI予測: {comp.get('chronos', 0):+.3f} (変化率={chr_d.get('predicted_change_pct', 'N/A')}%, 確信度={chr_d.get('confidence', 'N/A')})
 センチメント: {comp.get('sentiment', 0):+.3f}
-市場環境: {comp.get('market_context', 0):+.3f} (F&G={mkt.get('fng_value', 'N/A')}, BTC Dom={mkt.get('btc_dominance', 'N/A')}%)"""
+市場環境: {comp.get('market_context', 0):+.3f} (F&G={mkt.get('fng_value', 'N/A')}, BTC Dom={mkt.get('btc_dominance', 'N/A')}%)
+TF整合性: {alignment}"""
+
+        # マルチTFブレークダウン
+        if tf_breakdown:
+            tf_lines = []
+            for tf in ['15m', '1h', '4h', '1d']:
+                if tf in tf_breakdown:
+                    tf_data = tf_breakdown[tf]
+                    w = tf_data.get('weight', 0)
+                    tf_lines.append(f"  {tf}: score={tf_data['score']:+.4f} (weight={w:.0%})")
+            if tf_lines:
+                materials += "\nTFブレークダウン:\n" + '\n'.join(tf_lines)"""
 
         if news:
             headlines = '\n'.join(f"  - {n.get('title', '')} (score: {n.get('score', 0.5)})" for n in news[:3])
             materials += f"\n主要ニュース:\n{headlines}"
 
-        prompt = f"""あなたは仮想通貨のアナリストです。以下の分析データから、個人投資家向けに2-3文の簡潔な日本語コメントを生成してください。
+        prompt = f"""あなたは仮想通貨のアナリストです。以下のマルチタイムフレーム分析データから、個人投資家向けに2-3文の簡潔な日本語コメントを生成してください。
 
 {materials}
 
 ルール:
 - 敬体（です・ます調）で書く
 - なぜそのシグナル（BUY/SELL/HOLD）になったかを閾値と主要因を引用して説明する
-- レジーム（トレンド/レンジ）による重み配分がスコアにどう影響したかに触れる
+- 複数タイムフレームの方向性一致度（整合性）に言及する
 - データに基づいた客観的な分析を述べる
 - 150文字以内に収める"""
 
@@ -772,42 +1198,6 @@ def save_signal(scored: dict, buy_threshold: float, sell_threshold: float):
         print(f"Error saving signal for {scored.get('pair', 'unknown')}: {e}")
 
 
-def send_batch_order_message(decisions: list, timestamp: int):
-    """SQSにバッチ注文メッセージ送信（全通貨の判定を1メッセージで・通貨別閾値付き）"""
-    try:
-        orders = []
-        for d in decisions:
-            order = {
-                'pair': d['pair'],
-                'signal': d['signal'],
-                'score': d['score'],
-                'analysis_context': {
-                    'components': d.get('components', {}),
-                    'bb_width': d.get('bb_width', 0),
-                    'buy_threshold': round(d.get('buy_threshold', BASE_BUY_THRESHOLD), 4),
-                    'sell_threshold': round(d.get('sell_threshold', BASE_SELL_THRESHOLD), 4),
-                    'weights': d.get('weights', {}),
-                    'chronos_confidence': d.get('chronos_confidence', 0.5),
-                }
-            }
-            orders.append(order)
-
-        message = {
-            'batch': True,
-            'timestamp': timestamp,
-            'orders': orders
-        }
-
-        sqs.send_message(
-            QueueUrl=ORDER_QUEUE_URL,
-            MessageBody=json.dumps(message)
-        )
-        signals = [f"{d['signal']} {d['pair']}" for d in decisions]
-        print(f"Batch order message sent to SQS: {', '.join(signals)}")
-    except Exception as e:
-        print(f"Error sending batch order message: {e}")
-
-
 def notify_slack(result: dict, scored_pairs: list, active_positions: list,
                  thresholds_map: dict = None,
                  per_currency_decisions: list = None):
@@ -837,9 +1227,9 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
                 parts.append(f"SELL {sell_count}件")
             if hold_count > 0:
                 parts.append(f"HOLD {hold_count}件")
-            header_text = f"📊 マルチ通貨分析: {' / '.join(parts)}"
+            header_text = f"📊 マルチTF通貨分析: {' / '.join(parts)}"
         else:
-            header_text = "⚪ マルチ通貨分析: ALL HOLD"
+            header_text = "⚪ マルチTF通貨分析: ALL HOLD"
 
         # スコアバー
         def score_bar(score):
@@ -847,7 +1237,7 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
             pos = max(0, min(10, pos))
             return '▓' * pos + '░' * (10 - pos)
 
-        # ランキング表示（通貨別判定付き）
+        # ランキング表示（通貨別判定付き + マルチTFブレークダウン）
         ranking_text = ""
         for i, s in enumerate(scored_pairs):
             name = TRADING_PAIRS.get(s['pair'], {}).get('name', s['pair'])
@@ -861,14 +1251,31 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
             # 通貨別閾値
             pair_th = thresholds_map.get(s['pair'], {'buy': BASE_BUY_THRESHOLD, 'sell': BASE_SELL_THRESHOLD})
 
+            # マルチTFブレークダウン
+            tf_breakdown = s.get('tf_breakdown', {})
+            alignment = s.get('alignment', 'unknown')
+            align_emoji = {'aligned': '✅', 'conflicting': '⚠️', 'mixed': '➖'}.get(alignment, '❓')
+
             ranking_text += (
                 f"{medal} *{name}*: `{s['total_score']:+.4f}` {score_bar(s['total_score'])} → {signal_emoji}\n"
-                f"    Tech: `{s['components']['technical']:+.3f}`({weights.get('technical', TECHNICAL_WEIGHT):.2f}) | "
-                f"AI: `{s['components']['chronos']:+.3f}`({weights.get('chronos', CHRONOS_WEIGHT):.2f}) | "
+                f"    Tech: `{s['components']['technical']:+.3f}` | "
+                f"AI: `{s['components']['chronos']:+.3f}` | "
                 f"Sent: `{s['components']['sentiment']:+.3f}` | "
                 f"Mkt: `{s['components'].get('market_context', 0):+.3f}`\n"
-                f"    閾値: BUY≥`{pair_th['buy']:+.3f}` / SELL≤`{pair_th['sell']:+.3f}`\n"
             )
+
+            # TFブレークダウン表示（per-TF シグナル込み）
+            if tf_breakdown:
+                tf_parts = []
+                for tf in ['15m', '1h', '4h', '1d']:
+                    if tf in tf_breakdown:
+                        tf_data = tf_breakdown[tf]
+                        tf_sig = tf_data.get('signal', 'HOLD')
+                        sig_icon = {'BUY': '🟢', 'SELL': '🔴', 'HOLD': '⚪'}.get(tf_sig, '⚪')
+                        tf_parts.append(f"{tf}:`{tf_data['score']:+.3f}`{sig_icon}")
+                ranking_text += f"    TF: {' | '.join(tf_parts)} {align_emoji}{alignment}\n"
+
+            ranking_text += f"    閾値: BUY≥`{pair_th['buy']:+.3f}` / SELL≤`{pair_th['sell']:+.3f}`\n"
 
         # ポジション情報（複数対応 + 含み損益表示）
         position_text = ""
@@ -971,8 +1378,9 @@ def notify_slack(result: dict, scored_pairs: list, active_positions: list,
             {
                 "type": "context",
                 "elements": [
-                    {"type": "mrkdwn", "text": f"基準閾値: BUY≥`{BASE_BUY_THRESHOLD:+.3f}` / SELL≤`{BASE_SELL_THRESHOLD:+.3f}` (通貨別ボラ補正あり) | "
-                                                f"基準重み: Tech={TECHNICAL_WEIGHT} AI={CHRONOS_WEIGHT}(確信度で±0.08変動) Sent={SENTIMENT_WEIGHT} Mkt={MARKET_CONTEXT_WEIGHT}"
+                    {"type": "mrkdwn", "text": f"マルチTF: 15m={TIMEFRAME_WEIGHTS.get('15m', 0):.0%} 1h={TIMEFRAME_WEIGHTS.get('1h', 0):.0%} "
+                                                f"4h={TIMEFRAME_WEIGHTS.get('4h', 0):.0%} 1d={TIMEFRAME_WEIGHTS.get('1d', 0):.0%} | "
+                                                f"基準閾値: BUY≥`{BASE_BUY_THRESHOLD:+.3f}` / SELL≤`{BASE_SELL_THRESHOLD:+.3f}` (ボラ補正あり)"
                                                 + (f" | ⚠️ F&G補正あり" if any(th['buy'] > BASE_BUY_THRESHOLD * 1.3 for th in thresholds_map.values()) else "")}
                 ]
             }

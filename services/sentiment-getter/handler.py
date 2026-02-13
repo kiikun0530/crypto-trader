@@ -1,6 +1,8 @@
 """
 センチメント取得 Lambda
 DynamoDBから最新のセンチメントスコアを取得
+センチメントはTF非依存（ニュース感情は全TF共通）
+timeframe パラメータは下流に pass-through する
 """
 import json
 import os
@@ -13,6 +15,7 @@ SENTIMENT_TABLE = os.environ.get('SENTIMENT_TABLE', 'eth-trading-sentiment')
 def handler(event, context):
     """センチメント取得"""
     pair = event.get('pair', 'eth_usdt')
+    timeframe = event.get('timeframe', '1h')  # pass-through用
     
     try:
         # 最新のセンチメントスコア取得
@@ -20,6 +23,7 @@ def handler(event, context):
         
         return {
             'pair': pair,
+            'timeframe': timeframe,
             'sentiment_score': score,
             'last_updated': timestamp,
             'source': 'cryptopanic',
@@ -30,6 +34,7 @@ def handler(event, context):
         print(f"Error: {str(e)}")
         return {
             'pair': pair,
+            'timeframe': timeframe,
             'sentiment_score': 0.5,
             'top_headlines': [],
             'error': str(e)

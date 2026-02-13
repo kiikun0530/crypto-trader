@@ -1,5 +1,12 @@
 # =============================================================================
-# Step Functions: Analysis Orchestration Workflow
+# Step Functions: Multi-Timeframe Analysis Workflow
+# =============================================================================
+# パラメータ化されたワークフロー: EventBridgeから timeframe を受け取り、
+# 価格収集 → テクニカル+センチメント(並列) → Chronos(直列) → TFスコア保存
+# の4フェーズで分析を実行する。
+#
+# 同一のState Machineを全TF (15m, 1h, 4h, 1d) で共用。
+# EventBridgeが各TFスケジュールごとに timeframe パラメータを変えて起動する。
 # =============================================================================
 
 resource "aws_sfn_state_machine" "analysis_workflow" {
@@ -7,25 +14,56 @@ resource "aws_sfn_state_machine" "analysis_workflow" {
   role_arn = aws_iam_role.step_functions_execution.arn
 
   definition = jsonencode({
-    Comment = "Multi-Currency Trading Analysis Workflow"
-    StartAt = "AnalyzeAllPairs"
+    Comment = "Multi-Timeframe Trading Analysis Workflow"
+    StartAt = "CollectPrices"
     States = {
-      # Map: 全通貨ペアを並列分析 (クォータ10に対して6ペア並列)
-      AnalyzeAllPairs = {
+
+      # Phase 1: 価格収集（全通貨・指定TF）
+      CollectPrices = {
+        Type     = "Task"
+        Resource = "arn:aws:states:::lambda:invoke"
+        Parameters = {
+          FunctionName = aws_lambda_function.functions["price-collector"].arn
+          Payload = {
+            "timeframe.$" = "$.timeframe"
+            "pairs.$"     = "$.pairs"
+          }
+        }
+        ResultPath = "$.price_result"
+        Retry = [
+          {
+            ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"]
+            IntervalSeconds = 2
+            MaxAttempts     = 3
+            BackoffRate     = 2
+          }
+        ]
+        Catch = [
+          {
+            ErrorEquals = ["States.ALL"]
+            ResultPath  = "$.priceError"
+            Next        = "AnalysisFailed"
+          }
+        ]
+        Next = "AnalyzeTechSentiment"
+      }
+
+      # Phase 2: テクニカル + センチメント並列分析 (MaxConcurrency=3)
+      AnalyzeTechSentiment = {
         Type           = "Map"
-        MaxConcurrency = 6
+        MaxConcurrency = 3
         ItemsPath      = "$.pairs"
         ItemSelector = {
           "pair.$"      = "$$.Map.Item.Value"
-          "timestamp.$" = "$.timestamp"
+          "timeframe.$" = "$.timeframe"
         }
         ItemProcessor = {
           ProcessorConfig = {
             Mode = "INLINE"
           }
-          StartAt = "ParallelAnalysis"
+          StartAt = "TechSentParallel"
           States = {
-            ParallelAnalysis = {
+            TechSentParallel = {
               Type = "Parallel"
               Branches = [
                 {
@@ -36,29 +74,6 @@ resource "aws_sfn_state_machine" "analysis_workflow" {
                       Resource = "arn:aws:states:::lambda:invoke"
                       Parameters = {
                         FunctionName = aws_lambda_function.functions["technical"].arn
-                        "Payload.$"  = "$"
-                      }
-                      OutputPath = "$.Payload"
-                      Retry = [
-                        {
-                          ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"]
-                          IntervalSeconds = 2
-                          MaxAttempts     = 3
-                          BackoffRate     = 2
-                        }
-                      ]
-                      End = true
-                    }
-                  }
-                },
-                {
-                  StartAt = "ChronosPrediction"
-                  States = {
-                    ChronosPrediction = {
-                      Type     = "Task"
-                      Resource = "arn:aws:states:::lambda:invoke"
-                      Parameters = {
-                        FunctionName = aws_lambda_function.functions["chronos-caller"].arn
                         "Payload.$"  = "$"
                       }
                       OutputPath = "$.Payload"
@@ -99,47 +114,98 @@ resource "aws_sfn_state_machine" "analysis_workflow" {
                 }
               ]
               ResultPath = "$.analysisResults"
-              Next       = "MergePairResults"
+              Next       = "MergeTechSent"
               Catch = [
                 {
-                  ErrorEquals  = ["States.ALL"]
-                  ResultPath   = "$.analysisError"
-                  Next         = "MergePairResults"
+                  ErrorEquals = ["States.ALL"]
+                  ResultPath  = "$.analysisError"
+                  Next        = "MergeTechSent"
                 }
               ]
             }
 
-            MergePairResults = {
+            MergeTechSent = {
               Type = "Pass"
               Parameters = {
                 "pair.$"      = "$.pair"
-                "timestamp.$" = "$.timestamp"
+                "timeframe.$" = "$.timeframe"
                 "technical.$"  = "$.analysisResults[0]"
-                "chronos.$"    = "$.analysisResults[1]"
-                "sentiment.$"  = "$.analysisResults[2]"
+                "sentiment.$"  = "$.analysisResults[1]"
               }
               End = true
             }
           }
         }
-        ResultPath = "$.analysis_results"
-        Next       = "Aggregator"
+        ResultPath = "$.tech_sent_results"
+        Next       = "ChronosSequential"
         Catch = [
           {
             ErrorEquals = ["States.ALL"]
-            ResultPath  = "$.mapError"
+            ResultPath  = "$.techSentError"
             Next        = "AnalysisFailed"
           }
         ]
       }
 
-      # 全通貨のスコア比較 + 最適通貨選定
-      Aggregator = {
+      # Phase 3: Chronos AI予測 (MaxConcurrency=1 — SageMaker同時実行制限対策)
+      ChronosSequential = {
+        Type           = "Map"
+        MaxConcurrency = 1
+        ItemsPath      = "$.pairs"
+        ItemSelector = {
+          "pair.$"      = "$$.Map.Item.Value"
+          "timeframe.$" = "$.timeframe"
+        }
+        ItemProcessor = {
+          ProcessorConfig = {
+            Mode = "INLINE"
+          }
+          StartAt = "ChronosCaller"
+          States = {
+            ChronosCaller = {
+              Type     = "Task"
+              Resource = "arn:aws:states:::lambda:invoke"
+              Parameters = {
+                FunctionName = aws_lambda_function.functions["chronos-caller"].arn
+                "Payload.$"  = "$"
+              }
+              OutputPath = "$.Payload"
+              Retry = [
+                {
+                  ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"]
+                  IntervalSeconds = 3
+                  MaxAttempts     = 3
+                  BackoffRate     = 2
+                }
+              ]
+              End = true
+            }
+          }
+        }
+        ResultPath = "$.chronos_results"
+        Next       = "SaveTFScores"
+        Catch = [
+          {
+            ErrorEquals = ["States.ALL"]
+            ResultPath  = "$.chronosError"
+            Next        = "AnalysisFailed"
+          }
+        ]
+      }
+
+      # Phase 4: TFスコア保存 (aggregator tf_score mode)
+      SaveTFScores = {
         Type     = "Task"
         Resource = "arn:aws:states:::lambda:invoke"
         Parameters = {
           FunctionName = aws_lambda_function.functions["aggregator"].arn
-          "Payload.$"  = "$"
+          Payload = {
+            "mode"               = "tf_score"
+            "timeframe.$"        = "$.timeframe"
+            "pairs.$"            = "$.pairs"
+            "tech_sent_results.$" = "$.tech_sent_results"
+            "chronos_results.$"   = "$.chronos_results"
+          }
         }
         OutputPath = "$.Payload"
         Retry = [
@@ -162,7 +228,7 @@ resource "aws_sfn_state_machine" "analysis_workflow" {
 
       AnalysisComplete = {
         Type   = "Pass"
-        Result = { message = "Multi-currency analysis complete" }
+        Result = { message = "Multi-TF analysis complete" }
         End    = true
       }
 

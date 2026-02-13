@@ -49,7 +49,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | chronos-caller | AI時系列予測 (ONNX Runtime, Chronos-T5-Tiny) | Step Functions (×6) |
 | sentiment-getter | 通貨別センチメントスコア取得 | Step Functions (×6) |
 | aggregator | 全通貨スコアリング・ランキング・売買判定 | Step Functions |
-| order-executor | Coincheckで成行注文実行（同一通貨重複防止） | SQSトリガー |
+| order-executor | Coincheckで成行注文実行（BUYは最高スコア1通貨、SELLは全対象） | EventBridge 15分 |
 | position-monitor | 全通貨のSL(-5%)/TP(+10%)/トレーリングストップ監視 | 5分 |
 | news-collector | 全通貨ニュース一括取得・BTC相関分析 | 30分 |
 | error-remediator | Lambdaエラー検知→Slack通知→自動修復 | CloudWatch Logs |
