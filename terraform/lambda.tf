@@ -158,7 +158,7 @@ resource "aws_lambda_function" "functions" {
   filename         = data.archive_file.lambda[each.key].output_path
   source_code_hash = data.archive_file.lambda[each.key].output_base64sha256
 
-  # VPC外で実行 (コスト削減: NAT Gateway $45/月を節約)
+  # VPC外で実行 (コスト削減: NAT Gateway不要)
   # DynamoDB/S3/Secrets Managerはパブリックエンドポイント経由でアクセス (IAM認証あり)
 
   environment {

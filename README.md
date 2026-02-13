@@ -66,30 +66,11 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | trades | - | 取引履歴 |
 | analysis_state | - | 分析状態管理 |
 
-## 推定コスト
+## コスト
 
-### AWSインフラ費用（6通貨分析時）
+AWS Serverless 構成のため、運用コストは非常に低く抑えられています。
 
-| 項目 | 月額 |
-|------|------|
-| Lambda | ~$5.00 |
-| DynamoDB | ~$0.30 |
-| Step Functions | ~$0.10 |
-| CloudWatch | ~$0.50 |
-| Secrets Manager | ~$0.50 |
-| **合計** | **~$7** |
-
-> 詳細な計算式は [docs/architecture.md](docs/architecture.md) を参照
-
-### 外部API費用
-
-| API | 費用 | 備考 |
-|-----|------|------|
-| Binance | 無料 | 価格データ取得のみ（認証不要） |
-| CryptoPanic | 無料 or $199/月 | Growth Planでリアルタイムニュース取得 |
-| Coincheck | 0% | 取引所取引は手数料無料 |
-
-> **総コスト目安**: 無料構成 ~$7/月、Growth Plan ~$206/月
+> 詳細なコスト情報は非公開リポジトリで管理しています
 
 ## 前提条件
 

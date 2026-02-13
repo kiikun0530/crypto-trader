@@ -23,6 +23,7 @@
 14. [02/12 ニュース日時のJST変換保存](#14-0212-ニュース日時のjst変換保存)
 15. [02/12 Signal API DynamoDB 1MB制限によるデータ欠損](#15-0212-signal-api-dynamodb-1mb制限によるデータ欠損)
 16. [02/12 Terraform archive_file キャッシュによるLambdaデプロイ漏れ](#16-0212-terraform-archive_file-キャッシュによるlambdaデプロイ漏れ)
+17. [センチメント分析の過剰反応修正](#17-センチメント分析の過剰反応修正)
 
 ---
 
@@ -850,3 +851,71 @@ aws lambda update-function-code --function-name eth-trading-sentiment-getter \
 - `terraform apply` の "changed" 表示は **Lambda コードが実際に更新されたことを保証しない**
 - 重要な Lambda デプロイ後は `aws lambda get-function --query "Configuration.LastModified"` で更新日時を必ず確認する
 - 恒久対策: `terraform apply` 前に `.terraform/tmp/` 配下の既存ZIPを削除する、または `source_code_hash` を明示的に再計算させる
+
+---
+
+## 17. センチメント分析の過剰反応修正
+
+### 問題
+
+news-collector のセンチメント分析が特定の条件下で過剰にスコアを振らせていた。
+クリックベイト記事やFUD/FOMO期間中に不正確な極端スコアが発生。
+
+### 根本原因（6項目）
+
+| # | 問題 | 影響 |
+|---|------|------|
+| 1 | **ルールベースNLPのキーワード重みが過大** | `surge`, `crash` 等が ±0.20 で、クリックベイト見出し1本で最大 ±0.40 振れる |
+| 2 | **仮定/推測表現の未検出** | "could crash", "analyst warns" も確定事実と同じ重みで処理 |
+| 3 | **`pump` が bullish 扱い** | "pump and dump" はベアリッシュだが moderate_bullish に含まれていた |
+| 4 | **`liquidat` 接頭辞マッチが不動作** | リスト `in` 演算子では完全一致のため、`liquidation` にマッチしなかった（バグ） |
+| 5 | **BTC相関 0.5 + 市場ニュース 0.3 が過大** | 非BTC通貨で間接ニュースが直接ニュースをボリュームで支配 |
+| 6 | **`liked` をセンチメント指標として扱い** | 弱気ニュースにも "役に立った" 意味で liked される |
+| 7 | **集約スコアにダンピングなし** | 恐怖/貪欲期に全記事同方向 → 極端スコア |
+| 8 | **LLMプロンプトに節度の指示なし** | 0.0〜1.0フルレンジを制限なく使用、噂と確定を同格に評価 |
+
+### 修正内容
+
+#### (A) ルールベースNLP の全面改修
+- **クリックベイト/仮定表現検出**: `could`, `might`, `warns`, `?` 等を検出 → 重みを 60% に減衰
+- **キーワード重み緩和**: strong 0.20→0.14、moderate 0.12→0.05〜0.09（個別チューニング）
+- **辞書をリスト→dict化**: 各単語に個別の重みを設定可能に
+- **`pump` のコンテキスト判定**: "pump and dump" フレーズ検出時は pump 単語をスキップ
+- **`explode`/`moon` をクリックベイト枠**: 専用の低い重み（0.04〜0.06）で処理
+- **接頭辞マッチング追加**: `liquidat` → `liquidation`, `liquidated` 等に正しくマッチ
+- **1記事あたりの上限**: ±0.40 → ±0.30 に引き下げ
+
+#### (B) LLM プロンプトの moderating
+- 大半のニュースは 0.30〜0.70 のMODERATEなスコアを使うよう明示指示
+- 噂/推測/アナリスト意見 → 0.40〜0.60 の中立寄りを指示
+- 確定事実のみ極端スコア（0.15/0.85）を許可
+
+#### (C) 相関ウェイト調整
+- `BTC_CORRELATION_WEIGHT`: 0.50 → 0.35
+- `MARKET_NEWS_WEIGHT`: 0.30 → 0.20
+- 直接ニュースの相対的影響力を向上
+
+#### (D) 投票スコアの liked/disliked 修正
+- `liked` / `disliked` の重みを × 0.3 に低減
+- エンゲージメント ≠ センチメントの原則を反映
+
+#### (E) 集約スコアのダンピング
+- `SCORE_DAMPENING_FACTOR = 0.85` を導入
+- `final_score = 0.5 + (raw_score - 0.5) * 0.85`
+- 例: raw=0.20 → dampened=0.245、raw=0.80 → dampened=0.755
+
+### スコア変化の例
+
+| ケース | 修正前 | 修正後 |
+|--------|--------|--------|
+| "Bitcoin could crash to 50K warns analyst" | 0.10 (strong bearish) | 0.36 (mild bearish, speculative) |
+| "BTC price surges past 100K" | 0.90 (strong bullish) | 0.72 (moderate bullish) |
+| "Crypto market update: Bitcoin steady" | 0.50 (neutral) | 0.50 (neutral, no change) |
+| "Pump and dump scheme exposed" | 0.62 (bullish?!) | 0.32 (bearish, correct) |
+
+### 教訓
+
+- クリックベイト見出しは暗号通貨ニュースで特に多く、タイトルの語調と実際の市場インパクトは乖離する
+- "liked" 等のエンゲージメント指標はセンチメントではなく情報の有用性を表す
+- 間接ニュース（BTC相関・市場全体）はボリュームで直接ニュースを支配しやすいため重み調整が必要
+- LLMに対しても「節度あるスコアリング」を明示的に指示しないと人間と同様に誇張する

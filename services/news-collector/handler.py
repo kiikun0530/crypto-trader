@@ -39,10 +39,16 @@ MIN_RELIABLE_VOTES = 5
 VOTE_CONFIDENCE_CAP = 20
 
 # BTC相関の重み（BTC以外の通貨に適用）
-BTC_CORRELATION_WEIGHT = 0.5
+# 0.5→0.35: 間接ニュースが直接ニュースを支配しないよう緩和
+BTC_CORRELATION_WEIGHT = 0.35
 
 # 全体市場ニュースの重み
-MARKET_NEWS_WEIGHT = 0.3
+# 0.3→0.20: 汎用ニュースの影響を低減
+MARKET_NEWS_WEIGHT = 0.20
+
+# 集約スコアの極端値ダンピング係数
+# 0.5から離れるほどダンピングが効く（1.0=ダンピングなし）
+SCORE_DAMPENING_FACTOR = 0.85
 
 
 def handler(event, context):
@@ -256,22 +262,30 @@ def analyze_titles_with_llm(articles: list) -> dict:
             f'{i+1}. {a["title"]}' for i, a in enumerate(titles_for_llm)
         )
 
-        prompt = f"""Analyze the sentiment of these crypto news article titles.
+        prompt = f"""Analyze the sentiment of these crypto news article titles for their ACTUAL market impact.
 For each title, provide a sentiment score from 0.0 (very bearish) to 1.0 (very bullish), with 0.5 being neutral.
 
-Consider:
-- Regulatory actions, bans, lawsuits → bearish
-- ETF approvals, institutional adoption, partnerships → bullish
-- Hacks, exploits, fraud → bearish
-- Price milestones, ATH, breakouts → bullish
-- "Buy the dip", whale accumulation → bullish despite negative words
-- Market uncertainty, FUD → mildly bearish
-- Neutral news (updates, releases without clear impact) → 0.5
+IMPORTANT scoring guidelines:
+- Use MODERATE scores (0.30-0.70) for most news. Reserve extreme scores for truly exceptional events.
+- Confirmed events deserve stronger scores than rumors, predictions, or analyst opinions.
+- Clickbait headlines ("could crash", "might explode", "warns of") → score closer to 0.50, do NOT overreact.
+- Headlines with "?" are often speculative → lean toward 0.50.
+- Minor price movements (1-5%) are normal volatility → score near 0.50.
+
+Event calibration:
+- Confirmed ETF approval, major hack, exchange collapse → 0.15 or 0.85 (rarely more extreme)
+- Regulatory actions, partnerships, institutional adoption → 0.25-0.35 or 0.65-0.75
+- Hacks, exploits, fraud → 0.20-0.30
+- Price milestones, ATH → 0.65-0.75
+- "Buy the dip", whale accumulation → 0.55-0.65 (mildly bullish)
+- Market uncertainty, FUD → 0.40-0.45 (mildly bearish)
+- Neutral news (updates, releases, routine) → 0.48-0.52
+- Analyst predictions, rumors, speculation → 0.40-0.60 (near neutral)
 
 Titles:
 {titles_text}
 
-Respond with ONLY a JSON array of numbers in the same order. Example: [0.72, 0.35, 0.50]"""
+Respond with ONLY a JSON array of numbers in the same order. Example: [0.58, 0.38, 0.50]"""
 
         # Converse API（モデル非依存の統一API）
         response = bedrock.converse(
@@ -354,8 +368,10 @@ def analyze_sentiment_weighted(news: list, llm_scores: dict = None) -> tuple:
             votes = article.get('votes', {})
             positive = votes.get('positive', 0) + votes.get('important', 0) * 1.5
             negative = votes.get('negative', 0) + votes.get('toxic', 0) * 1.5
-            liked = votes.get('liked', 0)
-            disliked = votes.get('disliked', 0)
+            # liked/disliked はエンゲージメント指標であり、センチメントとは限らないため
+            # 重みを 0.3 に抑制（弱気ニュースにも「いいね」される場合がある）
+            liked = votes.get('liked', 0) * 0.3
+            disliked = votes.get('disliked', 0) * 0.3
             total_votes = positive + negative + liked + disliked
 
             if total_votes >= MIN_RELIABLE_VOTES:
@@ -395,12 +411,20 @@ def analyze_sentiment_weighted(news: list, llm_scores: dict = None) -> tuple:
     if total_weight == 0:
         return 0.5, fresh_count, {}
 
-    final_score = total_weighted_score / total_weight
+    raw_score = total_weighted_score / total_weight
+
+    # === 極端スコアのダンピング ===
+    # 0.5から離れるほど抑制が効く。恐怖/貪欲期に全記事が同方向になる過剰反応を防止
+    # 例: raw=0.2 → 0.5 + (0.2-0.5)*0.85 = 0.245 (やや中立寄りに)
+    # 例: raw=0.8 → 0.5 + (0.8-0.5)*0.85 = 0.755
+    final_score = 0.5 + (raw_score - 0.5) * SCORE_DAMPENING_FACTOR
 
     stats = {
         'total_articles': len(news),
         'vote_reliable': vote_reliable_count,
-        'vote_unreliable': vote_unreliable_count
+        'vote_unreliable': vote_unreliable_count,
+        'raw_score': round(raw_score, 4),
+        'dampened_score': round(final_score, 4),
     }
 
     return final_score, fresh_count, stats
@@ -437,13 +461,15 @@ def get_article_age_hours(published_at: str) -> float:
 def estimate_sentiment_from_title(title: str) -> float:
     """
     タイトルから高度なルールベース NLP でセンチメントを推定
-    
-    改善点 (Phase 2 #17):
+
+    改善点 (Phase 3):
     - 3段階の強度 (strong/moderate/mild) で重み分け
     - 否定語の検出 (not, no, fails, without → 極性反転)
     - バイグラム/フレーズマッチング
-    - 暗号通貨ドメイン特化の語彙
-    - 複数キーワードの相乗効果
+    - クリックベイト/仮定表現の検出 → 重み減衰
+    - pump and dump 等のコンテキスト判定
+    - 接頭辞マッチング対応 (liquidat → liquidation, liquidated)
+    - 1記事あたりのスコア上限を ±0.30 に制限（過剰反応防止）
     """
     if not title:
         return 0.5
@@ -452,78 +478,114 @@ def estimate_sentiment_from_title(title: str) -> float:
         title_lower = title.lower()
         words = title_lower.split()
 
+        # ===== クリックベイト/仮定/推測表現の検出 → 重み割引 =====
+        speculative_phrases = [
+            'could ', 'might ', 'may ', 'warns ', 'warns of', 'predicts ',
+            'analyst says', 'analysts say', 'expert says', 'experts say',
+            'according to', 'rumor', 'rumour', 'speculation', 'speculate',
+            'if ', 'what if', 'will it', 'can it', 'should you',
+            'opinion:', 'editorial:', '?',  # 疑問形の見出し
+        ]
+        is_speculative = any(sp in title_lower for sp in speculative_phrases)
+        # 仮定表現なら重みを60%に減衰
+        speculation_dampener = 0.6 if is_speculative else 1.0
+
         # ===== フレーズマッチング (バイグラム/トリグラム優先) =====
         bullish_phrases = {
-            # strong (+0.25)
-            'all-time high': 0.25, 'all time high': 0.25, 'new ath': 0.25,
-            'etf approved': 0.25, 'etf approval': 0.25, 'mass adoption': 0.25,
-            'short squeeze': 0.25, 'whale accumulation': 0.20,
-            'institutional buying': 0.20, 'record inflow': 0.20,
-            # moderate (+0.15)
-            'golden cross': 0.15, 'breaks out': 0.15, 'breaks above': 0.15,
-            'price target': 0.15, 'buy signal': 0.15, 'strong support': 0.15,
-            'higher high': 0.15, 'bullish divergence': 0.15,
-            'network upgrade': 0.12, 'strategic reserve': 0.12,
+            # strong (+0.20) — 確定的な強い事実
+            'all-time high': 0.20, 'all time high': 0.20, 'new ath': 0.20,
+            'etf approved': 0.20, 'etf approval': 0.20, 'mass adoption': 0.18,
+            'short squeeze': 0.18, 'whale accumulation': 0.15,
+            'institutional buying': 0.15, 'record inflow': 0.15,
+            # moderate (+0.12)
+            'golden cross': 0.12, 'breaks out': 0.12, 'breaks above': 0.12,
+            'price target': 0.10, 'buy signal': 0.10, 'strong support': 0.10,
+            'higher high': 0.10, 'bullish divergence': 0.12,
+            'network upgrade': 0.08, 'strategic reserve': 0.10,
             # contextual bullish (bearish word in bullish context)
-            'buy the dip': 0.15, 'buying the dip': 0.15, 'bought the dip': 0.15,
-            'buys the dip': 0.15, 'accumulate on dip': 0.12,
-            'whales buy': 0.12, 'whales buying': 0.12, 'whale buying': 0.12,
-            'bottom is in': 0.15, 'found support': 0.12, 'holds support': 0.12,
-            'signs of recovery': 0.15, 'showing strength': 0.12,
+            'buy the dip': 0.10, 'buying the dip': 0.10, 'bought the dip': 0.10,
+            'buys the dip': 0.10, 'accumulate on dip': 0.08,
+            'whales buy': 0.08, 'whales buying': 0.08, 'whale buying': 0.08,
+            'bottom is in': 0.10, 'found support': 0.08, 'holds support': 0.08,
+            'signs of recovery': 0.10, 'showing strength': 0.08,
         }
         bearish_phrases = {
-            # strong (-0.25)
-            'death cross': 0.25, 'bank run': 0.25, 'rug pull': 0.25,
-            'ponzi scheme': 0.25, 'sec lawsuit': 0.25, 'exchange hack': 0.25,
-            'mass liquidation': 0.25, 'flash crash': 0.25,
-            # moderate (-0.15)
-            'breaks below': 0.15, 'sell signal': 0.15, 'lower low': 0.15,
-            'bearish divergence': 0.15, 'key support': 0.15, 'lost support': 0.15,
-            'whale dump': 0.15, 'record outflow': 0.15, 'under investigation': 0.15,
-            'class action': 0.15, 'security breach': 0.15,
+            # strong (-0.20) — 確定的な強い事実
+            'death cross': 0.20, 'bank run': 0.20, 'rug pull': 0.20,
+            'ponzi scheme': 0.20, 'sec lawsuit': 0.18, 'exchange hack': 0.20,
+            'mass liquidation': 0.20, 'flash crash': 0.20,
+            'pump and dump': 0.18, 'pump-and-dump': 0.18,
+            # moderate (-0.12)
+            'breaks below': 0.12, 'sell signal': 0.12, 'lower low': 0.12,
+            'bearish divergence': 0.12, 'key support lost': 0.12, 'lost support': 0.12,
+            'whale dump': 0.12, 'record outflow': 0.12, 'under investigation': 0.12,
+            'class action': 0.12, 'security breach': 0.12,
         }
 
         phrase_score = 0.0
-        matched_phrase = False
+        matched_phrases = []
         for phrase, weight in bullish_phrases.items():
             if phrase in title_lower:
-                phrase_score += weight
-                matched_phrase = True
+                phrase_score += weight * speculation_dampener
+                matched_phrases.append(phrase)
         for phrase, weight in bearish_phrases.items():
             if phrase in title_lower:
-                phrase_score -= weight
-                matched_phrase = True
+                phrase_score -= weight * speculation_dampener
+                matched_phrases.append(phrase)
 
         # ===== 単語レベル (強度別) =====
-        strong_bullish = [
-            'surge', 'soar', 'skyrocket', 'explode', 'moon', 'parabolic',
-        ]
-        moderate_bullish = [
-            'rally', 'breakout', 'bullish', 'pump', 'gain', 'jump', 'boost',
-            'adoption', 'partnership', 'upgrade', 'approval', 'inflow',
-            'accumulate', 'outperform', 'momentum', 'recovery', 'rebound',
-            'reclaim', 'optimistic', 'milestone', 'halving',
-        ]
-        mild_bullish = [
-            'rise', 'climb', 'advance', 'positive', 'support', 'buying',
-            'uptrend', 'upside', 'opportunity', 'growth', 'strengthen',
-        ]
+        # ※ strong のウェイトを緩和（クリックベイト耐性）
+        strong_bullish = {
+            'surge': 0.14, 'soar': 0.14, 'skyrocket': 0.14,
+            'parabolic': 0.14,
+        }
+        moderate_bullish = {
+            'rally': 0.09, 'breakout': 0.09, 'bullish': 0.09,
+            'gain': 0.07, 'jump': 0.07, 'boost': 0.07,
+            'adoption': 0.08, 'partnership': 0.06, 'upgrade': 0.05,
+            'approval': 0.08, 'inflow': 0.07,
+            'accumulate': 0.07, 'outperform': 0.07, 'momentum': 0.06,
+            'recovery': 0.07, 'rebound': 0.07,
+            'reclaim': 0.06, 'optimistic': 0.06, 'milestone': 0.04,
+            'halving': 0.07,
+        }
+        mild_bullish = {
+            'rise': 0.04, 'climb': 0.04, 'advance': 0.04,
+            'positive': 0.04, 'support': 0.03, 'buying': 0.04,
+            'uptrend': 0.04, 'upside': 0.04, 'opportunity': 0.03,
+            'growth': 0.04, 'strengthen': 0.04,
+        }
 
-        strong_bearish = [
-            'crash', 'plunge', 'collapse', 'tank', 'devastate', 'implode',
-        ]
-        moderate_bearish = [
-            'dump', 'bearish', 'selloff', 'sell-off', 'decline', 'drop',
-            'slump', 'hack', 'exploit', 'vulnerability', 'fraud', 'scam',
-            'ban', 'crackdown', 'lawsuit', 'outflow', 'liquidat',
-            'panic', 'warning', 'bubble', 'overvalued', 'correction',
-            'bankrupt', 'insolvent', 'delisted',
-        ]
-        mild_bearish = [
-            'fall', 'dip', 'slide', 'weak', 'fear', 'risk', 'concern',
-            'uncertain', 'volatile', 'downtrend', 'resistance', 'struggle',
-            'caution', 'fud', 'restriction',
-        ]
+        strong_bearish = {
+            'crash': 0.14, 'plunge': 0.14, 'collapse': 0.14,
+            'tank': 0.14, 'devastate': 0.14, 'implode': 0.14,
+        }
+        moderate_bearish = {
+            'dump': 0.09, 'bearish': 0.09, 'selloff': 0.09,
+            'sell-off': 0.09, 'decline': 0.07, 'drop': 0.07,
+            'slump': 0.08, 'hack': 0.09, 'exploit': 0.08,
+            'vulnerability': 0.07, 'fraud': 0.09, 'scam': 0.09,
+            'ban': 0.08, 'crackdown': 0.09, 'lawsuit': 0.08,
+            'outflow': 0.07, 'panic': 0.07, 'warning': 0.05,
+            'bubble': 0.07, 'overvalued': 0.07, 'correction': 0.05,
+            'bankrupt': 0.09, 'insolvent': 0.09, 'delisted': 0.08,
+        }
+        mild_bearish = {
+            'fall': 0.04, 'dip': 0.03, 'slide': 0.04,
+            'weak': 0.04, 'fear': 0.04, 'risk': 0.03,
+            'concern': 0.03, 'uncertain': 0.04, 'volatile': 0.03,
+            'downtrend': 0.04, 'resistance': 0.03, 'struggle': 0.04,
+            'caution': 0.03, 'fud': 0.04, 'restriction': 0.04,
+        }
+
+        # 接頭辞マッチング用リスト（活用形対応）
+        bearish_prefixes = {
+            'liquidat': 0.09,  # liquidation, liquidated, liquidating
+            'investigat': 0.07,  # investigation, investigated
+        }
+        bullish_prefixes = {
+            'accumulat': 0.07,  # accumulating, accumulated, accumulation
+        }
 
         # 否定語リスト
         negation_words = {'not', 'no', 'never', "n't", 'without', 'fails',
@@ -537,38 +599,70 @@ def estimate_sentiment_from_title(title: str) -> float:
                     return True
             return False
 
+        # コンテキスト判定: "pump and dump" はフレーズで処理済みなので単語 pump をスキップ
+        pump_dump_context = 'pump and dump' in title_lower or 'pump-and-dump' in title_lower
+        # "explode" / "moon" はクリックベイト率が高いので強度を下げて処理
+        clickbait_words = {'explode': 0.06, 'moon': 0.04, 'moonshot': 0.04}
+
         word_score = 0.0
-        weights = {
-            'strong_bullish': 0.20, 'moderate_bullish': 0.12, 'mild_bullish': 0.06,
-            'strong_bearish': 0.20, 'moderate_bearish': 0.12, 'mild_bearish': 0.06,
-        }
 
         for i, word in enumerate(words):
             w = word.rstrip('.,!?:;')
             negated = is_negated(i)
 
-            if w in strong_bullish:
-                delta = weights['strong_bullish'] * (-1 if negated else 1)
-                word_score += delta
-            elif w in moderate_bullish:
-                delta = weights['moderate_bullish'] * (-1 if negated else 1)
-                word_score += delta
-            elif w in mild_bullish:
-                delta = weights['mild_bullish'] * (-1 if negated else 1)
-                word_score += delta
-            elif w in strong_bearish:
-                delta = weights['strong_bearish'] * (-1 if negated else 1)
-                word_score -= delta
-            elif w in moderate_bearish:
-                delta = weights['moderate_bearish'] * (-1 if negated else 1)
-                word_score -= delta
-            elif w in mild_bearish:
-                delta = weights['mild_bearish'] * (-1 if negated else 1)
-                word_score -= delta
+            # pump のコンテキスト判定
+            if w == 'pump' and pump_dump_context:
+                continue  # フレーズ側で処理済み
 
-        # ===== 最終スコア: フレーズ + 単語、上限 ±0.4 =====
+            # クリックベイト頻出語は専用の低い重みで処理
+            if w in clickbait_words:
+                delta = clickbait_words[w] * (-1 if negated else 1)
+                word_score += delta * speculation_dampener
+                continue
+
+            # 通常の単語マッチ（辞書ベースで個別重み）
+            matched = False
+            if w in strong_bullish:
+                delta = strong_bullish[w] * (-1 if negated else 1)
+                word_score += delta * speculation_dampener
+                matched = True
+            elif w in moderate_bullish:
+                delta = moderate_bullish[w] * (-1 if negated else 1)
+                word_score += delta * speculation_dampener
+                matched = True
+            elif w in mild_bullish:
+                delta = mild_bullish[w] * (-1 if negated else 1)
+                word_score += delta * speculation_dampener
+                matched = True
+            elif w in strong_bearish:
+                delta = strong_bearish[w] * (-1 if negated else 1)
+                word_score -= delta * speculation_dampener
+                matched = True
+            elif w in moderate_bearish:
+                delta = moderate_bearish[w] * (-1 if negated else 1)
+                word_score -= delta * speculation_dampener
+                matched = True
+            elif w in mild_bearish:
+                delta = mild_bearish[w] * (-1 if negated else 1)
+                word_score -= delta * speculation_dampener
+                matched = True
+
+            # 接頭辞マッチング（活用形対応）
+            if not matched:
+                for prefix, weight in bearish_prefixes.items():
+                    if w.startswith(prefix):
+                        delta = weight * (-1 if negated else 1)
+                        word_score -= delta * speculation_dampener
+                        break
+                for prefix, weight in bullish_prefixes.items():
+                    if w.startswith(prefix):
+                        delta = weight * (-1 if negated else 1)
+                        word_score += delta * speculation_dampener
+                        break
+
+        # ===== 最終スコア: フレーズ + 単語、上限 ±0.30（過剰反応防止） =====
         net_score = phrase_score + word_score
-        net_score = max(-0.4, min(0.4, net_score))
+        net_score = max(-0.30, min(0.30, net_score))
         return 0.5 + net_score
 
     except Exception as e:
@@ -593,8 +687,8 @@ def extract_top_headlines(articles: list, llm_scores: dict, top_n: int = 3, over
         votes = article.get('votes', {})
         positive = votes.get('positive', 0) + votes.get('important', 0) * 1.5
         negative = votes.get('negative', 0) + votes.get('toxic', 0) * 1.5
-        liked = votes.get('liked', 0)
-        disliked = votes.get('disliked', 0)
+        liked = votes.get('liked', 0) * 0.3
+        disliked = votes.get('disliked', 0) * 0.3
         total_votes = positive + negative + liked + disliked
 
         if total_votes >= MIN_RELIABLE_VOTES:
