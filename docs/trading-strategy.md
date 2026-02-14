@@ -41,7 +41,7 @@ flowchart TD
         ALL_HOLD["ALL HOLD"]
     end
 
-    subgraph 実行["order-executor (EventBridge 15分毎)"]
+    subgraph 実行["order-executor (crypto-order リポ)"]
         READ_SIG["signalsテーブルから<br/>最新シグナル読み取り"]
         SELL_EXEC["SELL: 全対象を売却"]
         BUY_EXEC["BUY: 最高スコア1通貨のみ購入"]
@@ -266,7 +266,7 @@ market_context = fng_score × 0.30 + funding_score × 0.35 + dominance_score × 
 ### 通貨毎のBUY/SELL/HOLD判定（ポジション非依存）
 
 **方針**: aggregator は全通貨を純粋にスコアと閾値で判定し、現在のポジション状況に影響されない。
-判定結果は DynamoDB signals テーブルに保存され、EventBridge 定期起動の order-executor が最新シグナルを読み取って注文を執行する。
+判定結果は DynamoDB signals テーブルに保存され、[crypto-order](https://github.com/kiikun0530/crypto-order) の order-executor が最新シグナルを読み取って注文を執行する。
 BUY対象が複数ある場合は最もスコアの高い1通貨のみ購入、SELLは全対象を売却する。
 
 ```
@@ -284,7 +284,7 @@ for each 通貨 in scored_pairs:
 
 # 3. DynamoDB signalsテーブルに保存済み（save_signal()で自動保存）
 
-# 4. order-executorでの実行（EventBridge 15分毎起動）
+# 4. order-executorでの実行（crypto-orderリポ, EventBridge 15分毎起動）
 SELL先（資金確保）:
     全対象のポジションがあれば売却、なければスキップ
 BUY:
@@ -292,14 +292,14 @@ BUY:
 ```
 
 **aggregator（判定）と order-executor（実行）の分離**:
-- aggregator: 純粋にスコア vs 閾値で判定。記録（DynamoDB signals）。
-- order-executor: EventBridge 15分毎起動。signalsテーブルから読み取り、ポジション確認、残高確認、サーキットブレーカー、実際の注文API呼び出し。
+- aggregator (crypto-trader): 純粋にスコア vs 閾値で判定。記録（DynamoDB signals）。
+- order-executor (crypto-order): EventBridge 15分毎起動。signalsテーブルから読み取り、ポジション確認、残高確認、サーキットブレーカー、実際の注文API呼び出し。
 
-**SELL処理（order-executor）**:
+**SELL処理（order-executor / crypto-order）**:
 - 全SELL判定を処理
 - 対象通貨のポジションがあれば売却、なければスキップ（「売る対象がなければ無視」）
 
-**BUY処理（order-executor）**:
+**BUY処理（order-executor / crypto-order）**:
 - BUY判定が複数あっても最もスコアの高い1通貨のみ購入（集中投資）
 - ポジション既存ならスキップ → 残高確認 → Kelly/フォールバック比率で投資額算出 → 購入
 
@@ -384,7 +384,7 @@ f* = 最適投資比率
 | Take Profit | +30% | 安全弁。利確はトレーリングストップに委任 |
 | トレーリング 3%+ | 連続トレーリング | ピーク価格から動的SL（下記表参照） |
 
-- position-monitor が5分間隔で全通貨のアクティブポジションを監視
+- position-monitor (crypto-order) が5分間隔で全通貨のアクティブポジションを監視
 - SL/TP はポジション作成時に設定され、ポジションレコードに保存
 - **連続トレーリングストップ**: ピーク価格をDynamoDBに永続化し、ピークからの下落率でSLを動的に設定
   - 含み益 3%未満: 固定SL (-5%)
@@ -394,11 +394,11 @@ f* = 最適投資比率
   - 含み益 12%+: ピークから1.0%下にSL（最狭、大利確保）
   - 最低でも建値+0.1%以上を保証（手数料分）
 - Take Profit (+30%) は異常時の最終防衛線。通常はトレーリングストップが主な利確手段
-- トリガー時は position-monitor が直接 Coincheck API で売り指示（確実な実行を保証）
+- トリガー時は position-monitor (crypto-order) が直接 Coincheck API で売り指示（確実な実行を保証）
 
 ### サーキットブレーカー
 
-order-executorにBUY注文前の安全装置として実装（デフォルトOFF）:
+order-executor (crypto-order) にBUY注文前の安全装置として実装（デフォルトOFF）:
 
 | 条件 | 閾値 | 動作 |
 |------|------|------|
@@ -411,7 +411,7 @@ order-executorにBUY注文前の安全装置として実装（デフォルトOFF
 ### 注文の確実性
 
 ```
-aggregator → DynamoDB (signals) ← order-executor (EventBridge 15分毎)
+aggregator → DynamoDB (signals) ← order-executor (crypto-order, EventBridge 15分毎)
                                        ↓ (失敗時)
                                  CloudWatch Alarm → Slack通知
 ```
@@ -483,7 +483,7 @@ F&G: 14 (Extreme Fear) | BTC Dom: 56.9% | Scores: F&G=+0.397 Fund=+0.133 Dom=-0.
 
 ### マルチポジション化
 
-✅ **実装済み**: 複数通貨の同時保有に対応。aggregator は通貨毎にポジション非依存でBUY/SELL/HOLD判定し、DynamoDB signalsテーブルに保存。order-executor が EventBridge 15分毎起動でシグナルを読み取り、ポジション・残高を確認して実際の注文を実行。BUYは最高スコアの1通貨のみ、SELLは全対象。投資額は `available_jpy`（残りJPY残高）から自然に分配される。
+✅ **実装済み**: 複数通貨の同時保有に対応。aggregator は通貨毎にポジション非依存でBUY/SELL/HOLD判定し、DynamoDB signalsテーブルに保存。order-executor (crypto-order) が EventBridge 15分毎起動でシグナルを読み取り、ポジション・残高を確認して実際の注文を実行。BUYは最高スコアの1通貨のみ、SELLは全対象。投資額は `available_jpy`（残りJPY残高）から自然に分配される。
 
 ### より大きなモデルへの移行
 

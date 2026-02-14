@@ -12,8 +12,6 @@ resource "aws_cloudwatch_log_group" "lambda" {
     "chronos-caller",
     "sentiment-getter",
     "aggregator",
-    "order-executor",
-    "position-monitor",
     "news-collector",
     "market-context",
     "warm-up"
@@ -80,18 +78,6 @@ locals {
       memory      = 512
       handler     = "handler.handler"
     }
-    order-executor = {
-      description = "注文実行"
-      timeout     = 60
-      memory      = 256
-      handler     = "handler.handler"
-    }
-    position-monitor = {
-      description = "ポジション監視（全通貨）"
-      timeout     = 60
-      memory      = 256
-      handler     = "handler.handler"
-    }
     news-collector = {
       description = "ニュース収集"
       timeout     = 60
@@ -115,14 +101,12 @@ locals {
   lambda_environment = {
     PRICES_TABLE         = aws_dynamodb_table.prices.name
     SENTIMENT_TABLE      = aws_dynamodb_table.sentiment.name
-    POSITIONS_TABLE      = aws_dynamodb_table.positions.name
-    TRADES_TABLE         = aws_dynamodb_table.trades.name
     SIGNALS_TABLE        = aws_dynamodb_table.signals.name
     ANALYSIS_STATE_TABLE = aws_dynamodb_table.analysis_state.name
     MARKET_CONTEXT_TABLE = aws_dynamodb_table.market_context.name
     TF_SCORES_TABLE      = aws_dynamodb_table.tf_scores.name
-    COINCHECK_SECRET_ARN = "arn:aws:secretsmanager:${var.aws_region}:${local.account_id}:secret:coincheck/api-credentials"
-    MAX_POSITION_JPY     = tostring(var.max_position_jpy)
+    POSITIONS_TABLE      = "${local.name_prefix}-positions" # crypto-order管理、aggregator読取用
+
     CRYPTOPANIC_API_KEY  = var.cryptopanic_api_key
     SLACK_WEBHOOK_URL      = var.slack_webhook_url
     TRADING_PAIRS_CONFIG   = trimspace(var.trading_pairs_config)

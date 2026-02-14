@@ -9,14 +9,13 @@ Crypto Trader のシステム構成と技術選定を説明するドキュメン
 
 ## システム構成図
 
-> **推定コスト**: AWS 約$11/月 + CryptoPanic Growth $199/月（オプション）
+> **推定コスト**: AWS 約$10/月 + CryptoPanic Growth $199/月（オプション）
 > Lambda VPC外実行により NAT Gateway ($45/月) を削減
 
 ```mermaid
 flowchart LR
     subgraph External["External APIs"]
         API_BINANCE["Binance API<br/>3通貨×4TFの価格取得"]
-        API_COINCHECK["Coincheck API<br/>取引執行（JPYペア）"]
         API_CRYPTOPANIC["CryptoPanic API v2<br/>Growth Plan"]
         API_FNG["Alternative.me<br/>Fear & Greed Index"]
         API_FUNDING["Binance Futures<br/>ファンディングレート"]
@@ -30,8 +29,6 @@ flowchart LR
         EB_4H["4時間間隔<br/>analysis-4h"]
         EB_1D["日次 UTC 00:05<br/>analysis-1d"]
         EB_META["15分間隔<br/>meta-aggregator"]
-        EB_ORDER["15分間隔<br/>order-executor"]
-        EB_POSITION["5分間隔<br/>position-monitor"]
         EB_NEWS["30分間隔<br/>news-collection"]
         EB_MKTCTX["30分間隔<br/>market-context"]
     end
@@ -42,8 +39,6 @@ flowchart LR
         L_CHRONOS["chronos-caller<br/>AI価格予測"]
         L_SENTIMENT["sentiment-getter<br/>センチメント取得"]
         L_AGG["aggregator<br/>tf_score / meta_aggregate<br/>デュアルモード"]
-        L_ORDER["order-executor<br/>注文実行"]
-        L_POSITION["position-monitor<br/>全通貨SL/TP監視"]
         L_NEWS["news-collector<br/>ニュース収集"]
         L_MKTCTX["market-context<br/>市場環境収集"]
         L_REMEDIATE["error-remediator<br/>エラー自動修復"]
@@ -60,15 +55,18 @@ flowchart LR
         SNS_ALERTS{{"alerts"}}
     end
 
-    subgraph DynamoDB["DynamoDB (8 Tables, 全通貨共有)"]
-        DB_PRICES[("prices<br/>pair#tf=PK, TTL:TF別")]
-        DB_SENTIMENT[("sentiment<br/>pair=PK, TTL:14日")]
-        DB_POSITIONS[("positions<br/>pair=PK")]
-        DB_TRADES[("trades<br/>pair=PK")]
-        DB_SIGNALS[("signals<br/>pair=PK, TTL:90日")]
-        DB_STATE[("analysis_state<br/>pair=PK")]
-        DB_MKTCTX[("market-context<br/>context_type=PK, TTL:14日")]
-        DB_TFSCORES[("tf-scores<br/>pair_tf=PK, TTL:24h")]
+    subgraph DynamoDB["DynamoDB (6 Tables, 全通貨共有)"]
+        DB_PRICES[("​prices<br/>pair#tf=PK, TTL:TF別")]
+        DB_SENTIMENT[("​sentiment<br/>pair=PK, TTL:14日")]
+        DB_SIGNALS[("​signals<br/>pair=PK, TTL:90日")]
+        DB_STATE[("​analysis_state<br/>pair=PK")]
+        DB_MKTCTX[("​market-context<br/>context_type=PK, TTL:14日")]
+        DB_TFSCORES[("​tf-scores<br/>pair_tf=PK, TTL:24h")]
+    end
+
+    subgraph CryptoOrder["crypto-order リポ (2 Tables)"]
+        DB_POSITIONS[("​positions<br/>pair=PK")]
+        DB_TRADES[("​trades<br/>pair=PK")]
     end
 
     subgraph SageMaker["SageMaker"]
@@ -91,8 +89,6 @@ flowchart LR
     EB_4H -->|"毎4時間"| SF_PRICE
     EB_1D -->|"毎日"| SF_PRICE
     EB_META -->|"毎15分"| L_AGG
-    EB_ORDER -->|"毎15分"| L_ORDER
-    EB_POSITION -->|"毎5分"| L_POSITION
     EB_NEWS -->|"30分毎"| L_NEWS
     EB_MKTCTX -->|"30分毎"| L_MKTCTX
 
@@ -119,24 +115,13 @@ flowchart LR
     L_AGG -->|"R meta_agg"| DB_MKTCTX
     L_AGG -->|"R meta_agg"| DB_TFSCORES
     L_AGG -->|"W"| DB_SIGNALS
-    L_ORDER -->|"R/W"| DB_POSITIONS
-    L_ORDER -->|"W"| DB_TRADES
-    L_POSITION -->|"R"| DB_POSITIONS
 
-    %% 注文
-    L_ORDER -->|"R"| DB_SIGNALS
-    L_ORDER -->|"R/W"| DB_POSITIONS
-
-    %% ポジション監視
-    L_POSITION -->|"全通貨チェック"| API_COINCHECK
+    %% 注文実行・ポジション監視は crypto-order リポジトリに移行
 
     %% 通知（直接Slack Webhook）
-    L_ORDER -->|"Slack通知"| SLACK
     L_AGG -->|"ランキング通知"| SLACK
-    L_POSITION -->|"SL/TP通知"| SLACK
 
     %% 外部API
-    L_ORDER --> API_COINCHECK
     L_NEWS --> API_CRYPTOPANIC
     L_MKTCTX --> API_FNG
     L_MKTCTX --> API_FUNDING
@@ -182,9 +167,9 @@ flowchart LR
 
 暗号通貨トレーディングボットは24時間365日稼働が必要だが、常にCPUリソースを使う必要はない。「イベント駆動 + Serverless」で、実際に処理が必要な時だけコストが発生する構成にしている。
 
-### 2. 信頼性 — 注文の確実な実行
+### 2. 信頼性 — シグナルの確実な生成
 
-金融取引では「注文を出したつもりが出ていなかった」が最も危険。DynamoDB signals テーブルに判定結果を永続化し、EventBridge 定期起動の order-executor が読み取り・執行。Lambda エラーは CloudWatch Alarm → Slack で即座に人間に通知。
+分析パイプラインでは「シグナルを確実に生成・保存する」ことが最重要。DynamoDB signals テーブルに判定結果を永続化し、crypto-order リポジトリの order-executor が読み取り・執行。Lambda エラーは CloudWatch Alarm → Slack で即座に人間に通知。
 
 ### 3. シンプルさ — 運用負荷ゼロ
 
@@ -248,7 +233,7 @@ ECS/EC2 は常時課金が発生し、現行の「完全サーバーレス」設
 
 **削減コスト**: NAT Gateway $45/月 + Elastic IP $3.6/月 = **$48.6/月**
 
-Lambda を VPC 内に配置すると、外部 API（Binance, Coincheck, CryptoPanic）へのアクセスに NAT Gateway が必須。しかし DynamoDB, SNS 等のAWSサービスは IAM 認証でアクセスでき、VPC内にある必要がない。Coincheck の API キーは Secrets Manager（IAMロール保護）で管理。
+Lambda を VPC 内に配置すると、外部 API（Binance, CryptoPanic 等）へのアクセスに NAT Gateway が必須。しかし DynamoDB, SNS 等のAWSサービスは IAM 認証でアクセスでき、VPC内にある必要がない。
 
 ### Binance（分析） + Coincheck（取引）
 
@@ -293,10 +278,10 @@ EventBridge (TF別スケジュール: 15m/1h/4h/1d)
 ### EventBridge → order-executor
 
 ```
-aggregator (meta_aggregate) → DynamoDB (signalsテーブル) ← order-executor (EventBridge 15分毎)
+aggregator (meta_aggregate) → DynamoDB (signalsテーブル) ← order-executor (crypto-orderリポ, EventBridge 15分毎)
 ```
 
-aggregator が全 TF スコアを統合して BUY/SELL/HOLD 判定を DynamoDB signals テーブルに保存。order-executor は EventBridge による15分毎の定期起動で最新シグナルを読み取り、注文を執行。BUY対象が複数ある場合は最もスコアの高い1通貨のみ、SELLは全対象を実行。
+aggregator が全 TF スコアを統合して BUY/SELL/HOLD 判定を DynamoDB signals テーブルに保存。order-executor (crypto-orderリポジトリで管理) が EventBridge 15分毎の定期起動で最新シグナルを読み取り、注文を執行。
 
 ### 監視・通知パイプライン
 
@@ -307,8 +292,8 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
                                             └→ Slack通知（エラー内容）
 ```
 
-- **CloudWatch Alarms (20個)**: 全10 Lambda × (Errors + Duration) で異常検知
-- **Subscription Filters (9個)**: warm-up以外の全Lambdaのエラーログを検知
+- **CloudWatch Alarms (18個)**: 全 9 Lambda × (Errors + Duration) で異常検知
+- **Subscription Filters (8個)**: warm-up以外の全Lambdaのエラーログを検知
   - フィルターパターン: `?"[ERROR]" ?Traceback ?"raise Exception" -"[INFO]" -"expected behavior" -"retrying in"`
   - SageMaker Serverless の想定内リトライログ（ThrottlingException → 自動リカバリ）を除外
 - **error-remediator Lambda**: エラー検知 → Slack通知（30分クールダウン付き）
@@ -335,10 +320,10 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
 | tf-scores | pair_tf (S) 例: btc_usdt#1h | timestamp (N) | 24時間 | TF別スコア保存 |
 | sentiment | pair (S) | timestamp (N) | 14日 | 通貨別センチメントスコア |
 | signals | pair (S) | timestamp (N) | 90日 | 分析シグナル履歴 |
-| positions | pair (S) | position_id (S) | - | ポジション管理 |
-| trades | pair (S) | timestamp (N) | 90日 | 取引履歴 |
 | analysis_state | pair (S) | - | - | 通貨別の最終分析時刻 |
 | market-context | context_type (S) | timestamp (N) | 14日 | マクロ市場環境指標 |
+
+> positions / trades テーブルは [crypto-order](https://github.com/kiikun0530/crypto-order) リポジトリで管理
 
 ### TTL 設計の根拠
 
@@ -351,8 +336,7 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
 | tf-scores | 24時間 | 最新スコアのみ必要、古いデータはstalenessで除外 |
 | sentiment | 14日 | ニュース相関分析に2週間分必要 |
 | signals | 90日 | パフォーマンス分析用に長めに保持 |
-| positions | なし | 取引履歴は永続保存（税務対応） |
-| trades | 90日 | 自動クリーンアップ |
+| analysis_state | なし | 分析状態は永続保存 |
 | market-context | 14日 | マクロ指標は短期分のみ必要 |
 
 ---
@@ -362,9 +346,10 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
 | 認証情報 | 保存先 | 理由 |
 |---|---|---|
 | AWS認証 | IAMロール | Lambda実行ロールで自動付与 |
-| Coincheck API | Secrets Manager | 取引に直結するため厳重管理 |
 | CryptoPanic API | Lambda環境変数 | 読み取り専用、リスク低 |
 | Slack Webhook | Lambda環境変数 | 読み取り専用、リスク低 |
+
+> Coincheck API 認証情報は [crypto-order](https://github.com/kiikun0530/crypto-order) で Secrets Manager 管理
 
 IAM ロールは最小権限原則で設計。各 Lambda は必要な DynamoDB テーブル・SNS のみアクセス可能。
 
@@ -382,9 +367,8 @@ IAM ロールは最小権限原則で設計。各 Lambda は必要な DynamoDB �
 | SageMaker Serverless | ~$3-8 | Chronos-2 推論 (3通貨×4TF/周期) |
 | Step Functions | ~$0.15 | 4TF別ワークフロー + メタ集約 |
 | CloudWatch | ~$0.55 | ログ保存14日 + Metric Alarms + Subscription Filters |
-| Secrets Manager | ~$0.50 | Coincheck APIキー |
 | SNS/EventBridge | ~$0.05 | 軽微 |
-| **AWS合計** | **~$11/月** | |
+| **AWS合計** | **~$10/月** | |
 
 ### 外部API費用
 
@@ -394,14 +378,17 @@ IAM ロールは最小権限原則で設計。各 Lambda は必要な DynamoDB �
 | Alternative.me | 無料 | Fear & Greed Index |
 | CoinGecko | 無料 | BTC Dominance |
 | CryptoPanic | 無料 or $199/月 | Growth Plan でリアルタイム取得 |
-| Coincheck | 0% | 取引手数料無料 |
+
+> Coincheck 取引手数料は [crypto-order](https://github.com/kiikun0530/crypto-order) を参照
 
 ### 総コスト
 
 | 構成 | 月額 |
 |---|---|
-| 無料プラン | **~$11/月** |
-| Growth Plan | **~$210/月** |
+| 無料プラン | **~$10/月** |
+| Growth Plan | **~$209/月** |
+
+> crypto-order側のコスト（Secrets Manager等）は別途
 
 ---
 
@@ -409,3 +396,4 @@ IAM ロールは最小権限原則で設計。各 Lambda は必要な DynamoDB �
 
 - [trading-strategy.md](trading-strategy.md) — マルチTF戦略、スコアリング、売買判定
 - [lambda-reference.md](lambda-reference.md) — 各Lambda関数の仕様、I/O、設定
+- [crypto-order](https://github.com/kiikun0530/crypto-order) — 注文実行・ポジション管理

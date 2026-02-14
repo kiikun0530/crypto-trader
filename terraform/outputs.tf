@@ -10,10 +10,9 @@ output "dynamodb_tables" {
   value = {
     prices         = aws_dynamodb_table.prices.name
     sentiment      = aws_dynamodb_table.sentiment.name
-    positions      = aws_dynamodb_table.positions.name
-    trades         = aws_dynamodb_table.trades.name
     signals        = aws_dynamodb_table.signals.name
     analysis_state = aws_dynamodb_table.analysis_state.name
+    # positions/trades は crypto-order リポジトリに移行
   }
 }
 

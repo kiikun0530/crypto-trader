@@ -21,8 +21,7 @@ dynamodb = boto3.resource('dynamodb')
 # テーブル名設定
 # -----------------------------------------------------------------------------
 PRICES_TABLE = os.environ.get('PRICES_TABLE', 'eth-trading-prices')
-POSITIONS_TABLE = os.environ.get('POSITIONS_TABLE', 'eth-trading-positions')
-TRADES_TABLE = os.environ.get('TRADES_TABLE', 'eth-trading-trades')
+POSITIONS_TABLE = os.environ.get('POSITIONS_TABLE', 'eth-trading-positions')  # crypto-order管理、aggregator読取用
 SIGNALS_TABLE = os.environ.get('SIGNALS_TABLE', 'eth-trading-signals')
 SENTIMENT_TABLE = os.environ.get('SENTIMENT_TABLE', 'eth-trading-sentiment')
 ANALYSIS_STATE_TABLE = os.environ.get('ANALYSIS_STATE_TABLE', 'eth-trading-analysis-state')
@@ -224,6 +223,3 @@ def find_all_active_positions(table_name: str = None) -> list:
 # -----------------------------------------------------------------------------
 # ユーティリティ
 # -----------------------------------------------------------------------------
-def get_currency_from_pair(pair: str) -> str:
-    """通貨ペアから通貨コードを抽出 (例: 'eth_jpy' -> 'eth')"""
-    return pair.split('_')[0]

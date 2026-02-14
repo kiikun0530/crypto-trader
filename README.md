@@ -8,14 +8,13 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 
 - **対象通貨**: 3通貨（Binance + Coincheck 両対応の高流動性銘柄を厳選）
 - **価格データ**: Binance API（マルチタイムフレーム OHLCV × 3通貨 × 4TF）
-- **取引執行**: Coincheck API（各通貨/JPY）
 - **テクニカル分析**: SMA20/200、RSI、MACD、ボリンジャーバンド、ADX、ATR
 - **レジーム検知**: ADXによるトレンド/レンジ判定、適応型ウェイト
 - **ニュースセンチメント**: CryptoPanic API（全通貨一括取得 + BTC相関分析）
 - **時系列予測**: Amazon Chronos-2 (120M) on SageMaker Serverless Endpoint
-- **ポジション管理**: 複数通貨同時保有対応（SELL優先 → 未保有通貨をBUY）
-- **リスク管理**: SL/TP + トレーリングストップ + サーキットブレーカー
 - **通知**: Slack Webhook（全通貨ランキング付き）
+
+> **注文実行・ポジション管理** は [crypto-order](https://github.com/kiikun0530/crypto-order) リポジトリで管理
 
 ## アーキテクチャ
 
@@ -36,7 +35,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | ETH | ETHUSDT | eth_jpy | DeFi基盤、高流動性 |
 | XRP | XRPUSDT | xrp_jpy | 送金特化、高速決済 |
 
-### Lambda関数（11個）
+### Lambda関数（9個）
 
 | 関数名 | 役割 | 実行間隔 |
 |--------|------|----------|
@@ -45,14 +44,14 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | chronos-caller | AI時系列予測 (SageMaker Serverless, Chronos-2 120M) | Step Functions (×3) |
 | sentiment-getter | 通貨別センチメントスコア取得 | Step Functions (×3) |
 | aggregator | TFスコア保存 / メタ集約・ランキング・売買判定（デュアルモード） | Step Functions / EventBridge 15分 |
-| order-executor | Coincheckで成行注文実行（同一通貨重複防止） | EventBridge 15分 |
-| position-monitor | 全通貨のSL(-5%)/TP(+30%)/トレーリングストップ監視 | 5分 |
 | news-collector | 全通貨ニュース一括取得・BTC相関分析 | 30分 |
 | market-context | F&G / Funding Rate / BTC Dominance 収集 | 30分 |
 | error-remediator | Lambdaエラー検知→Slack通知 | CloudWatch Logs |
 | warm-up | 全通貨の初回データ投入（手動） | - |
 
-### DynamoDBテーブル（8個）
+> **order-executor** / **position-monitor** は [crypto-order](https://github.com/kiikun0530/crypto-order) リポジトリに移行
+
+### DynamoDBテーブル（6個）
 
 | テーブル | TTL | 用途 |
 |----------|-----|------|
@@ -60,10 +59,10 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | tf-scores | 24時間 | TF別スコア保存 |
 | sentiment | 14日 | センチメントスコア |
 | signals | 90日 | 売買シグナル履歴 |
-| positions | - | ポジション管理 |
-| trades | 90日 | 取引履歴 |
 | analysis_state | - | 分析状態管理 |
 | market-context | 14日 | マクロ市場環境指標 |
+
+> **positions** / **trades** テーブルは [crypto-order](https://github.com/kiikun0530/crypto-order) リポジトリで管理
 
 ## 推定コスト
 
@@ -77,11 +76,10 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | SageMaker Serverless (Chronos-2) | ~$3-8 |
 | Step Functions | ~$0.15 |
 | CloudWatch | ~$0.55 |
-| Secrets Manager | ~$0.50 |
 | SNS/EventBridge | ~$0.05 |
-| **合計** | **~$11/月** |
+| **合計** | **~$10/月** |
 
-> 詳細な計算式は [docs/architecture.md](docs/architecture.md) を参照
+> 詳細な計算式は [docs/architecture.md](docs/architecture.md) を参照。注文関連コストは [crypto-order](https://github.com/kiikun0530/crypto-order) を参照
 
 ### 外部API費用
 
@@ -92,26 +90,16 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | CryptoPanic | 無料 or $199/月 | Growth Planでリアルタイムニュース取得 |
 | Coincheck | 0% | 取引所取引は手数料無料 |
 
-> **総コスト目安**: 無料構成 ~$11/月、Growth Plan ~$210/月
+> **総コスト目安**: 無料構成 ~$10/月、Growth Plan ~$209/月（crypto-order側のコストは別途）
 
 ## 前提条件
 
 - AWS アカウント
 - Terraform v1.0+
 - Python 3.11+
-- Coincheck アカウント（本人確認済み）
 - Slack ワークスペース
 
-### 💰 Coincheck入金について
-
-| 項目 | 値 |
-|------|-----|
-| 最低取引量 | 通貨により異なる（例: ETH 0.001, BTC 0.001） |
-| システム最低注文額 | 500円（MIN_ORDER_JPY） |
-| 推奨入金額 | 10,000円〜 |
-
-> ⚠️ **注意**: 日本円残高が500円未満だと注文が実行されません。  
-> 余裕を持って1万円以上の入金を推奨します。
+> 💰 Coincheckアカウント・入金については [crypto-order](https://github.com/kiikun0530/crypto-order) を参照
 
 ## セットアップ手順
 
@@ -133,30 +121,22 @@ export AWS_SECRET_ACCESS_KEY=your_secret_key
 export AWS_DEFAULT_REGION=ap-northeast-1
 ```
 
-### 3. Coincheck APIキーを Secrets Manager に登録
+### 3. Slack Webhook URL を取得
 
-```bash
-aws secretsmanager create-secret \
-  --name coincheck/api-credentials \
-  --secret-string '{"access_key":"YOUR_ACCESS_KEY","secret_key":"YOUR_SECRET_KEY"}'
-```
-
-> ⚠️ Coincheck APIキーには「取引」権限が必要です
-
-### 4. Slack Webhook URL を取得
+> Coincheck APIキー設定は [crypto-order](https://github.com/kiikun0530/crypto-order) を参照
 
 1. https://api.slack.com/apps にアクセス
 2. 「Create New App」→「From scratch」
 3. 「Incoming Webhooks」を有効化
 4. チャンネルを選択してWebhook URLを取得
 
-### 5. CryptoPanic APIキー（オプション）
+### 4. CryptoPanic APIキー（オプション）
 
 1. https://cryptopanic.com/developers/api/ にアクセス
 2. アカウント作成後、APIキーを取得
 3. Growth Plan（$199/月）でリアルタイムニュース取得可能
 
-### 6. Terraform変数を設定
+### 5. Terraform変数を設定
 
 ```bash
 cd terraform
@@ -169,12 +149,11 @@ cp terraform.tfvars.example terraform.tfvars
 environment          = "prod"
 aws_region           = "ap-northeast-1"
 volatility_threshold = 0.3        # 価格変動閾値（%）
-max_position_jpy     = 15000      # 最大ポジション（円）
 slack_webhook_url    = "https://hooks.slack.com/services/xxx/xxx/xxx"
 cryptopanic_api_key  = ""         # オプション
 ```
 
-### 7. Terraformでデプロイ
+### 6. Terraformでデプロイ
 
 ```bash
 terraform init
@@ -182,7 +161,7 @@ terraform plan
 terraform apply
 ```
 
-### 8. SageMaker Chronos-2 のデプロイ
+### 7. SageMaker Chronos-2 のデプロイ
 
 ```bash
 # Chronos-2 モデルを SageMaker Serverless Endpoint にデプロイ
@@ -191,7 +170,7 @@ python scripts/deploy_sagemaker_chronos.py
 
 > 初回デプロイ時のみ必要です。SageMaker Serverless のクォータ申請（MaxConcurrency上限）が事前に必要な場合があります。
 
-### 9. 初回データ投入
+### 8. 初回データ投入
 
 ```bash
 # 全3通貨の過去データを一括投入
@@ -231,8 +210,8 @@ aws logs tail /aws/lambda/eth-trading-price-collector --since 5m
 
 ### CloudWatch 監視
 
-- **Metric Alarms (20個)**: 全10 Lambda × (Errors + Duration)
-- **Subscription Filters (9個)**: warm-up以外の全Lambdaのエラーログをリアルタイム検知
+- **Metric Alarms (18個)**: 全 9 Lambda × (Errors + Duration)
+- **Subscription Filters (8個)**: warm-up以外の全Lambdaのエラーログをリアルタイム検知
 - 異常検知時は即座に Slack 通知
 
 ### エラー検知パイプライン
@@ -247,6 +226,8 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
 
 ## スコアベースの投資ロジック
 
+- **スコアベースの投資ロジック**の詳細は [crypto-order](https://github.com/kiikun0530/crypto-order) を参照
+
 シグナルスコアに応じて投資金額が自動調整されます（Kelly Criterion 適用、トレード履歴5件未満時はフォールバック比率）：
 
 | スコア | フォールバック投資比率 | 説明 |
@@ -259,7 +240,7 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
 
 ## 手数料
 
-Coincheck取引所の取引手数料は **0%** です（2026年2月時点、対象通貨: ETH, BTC, XRP等）。
+Coincheck取引所の取引手数料は **0%** です（2026年2月時点、対象通貨: ETH, BTC, XRP等）。詳細は [crypto-order](https://github.com/kiikun0530/crypto-order) を参照。
 
 ## ローカル開発
 
@@ -296,8 +277,6 @@ crypto-trader/
 │   ├── chronos-caller/
 │   ├── sentiment-getter/
 │   ├── aggregator/
-│   ├── order-executor/
-│   ├── position-monitor/
 │   ├── news-collector/
 │   ├── market-context/
 │   ├── error-remediator/

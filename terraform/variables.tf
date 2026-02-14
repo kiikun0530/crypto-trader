@@ -20,14 +20,7 @@ variable "trading_pair" {
   default     = "eth_jpy"
 }
 
-# ============================================
-# Trading Settings
-# ============================================
-variable "max_position_jpy" {
-  description = "Maximum position size in JPY"
-  type        = number
-  default     = 15000
-}
+# max_position_jpy は crypto-order リポジトリに移行
 
 # ============================================
 # Multi-Currency Settings

@@ -1,6 +1,8 @@
 # Lambda関数リファレンス
 
-全11個の Lambda 関数の仕様、入出力、設定の詳細。
+全 9 個の Lambda 関数の仕様、入出力、設定の詳細。
+
+> **order-executor** / **position-monitor** は [crypto-order](https://github.com/kiikun0530/crypto-order) リポジトリに移行しました
 
 ---
 
@@ -12,11 +14,9 @@
 |---|---|
 | `PRICES_TABLE` | 価格テーブル名 |
 | `SENTIMENT_TABLE` | センチメントテーブル名 |
-| `POSITIONS_TABLE` | ポジションテーブル名 |
-| `TRADES_TABLE` | 取引テーブル名 |
+| `POSITIONS_TABLE` | ポジションテーブル名（aggregator読取用、crypto-order管理） |
 | `SIGNALS_TABLE` | シグナルテーブル名 |
 | `ANALYSIS_STATE_TABLE` | 分析状態テーブル名 |
-| `COINCHECK_SECRET_ARN` | Coincheck API認証情報のARN |
 | `SLACK_WEBHOOK_URL` | Slack通知用Webhook |
 | `TRADING_PAIRS_CONFIG` | 通貨ペア設定JSON |
 | `SAGEMAKER_ENDPOINT` | SageMaker Serverless エンドポイント名 |
@@ -26,7 +26,6 @@
 | `MARKET_CONTEXT_TABLE` | マーケットコンテキストテーブル名 |
 | `TF_SCORES_TABLE` | TF別スコアテーブル名 |
 | `BEDROCK_MODEL_ID` | Bedrock LLMモデルID (センチメント分析) |
-| `MAX_POSITION_JPY` | 最大ポジション額（円） |
 
 ### 通貨ペア設定 (TRADING_PAIRS_CONFIG)
 
@@ -459,101 +458,9 @@ aggregator が DynamoDB signals テーブルに保存するシグナルデータ
 
 ---
 
-## order-executor
+## order-executor / position-monitor
 
-EventBridge 15分毎の定期起動で DynamoDB signals テーブルから最新シグナルを読み取り、Coincheck APIで成行注文を実行。
-
-| 項目 | 値 |
-|---|---|
-| トリガー | EventBridge (15分間隔) |
-| メモリ | 256MB |
-| タイムアウト | 60秒 |
-| DynamoDB | signals (R), positions (R/W), trades (W) |
-| 外部API | Coincheck |
-
-### バッチ注文処理
-
-aggregatorが DynamoDB signals テーブルに全通貨のBUY/SELL/HOLD判定を保存。order-executorはポジション・残高を確認して実際の注文を実行する。
-
-**処理順序**:
-1. **SELL先**: ポジションがあれば売却、なければスキップ（資金確保）
-2. **BUY**: スコア降順で処理、各通貨のポジション・残高を確認して購入
-
-**BUYが複数ある場合**:
-- スコア順（期待値の高い通貨が優先）
-- 各BUYで残高確認 → Kelly/フォールバック比率で投資額算出
-- 残高が減るため、優先度の低い通貨は自然と投資額が小さくなる
-- MIN_ORDER_JPY(¥500)未満になると購入されない
-
-**SELLが複数ある場合**:
-- ポジションがあれば順に売却
-- ポジションがない通貨はスキップ（無視）
-
-### 同一通貨重複防止
-
-BUY注文時、対象通貨のアクティブポジションが既に存在するかチェック。例:
-
-```
-ETH保有中にETHのBUYシグナル → 既にETH保有中のためスキップ（Slack通知）
-ETH保有中にBTCのBUYシグナル → 異なる通貨なのでBTC購入を実行
-```
-
-### Coincheck API 呼び出し
-
-```
-買い: POST /api/exchange/orders
-      { pair: "eth_jpy", order_type: "market_buy", market_buy_amount: "5000" }
-
-売り: POST /api/exchange/orders
-      { pair: "eth_jpy", order_type: "market_sell", amount: "0.01" }
-```
-
-認証: HMAC-SHA256 署名（Secrets Manager からキー取得）
-
-### 通貨別注文ルール
-
-Coincheck 取引所の通貨別最小注文数量・小数点以下桁数に基づき、売り注文時にバリデーションを実施。
-
-| 通貨 | 最小注文数量 | 小数点桁数 |
-|---|---|---|
-| BTC | 0.001 | 8桁 |
-| ETH | 0.001 | 8桁 |
-| XRP | 1.0 | 6桁 |
-| SOL | 0.01 | 8桁 |
-| DOGE | 1.0 | 2桁 |
-| AVAX | 0.01 | 8桁 |
-
-参考: [取引注文ルール](https://faq.coincheck.com/s/article/40218?language=ja) / [取引所手数料](https://coincheck.com/ja/exchange/fee) / [取引所 API](https://coincheck.com/ja/documents/exchange/api)
-
----
-
-## position-monitor
-
-5分間隔で全通貨のアクティブポジションを監視し、SL/TP判定を実行。
-
-| 項目 | 値 |
-|---|---|
-| トリガー | EventBridge (5分間隔) |
-| メモリ | 256MB |
-| タイムアウト | 60秒 |
-| DynamoDB | positions (R/W) |
-| 外部API | Coincheck (価格取得) |
-
-### 処理フロー
-
-1. `TRADING_PAIRS_CONFIG` の全通貨についてアクティブポジションを検索
-2. ポジションがあれば Coincheck API で現在価格を取得
-3. **ピーク価格追跡**: `highest_price` を更新し DynamoDB に永続化
-4. **連続トレーリングストップ**:
-   - ピーク利益 3-5% → ピークから 2.0% 下でSL
-   - ピーク利益 5-8% → ピークから 1.5% 下でSL
-   - ピーク利益 8-12% → ピークから 1.2% 下でSL
-   - ピーク利益 12%+ → ピークから 1.0% 下でSL
-   - 3%以上到達後は必ず建値以上を保証
-5. SL/TP 判定:
-   - 現在価格 <= ストップロス(参入-5%、またはトレーリングSL) → 売り指示
-   - 現在価格 >= テイクプロフィット(参入+30%) → 売り指示
-6. 売り指示時は SQS 経由で order-executor に送信（ORDER_QUEUE_URL が設定されている場合）または Slack 通知のみ
+→ [crypto-order リポジトリ](https://github.com/kiikun0530/crypto-order) に移行しました
 
 ---
 
@@ -590,7 +497,7 @@ CloudWatch Logs のエラーパターンを検知し、Slack通知を送信。
 
 | 項目 | 値 |
 |---|---|
-| トリガー | CloudWatch Subscription Filter (8 Lambda) |
+| トリガー | CloudWatch Subscription Filter (7 Lambda) |
 | メモリ | 256MB |
 | タイムアウト | 30秒 |
 | DynamoDB | analysis-state (R/W) |
@@ -701,12 +608,10 @@ market_score = fng_score × 0.30 + funding_score × 0.35 + dominance_score × 0.
 ```mermaid
 flowchart TD
     subgraph 定期実行
-        E2["5分毎"] --> PM["position-monitor"]
         E3["30分毎"] --> NC["news-collector"]
         E4["30分毎"] --> MC["market-context"]
         E5["TF別 15m/1h/4h/1d"] --> SF
         E6["15分毎"] --> META["aggregator(meta)"]
-        E7["15分毎"] --> OE["order-executor"]
     end
 
     subgraph Step Functions
@@ -735,17 +640,15 @@ flowchart TD
         AGG -->|"R"| DB_MC
         AGG -->|"R"| DB_TF
         AGG -->|"W"| DB_SIG["signals"]
-        AGG -->|"R"| DB_POS["positions"]
         META -->|"R"| DB_SIG
         META -->|"W"| DB_SIG
-        OE -->|"R"| DB_SIG
-        OE -->|"R/W"| DB_POS
-        OE -->|"W"| DB_T["trades"]
-        PM -->|"R"| DB_POS
     end
 
-    subgraph 注文実行
-        OE -->|"Coincheck API"| TRADE["取引"]
+    subgraph CryptoOrder["crypto-order リポ"]
+        OE["order-executor"] -->|"R"| DB_SIG
+        PM["position-monitor"] -->|"R"| DB_POS["positions"]
+        OE -->|"R/W"| DB_POS
+        OE -->|"W"| DB_T["trades"]
     end
 
     subgraph 監視・通知

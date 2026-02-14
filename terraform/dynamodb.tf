@@ -56,59 +56,8 @@ resource "aws_dynamodb_table" "sentiment" {
   }
 }
 
-# ポジションテーブル (TTL: クローズ後180日)
-resource "aws_dynamodb_table" "positions" {
-  name         = "${local.name_prefix}-positions"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "pair"
-  range_key    = "position_id"
-
-  attribute {
-    name = "pair"
-    type = "S"
-  }
-
-  attribute {
-    name = "position_id"
-    type = "S"
-  }
-
-  ttl {
-    attribute_name = "ttl"
-    enabled        = true
-  }
-
-  tags = {
-    Name = "${local.name_prefix}-positions"
-  }
-}
-
-# 取引履歴テーブル (TTL: 90日)
-resource "aws_dynamodb_table" "trades" {
-  name         = "${local.name_prefix}-trades"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "pair"
-  range_key    = "timestamp"
-
-  attribute {
-    name = "pair"
-    type = "S"
-  }
-
-  attribute {
-    name = "timestamp"
-    type = "N"
-  }
-
-  ttl {
-    attribute_name = "ttl"
-    enabled        = true
-  }
-
-  tags = {
-    Name = "${local.name_prefix}-trades"
-  }
-}
+# ポジション・取引テーブルは crypto-order リポジトリに移行
+# → https://github.com/kiikun0530/crypto-order
 
 # シグナルテーブル (TTL: 90日 - パフォーマンス分析用)
 resource "aws_dynamodb_table" "signals" {

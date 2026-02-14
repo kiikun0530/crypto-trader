@@ -47,6 +47,8 @@ resource "aws_iam_role_policy" "lambda_custom" {
     Version = "2012-10-17"
     Statement = [
       # DynamoDB フルアクセス (テーブル限定)
+      # ※ positions/trades テーブルは crypto-order リポジトリに移行
+      #   aggregator が positions を読み取り参照するため ReadOnly で残す
       {
         Effect = "Allow"
         Action = [
@@ -62,30 +64,30 @@ resource "aws_iam_role_policy" "lambda_custom" {
         Resource = [
           aws_dynamodb_table.prices.arn,
           aws_dynamodb_table.sentiment.arn,
-          aws_dynamodb_table.positions.arn,
-          aws_dynamodb_table.trades.arn,
           aws_dynamodb_table.signals.arn,
           aws_dynamodb_table.analysis_state.arn,
           aws_dynamodb_table.market_context.arn,
           aws_dynamodb_table.tf_scores.arn,
           "${aws_dynamodb_table.prices.arn}/index/*",
           "${aws_dynamodb_table.sentiment.arn}/index/*",
-          "${aws_dynamodb_table.positions.arn}/index/*",
-          "${aws_dynamodb_table.trades.arn}/index/*",
           "${aws_dynamodb_table.signals.arn}/index/*",
           "${aws_dynamodb_table.analysis_state.arn}/index/*",
           "${aws_dynamodb_table.market_context.arn}/index/*",
           "${aws_dynamodb_table.tf_scores.arn}/index/*"
         ]
       },
-      # Secrets Managerアクセス
+      # positions テーブル読み取り専用 (aggregator がSlack通知で使用)
+      # テーブル自体は crypto-order で管理
       {
         Effect = "Allow"
         Action = [
-          "secretsmanager:GetSecretValue"
+          "dynamodb:GetItem",
+          "dynamodb:Query",
+          "dynamodb:Scan"
         ]
         Resource = [
-          "arn:aws:secretsmanager:${var.aws_region}:${local.account_id}:secret:coincheck/*"
+          "arn:aws:dynamodb:${var.aws_region}:${local.account_id}:table/${local.name_prefix}-positions",
+          "arn:aws:dynamodb:${var.aws_region}:${local.account_id}:table/${local.name_prefix}-positions/index/*"
         ]
       },
       # SNSアクセス

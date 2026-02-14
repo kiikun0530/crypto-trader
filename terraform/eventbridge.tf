@@ -95,61 +95,8 @@ resource "aws_lambda_permission" "meta_aggregator" {
   source_arn    = aws_cloudwatch_event_rule.meta_aggregator.arn
 }
 
-# -----------------------------------------------------------------------------
-# 注文実行 (15分間隔 — メタアグリゲーター後にDynamoDBシグナル読み取り)
-# EventBridge → Lambda 直接起動
-# meta-aggregatorがシグナル保存後に実行されるよう、同じ15分間隔で起動
-# -----------------------------------------------------------------------------
-resource "aws_cloudwatch_event_rule" "order_executor" {
-  name                = "${local.name_prefix}-order-executor"
-  description         = "Execute orders based on latest signals every 15 minutes"
-  schedule_expression = "rate(15 minutes)"
-  state               = "ENABLED"
-
-  tags = {
-    Name = "${local.name_prefix}-order-executor"
-  }
-}
-
-resource "aws_cloudwatch_event_target" "order_executor" {
-  rule      = aws_cloudwatch_event_rule.order_executor.name
-  target_id = "OrderExecutorLambda"
-  arn       = aws_lambda_function.functions["order-executor"].arn
-}
-
-resource "aws_lambda_permission" "order_executor" {
-  statement_id  = "AllowEventBridgeOrderExecutor"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.functions["order-executor"].function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.order_executor.arn
-}
-
-# ポジション監視ルール (5分間隔)
-resource "aws_cloudwatch_event_rule" "position_monitor" {
-  name                = "${local.name_prefix}-position-monitor"
-  description         = "Monitor all open positions every 5 minutes"
-  schedule_expression = "rate(5 minutes)"
-  state               = "ENABLED"
-
-  tags = {
-    Name = "${local.name_prefix}-position-monitor"
-  }
-}
-
-resource "aws_cloudwatch_event_target" "position_monitor" {
-  rule      = aws_cloudwatch_event_rule.position_monitor.name
-  target_id = "PositionMonitorLambda"
-  arn       = aws_lambda_function.functions["position-monitor"].arn
-}
-
-resource "aws_lambda_permission" "position_monitor" {
-  statement_id  = "AllowEventBridgeInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.functions["position-monitor"].function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.position_monitor.arn
-}
+# 注文実行・ポジション監視は crypto-order リポジトリに移行
+# → https://github.com/kiikun0530/crypto-order
 
 # ニュース収集ルール (30分間隔 - CryptoPanic Growth Plan)
 resource "aws_cloudwatch_event_rule" "news_collection" {

@@ -9,12 +9,14 @@
 
 ## 🔴 Critical
 
-### ISSUE-001: order-executor の Timeout ドリフト ✅ 完了
+### ISSUE-001: order-executor の Timeout ドリフト ✅ 完了 → crypto-order に移行
 
 - **現状**: Terraform定義では `timeout = 60` だが AWS実値が 30秒にドリフトしていた
 - **対処**: `terraform apply -target` で 60秒に修正済み (2026-02-11)
 
 ### ISSUE-002: price-collector / position-monitor で 2/6-7 に大量エラー ⏭️ 無視
+
+- position-monitor は crypto-order に移行
 
 - **現状**: 2/6に1,130件、2/7に579件のエラー。2/8以降は0件で収束済み
 - **判断**: 一時的な障害で自然収束。対応不要
@@ -38,7 +40,9 @@
   - `main.tf` の backend ブロックを有効化（`use_lockfile = true`）
   - `terraform init -migrate-state` でローカル → S3 に移行完了
 
-### ISSUE-005: positions テーブルに TTL が設定されていない ✅ 完了
+### ISSUE-005: positions テーブルに TTL が設定されていない ✅ 完了 → crypto-order に移行
+
+- 現状は crypto-order リポジトリで管理
 
 - **現状**: positions テーブルに TTL を追加済み (2026-02-11)
 - **対処**:
@@ -85,11 +89,12 @@
 - **統合した項目**:
   - `TRADING_PAIRS` 設定パース（6サービスから統合）
   - `get_current_price()` Coincheck API呼び出し（3サービスから統合）
-  - `get_active_position()` ポジション取得（3サービスから統合）
-  - `get_currency_from_pair()` ユーティリティ
+  - `get_active_position()` ポジション取得（aggregator読取用に残す）
+  - `get_currency_from_pair()` ユーティリティ (crypto-orderに移行)
   - `send_slack_notification()` Slack通知送信
-  - テーブル名定数 (`PRICES_TABLE`, `POSITIONS_TABLE`, `TRADES_TABLE` 等)
-- **更新サービス**: price-collector, position-monitor, order-executor, aggregator, news-collector, warm-up
+  - テーブル名定数 (`PRICES_TABLE`, `POSITIONS_TABLE` 等)
+- **更新サービス**: price-collector, aggregator, news-collector, warm-up
+  - order-executor, position-monitor は crypto-order に移行
 - **デプロイ**: Lambda Layer + 全Lambda関数を `terraform apply` で更新済み
 
 ### ISSUE-014: `get_current_price()` 関数の重複定義 ✅ 完了
@@ -128,11 +133,11 @@
 
 | Issue | 内容 | ステータス |
 |-------|------|-----------|
-| ISSUE-001 | order-executor timeout | ✅ 完了 |
+| ISSUE-001 | order-executor timeout | ✅ 完了 (crypto-order) |
 | ISSUE-002 | price-collector エラー | ⏭️ 無視 |
 | ISSUE-003 | slack-notifier | ⏭️ 問題なし |
 | ISSUE-004 | tfstate S3移行 | ✅ 完了 |
-| ISSUE-005 | positions TTL | ✅ 完了 |
+| ISSUE-005 | positions TTL | ✅ 完了 (crypto-order) |
 | ISSUE-006 | DDBクエリ効率 | 📋 ISSUE-005で軽減 |
 | ISSUE-007 | IAM分離 | ⏭️ 無視 |
 | ISSUE-008 | Slack Webhook平文 | 📋 低優先 |
