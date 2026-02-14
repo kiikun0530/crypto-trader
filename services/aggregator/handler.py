@@ -1063,12 +1063,206 @@ def _extract_news_headlines(sentiment_result: dict) -> list:
         return Decimal('0')
 
 
+def _interpret_indicators(scored: dict) -> list:
+    """テクニカル指標を定性的な洞察に変換"""
+    ind = scored.get('indicators_detail', {})
+    insights = []
+
+    # RSI
+    rsi = ind.get('rsi')
+    if rsi is not None:
+        rsi_val = float(rsi)
+        if rsi_val > 70:
+            insights.append(f"RSI={rsi_val:.0f}で買われすぎゾーン突入 → 利確圧力・反転リスク上昇")
+        elif rsi_val > 60:
+            insights.append(f"RSI={rsi_val:.0f}で買い勢力がやや優勢")
+        elif rsi_val < 30:
+            insights.append(f"RSI={rsi_val:.0f}で売られすぎゾーン → 反発期待")
+        elif rsi_val < 40:
+            insights.append(f"RSI={rsi_val:.0f}で売り勢力がやや優勢")
+        else:
+            insights.append(f"RSI={rsi_val:.0f}で中立圏")
+
+    # ADX + レジーム
+    adx = ind.get('adx')
+    regime = ind.get('regime', 'neutral')
+    if adx is not None:
+        adx_val = float(adx)
+        if adx_val > 40:
+            insights.append(f"ADX={adx_val:.0f}: 非常に強いトレンドが発生中（{regime}相場）")
+        elif adx_val > 25:
+            insights.append(f"ADX={adx_val:.0f}: トレンドが明確（{regime}相場）")
+        else:
+            insights.append(f"ADX={adx_val:.0f}: 方向感が弱くレンジ気味")
+
+    # MACD モメンタム
+    macd_slope = ind.get('macd_histogram_slope')
+    macd_hist = ind.get('macd_histogram')
+    if macd_slope is not None and macd_hist is not None:
+        slope = float(macd_slope)
+        hist = float(macd_hist)
+        if hist > 0 and slope > 0:
+            insights.append("MACD: 強気モメンタム加速中")
+        elif hist > 0 and slope < 0:
+            insights.append("MACD: 強気だがモメンタム鈍化 → ピークアウトの兆し")
+        elif hist < 0 and slope < 0:
+            insights.append("MACD: 弱気モメンタム加速中")
+        elif hist < 0 and slope > 0:
+            insights.append("MACD: 弱気だが下げ勢い鈍化 → 底打ちの兆し")
+
+    # BB位置（価格がバンドのどこにあるか）
+    bb_upper = ind.get('bb_upper', 0)
+    bb_lower = ind.get('bb_lower', 0)
+    price = ind.get('current_price', 0)
+    if price and bb_upper and bb_lower and float(bb_upper) > float(bb_lower):
+        bb_range = float(bb_upper) - float(bb_lower)
+        bb_pos = (float(price) - float(bb_lower)) / bb_range
+        if bb_pos > 0.9:
+            insights.append("価格がBB上限に接近（ブレイクアウトまたは反落の分岐点）")
+        elif bb_pos < 0.1:
+            insights.append("価格がBB下限に接近（反発またはブレイクダウンの分岐点）")
+
+    # SMA200 長期トレンド & ゴールデンクロス
+    sma_200 = ind.get('sma_200')
+    golden_cross = ind.get('golden_cross')
+    if sma_200 and price:
+        if float(price) > float(sma_200):
+            insights.append("SMA200の上を推移（長期上昇トレンド内）")
+        else:
+            insights.append("SMA200を下回る（長期下降トレンド内）")
+    if golden_cross:
+        insights.append("ゴールデンクロス発生中")
+
+    # 出来高
+    volume_mult = ind.get('volume_multiplier')
+    if volume_mult is not None:
+        vm = float(volume_mult)
+        if vm > 2.0:
+            insights.append(f"出来高が平均の{vm:.1f}倍 → 高い関心、シグナルの信頼度が高い")
+        elif vm < 0.5:
+            insights.append(f"出来高が平均の{vm:.1f}倍と低迷 → ブレイク方向の信頼度は低い")
+
+    return insights
+
+
+def _interpret_chronos(scored: dict) -> list:
+    """Chronos AI予測を定性的に解釈"""
+    chr_d = scored.get('chronos_detail', {})
+    insights = []
+
+    pred_pct = chr_d.get('predicted_change_pct')
+    conf = chr_d.get('confidence')
+    if pred_pct is not None:
+        pct = float(pred_pct)
+        conf_label = ""
+        if conf is not None:
+            conf_val = float(conf)
+            conf_label = "高確信" if conf_val > 0.7 else "中確信" if conf_val > 0.4 else "低確信"
+        else:
+            conf_label = "確信度不明"
+
+        if abs(pct) < 0.1:
+            insights.append(f"AI予測: ほぼ横ばい（{pct:+.2f}%、{conf_label}）")
+        elif pct > 1.0:
+            insights.append(f"AI予測: {pct:+.2f}%の大幅上昇を予想（{conf_label}）")
+        elif pct > 0:
+            insights.append(f"AI予測: {pct:+.2f}%の上昇を予想（{conf_label}）")
+        elif pct < -1.0:
+            insights.append(f"AI予測: {pct:+.2f}%の大幅下落を予想（{conf_label}）")
+        else:
+            insights.append(f"AI予測: {pct:+.2f}%の下落を予想（{conf_label}）")
+
+        # 予測レンジ（不確実性）
+        q10 = chr_d.get('q10_change_pct')
+        q90 = chr_d.get('q90_change_pct')
+        if q10 is not None and q90 is not None:
+            spread = float(q90) - float(q10)
+            if spread > 5:
+                insights.append(f"予測レンジ幅{spread:.1f}%と広く不確実性が高い")
+            elif spread < 1:
+                insights.append(f"予測レンジ幅{spread:.1f}%と狭く方向感に確信")
+
+    return insights
+
+
+def _interpret_market_context(scored: dict) -> list:
+    """市場環境データを定性的に解釈"""
+    mkt = scored.get('market_context_detail', {})
+    insights = []
+
+    fng = mkt.get('fng_value')
+    if fng is not None:
+        fng_val = int(fng)
+        if fng_val <= 20:
+            insights.append(f"Fear & Greed={fng_val}: 極度の恐怖（逆張り買いの好機の可能性）")
+        elif fng_val <= 35:
+            insights.append(f"Fear & Greed={fng_val}: 恐怖優勢")
+        elif fng_val >= 80:
+            insights.append(f"Fear & Greed={fng_val}: 極度の貪欲（天井警戒）")
+        elif fng_val >= 65:
+            insights.append(f"Fear & Greed={fng_val}: 楽観ムード")
+        else:
+            insights.append(f"Fear & Greed={fng_val}: 中立")
+
+    btc_dom = mkt.get('btc_dominance')
+    if btc_dom is not None:
+        insights.append(f"BTC Dominance={float(btc_dom):.1f}%")
+
+    return insights
+
+
+def _interpret_multi_tf(scored: dict) -> list:
+    """マルチタイムフレームの方向性を定性的に解釈"""
+    tf_breakdown = scored.get('tf_breakdown', {})
+    insights = []
+    if not tf_breakdown:
+        return insights
+
+    # 各TFのシグナル集約
+    tf_signals = {}
+    for tf in ['15m', '1h', '4h', '1d']:
+        if tf in tf_breakdown:
+            tf_signals[tf] = tf_breakdown[tf].get('signal', 'HOLD')
+
+    buy_tfs = [tf for tf, s in tf_signals.items() if s == 'BUY']
+    sell_tfs = [tf for tf, s in tf_signals.items() if s == 'SELL']
+
+    if buy_tfs and not sell_tfs:
+        insights.append(f"{', '.join(buy_tfs)}が買いシグナル → 全体的に強気")
+    elif sell_tfs and not buy_tfs:
+        insights.append(f"{', '.join(sell_tfs)}が売りシグナル → 全体的に弱気")
+    elif buy_tfs and sell_tfs:
+        insights.append(f"買い({', '.join(buy_tfs)})と売り({', '.join(sell_tfs)})で時間軸間に方向乖離")
+
+    # 短期 vs 長期
+    short_tfs = {tf: tf_breakdown[tf] for tf in ['15m', '1h'] if tf in tf_breakdown}
+    long_tfs = {tf: tf_breakdown[tf] for tf in ['4h', '1d'] if tf in tf_breakdown}
+    if short_tfs and long_tfs:
+        short_avg = sum(d['score'] for d in short_tfs.values()) / len(short_tfs)
+        long_avg = sum(d['score'] for d in long_tfs.values()) / len(long_tfs)
+        if short_avg > 0.01 and long_avg < -0.01:
+            insights.append("短期はリバウンド局面だが上位トレンドは下向き → 戻り売りに注意")
+        elif short_avg < -0.01 and long_avg > 0.01:
+            insights.append("短期の下押しは一時的で長期トレンドは上向き → 押し目買いの好機か")
+        elif short_avg > 0.01 and long_avg > 0.01:
+            insights.append("短期・長期ともに強気で一致 → トレンドの信頼度が高い")
+        elif short_avg < -0.01 and long_avg < -0.01:
+            insights.append("短期・長期ともに弱気で一致 → 下落トレンドの信頼度が高い")
+        else:
+            insights.append("短期・長期ともに方向感が弱く中立")
+
+    return insights
+
+
 def generate_ai_comment(scored: dict, thresholds: dict) -> str:
-    """Bedrock (Nova Micro) で総合評価コメントを日本語で生成"""
+    """Bedrock (Claude 3.5 Haiku) で専門家レベルの分析コメントを生成
+
+    数値スコアは一切含めず、定性的な市場解釈を提供する。
+    指標値（RSI, ADX, F&G等）は意味のある文脈でのみ引用。
+    """
     try:
         pair = scored.get('pair', 'unknown')
         coin_name = TRADING_PAIRS.get(pair, {}).get('name', pair.upper())
-        comp = scored.get('components', {})
         total = scored.get('total_score', 0)
 
         # シグナル判定
@@ -1077,120 +1271,63 @@ def generate_ai_comment(scored: dict, thresholds: dict) -> str:
             signal = 'BUY'
         elif total <= thresholds.get('sell', BASE_SELL_THRESHOLD):
             signal = 'SELL'
+        signal_jp = {'BUY': '買い', 'SELL': '売り', 'HOLD': '様子見'}[signal]
 
-        # 根拠データ
-        ind = scored.get('indicators_detail', {})
-        chr_d = scored.get('chronos_detail', {})
+        # === 各データソースを定性的に解釈（Python側で前処理） ===
+        tech_insights = _interpret_indicators(scored)
+        ai_insights = _interpret_chronos(scored)
+        mkt_insights = _interpret_market_context(scored)
+        tf_insights = _interpret_multi_tf(scored)
+
+        # ニュースヘッドライン
         news = scored.get('news_headlines', [])
-        mkt = scored.get('market_context_detail', {})
+        news_items = [f"「{n.get('title', '')}」" for n in news[:3] if n.get('title')]
 
-        # マルチTFブレークダウン
-        tf_breakdown = scored.get('tf_breakdown', {})
-        alignment = scored.get('alignment', 'unknown')
-
-        # レジーム別ウェイト
-        regime = ind.get('regime', 'neutral')
-        if regime == 'trending':
-            regime_label = 'トレンド相場'
-            weight_desc = 'MACD/SMA重視(35%ずつ)、RSI/BB軽視(15%ずつ)'
-        elif regime == 'ranging':
-            regime_label = 'レンジ相場'
-            weight_desc = 'RSI/BB重視(35%ずつ)、MACD/SMA軽視(15%ずつ)'
-        else:
-            regime_label = '中間'
-            weight_desc = '均等(各25%)'
-
-        # プロンプトに渡す材料
-        buy_th = thresholds.get('buy', BASE_BUY_THRESHOLD)
-        sell_th = thresholds.get('sell', BASE_SELL_THRESHOLD)
-
-        # シグナル理由
-        if signal == 'BUY':
-            signal_reason = f'総合スコア{total:+.3f}がBUY閾値{buy_th:+.2f}以上のため買いシグナル'
-        elif signal == 'SELL':
-            signal_reason = f'総合スコア{total:+.3f}がSELL閾値{sell_th:+.2f}以下のため売りシグナル'
-        else:
-            signal_reason = f'総合スコア{total:+.3f}はBUY閾値{buy_th:+.2f}とSELL閾値{sell_th:+.2f}の間でHOLD'
-
+        # === 定性データをプロンプトに構成 ===
+        NL = '\n'
         materials = f"""通貨: {coin_name}
-シグナル判定: {signal} — {signal_reason}
-レジーム: {regime_label}（ADX={ind.get('adx', 'N/A')}）→ {weight_desc}
-テクニカル: {comp.get('technical', 0):+.3f} (RSI={ind.get('rsi', 'N/A')}, ADX={ind.get('adx', 'N/A')})
-AI予測: {comp.get('chronos', 0):+.3f} (変化率={chr_d.get('predicted_change_pct', 'N/A')}%, 確信度={chr_d.get('confidence', 'N/A')})
-センチメント: {comp.get('sentiment', 0):+.3f}
-市場環境: {comp.get('market_context', 0):+.3f} (F&G={mkt.get('fng_value', 'N/A')}, BTC Dom={mkt.get('btc_dominance', 'N/A')}%)
-TF整合性: {alignment}"""
+シグナル判定: {signal_jp}
 
-        # マルチTFブレークダウン（シグナル名を明記）
-        if tf_breakdown:
-            tf_lines = []
-            for tf in ['15m', '1h', '4h', '1d']:
-                if tf in tf_breakdown:
-                    tf_data = tf_breakdown[tf]
-                    w = tf_data.get('weight', 0)
-                    tf_sig = tf_data.get('signal', 'HOLD')
-                    tf_comp = tf_data.get('components', {})
-                    tf_lines.append(
-                        f"  {tf}: シグナル={tf_sig}, score={tf_data['score']:+.4f}, weight={w:.0%}"
-                        f" (tech={tf_comp.get('technical', 0):+.3f}, chronos={tf_comp.get('chronos', 0):+.3f},"
-                        f" sent={tf_comp.get('sentiment', 0):+.3f}, mkt={tf_comp.get('market_context', 0):+.3f})"
-                    )
-            if tf_lines:
-                materials += "\nTFブレークダウン:\n" + '\n'.join(tf_lines)
+【テクニカル分析】
+{NL.join('・' + i for i in tech_insights) if tech_insights else '・データ不足'}
 
-            # TF間の方向性分析
-            tf_signals = {tf: tf_breakdown[tf].get('signal', 'HOLD') for tf in ['15m', '1h', '4h', '1d'] if tf in tf_breakdown}
-            buy_tfs = [tf for tf, s in tf_signals.items() if s == 'BUY']
-            sell_tfs = [tf for tf, s in tf_signals.items() if s == 'SELL']
-            hold_tfs = [tf for tf, s in tf_signals.items() if s == 'HOLD']
-            materials += f"\nTFシグナル集計: BUY={buy_tfs or 'なし'}, SELL={sell_tfs or 'なし'}, HOLD={hold_tfs or 'なし'}"
+【AI予測（Chronos）】
+{NL.join('・' + i for i in ai_insights) if ai_insights else '・データ不足'}
 
-            # 短期 vs 長期の方向性比較
-            short_tfs = {tf: tf_breakdown[tf] for tf in ['15m', '1h'] if tf in tf_breakdown}
-            long_tfs = {tf: tf_breakdown[tf] for tf in ['4h', '1d'] if tf in tf_breakdown}
-            if short_tfs and long_tfs:
-                short_avg = sum(d['score'] for d in short_tfs.values()) / len(short_tfs)
-                long_avg = sum(d['score'] for d in long_tfs.values()) / len(long_tfs)
-                if short_avg > 0.01 and long_avg > 0.01:
-                    tf_relation = "短期・長期ともに強気方向で一致"
-                elif short_avg < -0.01 and long_avg < -0.01:
-                    tf_relation = "短期・長期ともに弱気方向で一致"
-                elif short_avg > 0.01 and long_avg < -0.01:
-                    tf_relation = "短期は強気だが長期は弱気で乖離あり"
-                elif short_avg < -0.01 and long_avg > 0.01:
-                    tf_relation = "短期は弱気だが長期は強気で乖離あり"
-                else:
-                    tf_relation = "短期・長期ともに方向感が弱く中立"
-                materials += f"\n短期(15m,1h)平均={short_avg:+.4f} vs 長期(4h,1d)平均={long_avg:+.4f} → {tf_relation}"
+【市場環境】
+{NL.join('・' + i for i in mkt_insights) if mkt_insights else '・データ不足'}
 
-        if news:
-            headlines = '\n'.join(f"  - {n.get('title', '')} (score: {n.get('score', 0.5)})" for n in news[:3])
-            materials += f"\n主要ニュース:\n{headlines}"
+【マルチタイムフレーム分析】
+{NL.join('・' + i for i in tf_insights) if tf_insights else '・データ不足'}"""
 
-        prompt = f"""あなたは仮想通貨のアナリストです。以下のマルチタイムフレーム分析データから、個人投資家向けに2-3文の簡潔な日本語コメントを生成してください。
+        if news_items:
+            materials += f"\n\n【最近のニュース】\n{'、'.join(news_items)}"
+
+        prompt = f"""あなたはヘッジファンドの仮想通貨トレーディングデスクのシニアアナリストです。
+以下の分析データから市場の「物語」を読み取り、個人投資家向けの分析コメントを日本語で作成してください。
 
 {materials}
 
-ルール:
-- 敬体（です・ます調）で書く
-- なぜそのシグナル（BUY/SELL/HOLD）になったかを閾値と主要因を引用して説明する
-- 各TFのシグナル名（BUY/SELL/HOLD）は「TFブレークダウン」に記載された通りに正確に引用すること。スコアが負でもシグナルがHOLDならHOLDと書け。絶対に捏造しないでください
-- 短期(15m,1h)と長期(4h,1d)の方向性の一致・乖離に言及すること
-- データに基づいた客観的な分析を述べる
-- 200文字以内に収める"""
+【コメント作成ルール】
+1. 今の相場状況を一言で特徴づけてから始める（例:「調整局面入りの兆しです」「底固めからの反発初動と見られます」）
+2. 最も重要な根拠を1-2点だけ挙げる。数値の羅列ではなく「なぜそれが重要か」を説明すること
+3. リスクや注意点を1点挙げる（反対シナリオの可能性）
+4. 数値スコアや閾値の数字は絶対に書かない。指標値（RSI, ADX, Fear&Greed）だけ自然に引用してよい
+5. です・ます調で3文以内、300文字以内
+6. シグナル判定「{signal_jp}」の根拠を自然に織り込む"""
 
         response = bedrock.converse(
             modelId=BEDROCK_MODEL_ID,
             messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig={"maxTokens": 200, "temperature": 0.3},
+            inferenceConfig={"maxTokens": 400, "temperature": 0.4},
         )
 
         comment = response['output']['message']['content'][0]['text'].strip()
         # 改行を除去して1行にする
         comment = comment.replace('\n', ' ').strip()
         # 長すぎる場合は切り詰め
-        if len(comment) > 250:
-            comment = comment[:247] + '...'
+        if len(comment) > 350:
+            comment = comment[:347] + '...'
 
         tokens_in = response.get('usage', {}).get('inputTokens', 0)
         tokens_out = response.get('usage', {}).get('outputTokens', 0)

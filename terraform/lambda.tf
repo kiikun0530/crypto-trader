@@ -113,7 +113,7 @@ locals {
     MODEL_BUCKET           = "${local.name_prefix}-sagemaker-models-${local.account_id}"
     MODEL_PREFIX           = "chronos-onnx"
     SAGEMAKER_ENDPOINT     = "${local.name_prefix}-chronos-base"
-    BEDROCK_MODEL_ID       = "apac.amazon.nova-micro-v1:0"
+    BEDROCK_MODEL_ID       = "apac.anthropic.claude-3-5-haiku-20241022-v1:0"
   }
 }
 
