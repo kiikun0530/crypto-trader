@@ -135,7 +135,7 @@ resource "aws_iam_role_policy" "lambda_custom" {
           "arn:aws:s3:::${local.name_prefix}-daily-reports-${local.account_id}/*"
         ]
       },
-      # Bedrock: LLMセンチメント分析 (news-collector)
+      # Bedrock: LLMセンチメント分析 (news-collector) + AIコメント (aggregator)
       {
         Effect = "Allow"
         Action = [
@@ -143,7 +143,8 @@ resource "aws_iam_role_policy" "lambda_custom" {
           "bedrock:Converse"
         ]
         Resource = [
-          "arn:aws:bedrock:${var.aws_region}::foundation-model/anthropic.claude-*",
+          # APAC inference profile は複数リージョンにルーティングするため * 必須
+          "arn:aws:bedrock:*::foundation-model/anthropic.claude-*",
           "arn:aws:bedrock:*::foundation-model/amazon.nova-*",
           "arn:aws:bedrock:${var.aws_region}:${local.account_id}:inference-profile/apac.amazon.nova-*",
           "arn:aws:bedrock:${var.aws_region}:${local.account_id}:inference-profile/apac.anthropic.claude-*"
