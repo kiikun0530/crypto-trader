@@ -56,7 +56,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | テーブル | TTL | 用途 |
 |----------|-----|------|
 | prices | TF別 (14d-365d) | 全通貨×全TFの価格履歴 |
-| tf-scores | 24時間 | TF別スコア保存 |
+| tf-scores | TF別 (14d-365d) | TF別スコア保存 |
 | sentiment | 14日 | センチメントスコア |
 | signals | 90日 | 売買シグナル履歴 |
 | analysis_state | - | 分析状態管理 |

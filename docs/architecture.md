@@ -61,7 +61,7 @@ flowchart LR
         DB_SIGNALS[("​signals<br/>pair=PK, TTL:90日")]
         DB_STATE[("​analysis_state<br/>pair=PK")]
         DB_MKTCTX[("​market-context<br/>context_type=PK, TTL:14日")]
-        DB_TFSCORES[("​tf-scores<br/>pair_tf=PK, TTL:24h")]
+        DB_TFSCORES[("​tf-scores<br/>pair_tf=PK, TTL:TF別")]
     end
 
     subgraph CryptoOrder["crypto-order リポ (2 Tables)"]
@@ -317,7 +317,7 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
 | テーブル | PK | SK | TTL | 用途 |
 |---|---|---|---|---|
 | prices | pair_tf (S) 例: btc_usdt#1h | timestamp (N) | TF別 (14d/30d/90d/250d) | 全通貨×全TFの価格履歴 |
-| tf-scores | pair_tf (S) 例: btc_usdt#1h | timestamp (N) | 24時間 | TF別スコア保存 |
+| tf-scores | pair_tf (S) 例: btc_usdt#1h | timestamp (N) | TF別 (14d/30d/90d/365d) | TF別スコア保存 |
 | sentiment | pair (S) | timestamp (N) | 14日 | 通貨別センチメントスコア |
 | signals | pair (S) | timestamp (N) | 90日 | 分析シグナル履歴 |
 | analysis_state | pair (S) | - | - | 通貨別の最終分析時刻 |
@@ -333,7 +333,10 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
 | prices (1h) | 30日 | 336本×1h = 14日分、余裕あり |
 | prices (4h) | 90日 | 336本×4h = 56日分、余裕あり |
 | prices (1d) | 365日 | SMA200(250日)+余裕を持って1年分保持 |
-| tf-scores | 24時間 | 最新スコアのみ必要、古いデータはstalenessで除外 |
+| tf-scores (15m) | 14日 | prices(15m)と同じ期間、チャートマーカー表示用 |
+| tf-scores (1h) | 30日 | prices(1h)と同じ期間 |
+| tf-scores (4h) | 90日 | prices(4h)と同じ期間、パフォーマンス分析にも活用 |
+| tf-scores (1d) | 365日 | prices(1d)と同じ期間 |
 | sentiment | 14日 | ニュース相関分析に2週間分必要 |
 | signals | 90日 | パフォーマンス分析用に長めに保持 |
 | analysis_state | なし | 分析状態は永続保存 |
