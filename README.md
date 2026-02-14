@@ -4,15 +4,15 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 
 ## 概要
 
-6通貨（ETH / BTC / XRP / SOL / DOGE / AVAX）を同時に分析し、最も期待値の高い通貨を自動で選択・売買する。
+3通貨（BTC / ETH / XRP）を同時に分析し、最も期待値の高い通貨を自動で選択・売買する。
 
-- **対象通貨**: 6通貨（Binance + Coincheck 両対応の銘柄を厳選）
-- **価格データ**: Binance API（5分足 OHLC × 6通貨）
+- **対象通貨**: 3通貨（Binance + Coincheck 両対応の高流動性銘柄を厳選）
+- **価格データ**: Binance API（マルチタイムフレーム OHLCV × 3通貨 × 4TF）
 - **取引執行**: Coincheck API（各通貨/JPY）
 - **テクニカル分析**: SMA20/200、RSI、MACD、ボリンジャーバンド、ADX、ATR
 - **レジーム検知**: ADXによるトレンド/レンジ判定、適応型ウェイト
 - **ニュースセンチメント**: CryptoPanic API（全通貨一括取得 + BTC相関分析）
-- **時系列予測**: Amazon Chronos-T5-Tiny（ONNX Runtime on Lambda）
+- **時系列予測**: Amazon Chronos-2 (120M) on SageMaker Serverless Endpoint
 - **ポジション管理**: 複数通貨同時保有対応（SELL優先 → 未保有通貨をBUY）
 - **リスク管理**: SL/TP + トレーリングストップ + サーキットブレーカー
 - **通知**: Slack Webhook（全通貨ランキング付き）
@@ -24,60 +24,62 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
   - [docs/trading-strategy.md](docs/trading-strategy.md) — 売買戦略・スコアリング
   - [docs/lambda-reference.md](docs/lambda-reference.md) — Lambda関数リファレンス
   - [docs/bugfix-history.md](docs/bugfix-history.md) — バグ修正履歴・設計原則
-  - [docs/system-status-v1.md](docs/system-status-v1.md) — 現行システムステータス & 評価ベースライン
-  - [docs/trading-logic-improvement-plan.md](docs/trading-logic-improvement-plan.md) — 改善企画書 (10項目実装済)
+  - [docs/improvement-issues.md](docs/improvement-issues.md) — 改善課題
 
 > GitHub上でMermaidダイアグラムがレンダリングされます
 
-### 対象通貨（6通貨）
+### 対象通貨（3通貨）
 
 | 通貨 | Binanceペア | Coincheckペア | 選定理由 |
 |------|------------|--------------|----------|
+| BTC | BTCUSDT | btc_jpy | 市場牽引力、最高流動性 |
 | ETH | ETHUSDT | eth_jpy | DeFi基盤、高流動性 |
-| BTC | BTCUSDT | btc_jpy | 市場牽引力、Coincheck対応 |
 | XRP | XRPUSDT | xrp_jpy | 送金特化、高速決済 |
-| SOL | SOLUSDT | sol_jpy | 高速L1、DeFi/NFT基盤 |
-| DOGE | DOGEUSDT | doge_jpy | 高流動性、ミーム経済 |
-| AVAX | AVAXUSDT | avax_jpy | 高速L1、DeFi成長 |
 
-### Lambda関数（10個）
+### Lambda関数（11個）
 
 | 関数名 | 役割 | 実行間隔 |
 |--------|------|----------|
-| price-collector | 全6通貨の価格取得・変動検知 | 5分 |
-| technical | テクニカル指標計算（RSI, MACD, SMA, BB, ADX, ATR） | Step Functions (×6) |
-| chronos-caller | AI時系列予測 (ONNX Runtime, Chronos-T5-Tiny) | Step Functions (×6) |
-| sentiment-getter | 通貨別センチメントスコア取得 | Step Functions (×6) |
-| aggregator | 全通貨スコアリング・ランキング・売買判定 | Step Functions |
-| order-executor | Coincheckで成行注文実行（同一通貨重複防止） | SQSトリガー |
-| position-monitor | 全通貨のSL(-5%)/TP(+10%)/トレーリングストップ監視 | 5分 |
+| price-collector | TF別全通貨の価格収集 | Step Functions (Phase 1) |
+| technical | テクニカル指標計算（RSI, MACD, SMA, BB, ADX, ATR） | Step Functions (×3) |
+| chronos-caller | AI時系列予測 (SageMaker Serverless, Chronos-2 120M) | Step Functions (×3) |
+| sentiment-getter | 通貨別センチメントスコア取得 | Step Functions (×3) |
+| aggregator | TFスコア保存 / メタ集約・ランキング・売買判定（デュアルモード） | Step Functions / EventBridge 15分 |
+| order-executor | Coincheckで成行注文実行（同一通貨重複防止） | EventBridge 15分 |
+| position-monitor | 全通貨のSL(-5%)/TP(+30%)/トレーリングストップ監視 | 5分 |
 | news-collector | 全通貨ニュース一括取得・BTC相関分析 | 30分 |
-| error-remediator | Lambdaエラー検知→Slack通知→自動修復 | CloudWatch Logs |
+| market-context | F&G / Funding Rate / BTC Dominance 収集 | 30分 |
+| error-remediator | Lambdaエラー検知→Slack通知 | CloudWatch Logs |
 | warm-up | 全通貨の初回データ投入（手動） | - |
 
-### DynamoDBテーブル（6個）
+### DynamoDBテーブル（8個）
 
 | テーブル | TTL | 用途 |
 |----------|-----|------|
-| prices | 14日 | 価格履歴 |
+| prices | TF別 (14d-365d) | 全通貨×全TFの価格履歴 |
+| tf-scores | 24時間 | TF別スコア保存 |
 | sentiment | 14日 | センチメントスコア |
 | signals | 90日 | 売買シグナル履歴 |
 | positions | - | ポジション管理 |
-| trades | - | 取引履歴 |
+| trades | 90日 | 取引履歴 |
 | analysis_state | - | 分析状態管理 |
+| market-context | 14日 | マクロ市場環境指標 |
 
 ## 推定コスト
 
-### AWSインフラ費用（6通貨分析時）
+### AWSインフラ費用（3通貨 × 4TF分析時）
 
 | 項目 | 月額 |
 |------|------|
-| Lambda | ~$5.00 |
+| Lambda | ~$4.00 |
 | DynamoDB | ~$0.30 |
-| Step Functions | ~$0.10 |
-| CloudWatch | ~$0.50 |
+| Bedrock (Amazon Nova Micro) | ~$2.00 |
+| SageMaker Serverless (Chronos-2) | ~$3-8 |
+| Step Functions | ~$0.15 |
+| CloudWatch | ~$0.55 |
 | Secrets Manager | ~$0.50 |
-| **合計** | **~$7** |
+| SNS/EventBridge | ~$0.05 |
+| **合計** | **~$11/月** |
 
 > 詳細な計算式は [docs/architecture.md](docs/architecture.md) を参照
 
@@ -85,11 +87,12 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 
 | API | 費用 | 備考 |
 |-----|------|------|
-| Binance | 無料 | 価格データ取得のみ（認証不要） |
+| Binance | 無料 | 価格データ + ファンディングレート取得（認証不要） |
+| Alternative.me / CoinGecko | 無料 | F&G Index / BTC Dominance |
 | CryptoPanic | 無料 or $199/月 | Growth Planでリアルタイムニュース取得 |
 | Coincheck | 0% | 取引所取引は手数料無料 |
 
-> **総コスト目安**: 無料構成 ~$7/月、Growth Plan ~$206/月
+> **総コスト目安**: 無料構成 ~$11/月、Growth Plan ~$210/月
 
 ## 前提条件
 
@@ -166,7 +169,7 @@ cp terraform.tfvars.example terraform.tfvars
 environment          = "prod"
 aws_region           = "ap-northeast-1"
 volatility_threshold = 0.3        # 価格変動閾値（%）
-max_position_jpy     = 100000     # 最大ポジション（円）
+max_position_jpy     = 15000      # 最大ポジション（円）
 slack_webhook_url    = "https://hooks.slack.com/services/xxx/xxx/xxx"
 cryptopanic_api_key  = ""         # オプション
 ```
@@ -179,25 +182,19 @@ terraform plan
 terraform apply
 ```
 
-### 8. Chronos ONNXモデルの準備
+### 8. SageMaker Chronos-2 のデプロイ
 
 ```bash
-# ONNX変換に必要なパッケージをインストール
-pip install torch transformers chronos-forecasting "optimum[onnxruntime]"
-
-# Chronos-T5-Tiny を ONNX 形式に変換
-python scripts/convert_chronos_onnx.py
-
-# 変換したモデルを S3 にアップロード
-aws s3 sync models/chronos-onnx/ s3://eth-trading-sagemaker-models-$(aws sts get-caller-identity --query Account --output text)/chronos-onnx/
+# Chronos-2 モデルを SageMaker Serverless Endpoint にデプロイ
+python scripts/deploy_sagemaker_chronos.py
 ```
 
-> ONNX変換は初回のみ必要です。モデルファイル（~62.5MB）は `.gitignore` で除外されています。
+> 初回デプロイ時のみ必要です。SageMaker Serverless のクォータ申請（MaxConcurrency上限）が事前に必要な場合があります。
 
 ### 9. 初回データ投入
 
 ```bash
-# 全6通貨の過去1000件の価格データを一括投入
+# 全3通貨の過去データを一括投入
 aws lambda invoke \
   --function-name eth-trading-warm-up \
   --payload '{}' \
@@ -230,15 +227,15 @@ aws dynamodb scan \
 aws logs tail /aws/lambda/eth-trading-price-collector --since 5m
 ```
 
-## 監視・自動修復
+## 監視・通知
 
 ### CloudWatch 監視
 
-- **Metric Alarms (18個)**: 全10 Lambda × Errors + 主要Lambda × Duration
-- **Subscription Filters (8個)**: warm-up以外の全Lambdaのエラーログをリアルタイム検知
+- **Metric Alarms (20個)**: 全10 Lambda × (Errors + Duration)
+- **Subscription Filters (9個)**: warm-up以外の全Lambdaのエラーログをリアルタイム検知
 - 異常検知時は即座に Slack 通知
 
-### Claude AI 自動修復パイプライン
+### エラー検知パイプライン
 
 ```
 CloudWatch Logs → Subscription Filter → error-remediator Lambda
@@ -250,15 +247,15 @@ CloudWatch Logs → Subscription Filter → error-remediator Lambda
 
 ## スコアベースの投資ロジック
 
-シグナルスコアに応じて投資金額が自動調整されます：
+シグナルスコアに応じて投資金額が自動調整されます（Kelly Criterion 適用、トレード履歴5件未満時はフォールバック比率）：
 
-| スコア | 投資比率 | 説明 |
+| スコア | フォールバック投資比率 | 説明 |
 |--------|----------|------|
-| 0.45+ | 100% | 非常に強気 |
-| 0.35-0.45 | 75% | 強気 |
-| 0.25-0.35 | 50% | やや強気 |
-| 0.15-0.25 | 30% | 弱気 |
-| 0.15未満 | 0% | 注文なし |
+| 0.45+ | 60% | 非常に強いシグナル |
+| 0.35-0.45 | 45% | 強いシグナル |
+| 0.25-0.35 | 30% | 中程度のシグナル |
+| 0.15-0.25 | 20% | 弱いシグナル |
+| 0.15未満 | 0% | 見送り |
 
 ## 手数料
 
@@ -302,19 +299,19 @@ crypto-trader/
 │   ├── order-executor/
 │   ├── position-monitor/
 │   ├── news-collector/
+│   ├── market-context/
 │   ├── error-remediator/
 │   └── warm-up/
 ├── scripts/
-│   └── convert_chronos_onnx.py  # ONNX変換スクリプト
+│   ├── convert_chronos_onnx.py  # ONNX変換スクリプト（レガシー）
+│   └── deploy_sagemaker_chronos.py  # SageMaker Chronos-2 デプロイスクリプト
 ├── models/
-│   └── chronos-onnx/            # ONNX変換済みモデル (gitignore対象)
 ├── docs/
 │   ├── architecture.md     # システム構成・設計思想
 │   ├── trading-strategy.md # 売買戦略・スコアリング
     ├── lambda-reference.md # Lambda関数リファレンス
-    ├── bugfix-history.md   # バグ修正履歴
-    ├── system-status-v1.md # 現行システムステータス & 評価ベースライン
-    └── trading-logic-improvement-plan.md  # 改善企画書
+    ├── bugfix-history.md       # バグ修正履歴
+    └── improvement-issues.md   # 改善課題
 └── README.md
 ```
 

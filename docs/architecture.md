@@ -9,7 +9,7 @@ Crypto Trader のシステム構成と技術選定を説明するドキュメン
 
 ## システム構成図
 
-> **推定コスト**: AWS 約$6/月 + CryptoPanic Growth $199/月（オプション）
+> **推定コスト**: AWS 約$11/月 + CryptoPanic Growth $199/月（オプション）
 > Lambda VPC外実行により NAT Gateway ($45/月) を削減
 
 ```mermaid
@@ -298,21 +298,20 @@ aggregator (meta_aggregate) → DynamoDB (signalsテーブル) ← order-executo
 
 aggregator が全 TF スコアを統合して BUY/SELL/HOLD 判定を DynamoDB signals テーブルに保存。order-executor は EventBridge による15分毎の定期起動で最新シグナルを読み取り、注文を執行。BUY対象が複数ある場合は最もスコアの高い1通貨のみ、SELLは全対象を実行。
 
-### 監視・自動修復パイプライン
+### 監視・通知パイプライン
 
-全 Lambda に CloudWatch Metric Alarms（Errors + Duration）を設定し、異常検知時は即座に Slack 通知。さらに、エラーログを自動検知して Claude AI が修正コードを生成・デプロイする自動修復パイプラインを構築。
+全 Lambda に CloudWatch Metric Alarms（Errors + Duration）を設定し、異常検知時は即座に Slack 通知。さらに、エラーログを自動検知して Slack に通知するパイプラインを構築。
 
 ```
 CloudWatch Logs → Subscription Filter → error-remediator Lambda
                                             └→ Slack通知（エラー内容）
 ```
 
-- **CloudWatch Alarms (21個)**: 全10 Lambda × (Errors + Duration) + DLQアラーム で異常検知
+- **CloudWatch Alarms (20個)**: 全10 Lambda × (Errors + Duration) で異常検知
 - **Subscription Filters (9個)**: warm-up以外の全Lambdaのエラーログを検知
   - フィルターパターン: `?"[ERROR]" ?Traceback ?"raise Exception" -"[INFO]" -"expected behavior" -"retrying in"`
   - SageMaker Serverless の想定内リトライログ（ThrottlingException → 自動リカバリ）を除外
 - **error-remediator Lambda**: エラー検知 → Slack通知（30分クールダウン付き）
-
 ### DynamoDB
 
 | 選択肢 | メリット | デメリット | 採用 |
@@ -379,7 +378,7 @@ IAM ロールは最小権限原則で設計。各 Lambda は必要な DynamoDB �
 |---|---|---|
 | Lambda | ~$4.00 | 3通貨×4TF分析 + メタ集約 + error-remediator含む |
 | DynamoDB | ~$0.30 | 8テーブル×3通貨×4TF分のR/W |
-| Bedrock | ~$2.00 | Claude 3.5 Haiku センチメント分析 |
+| Bedrock | ~$2.00 | Amazon Nova Micro センチメント分析 |
 | SageMaker Serverless | ~$3-8 | Chronos-2 推論 (3通貨×4TF/周期) |
 | Step Functions | ~$0.15 | 4TF別ワークフロー + メタ集約 |
 | CloudWatch | ~$0.55 | ログ保存14日 + Metric Alarms + Subscription Filters |

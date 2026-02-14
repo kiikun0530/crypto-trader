@@ -17,13 +17,14 @@
 | `SIGNALS_TABLE` | シグナルテーブル名 |
 | `ANALYSIS_STATE_TABLE` | 分析状態テーブル名 |
 | `COINCHECK_SECRET_ARN` | Coincheck API認証情報のARN |
-| `ORDER_QUEUE_URL` | SQS注文キューURL |
 | `SLACK_WEBHOOK_URL` | Slack通知用Webhook |
 | `TRADING_PAIRS_CONFIG` | 通貨ペア設定JSON |
-| `MODEL_BUCKET` | ONNXモデル格納S3バケット |
-| `MODEL_PREFIX` | ONNXモデルのS3プレフィックス |
+| `SAGEMAKER_ENDPOINT` | SageMaker Serverless エンドポイント名 |
+| `MODEL_BUCKET` | S3モデル格納バケット（レガシー） |
+| `MODEL_PREFIX` | S3モデルのプレフィックス（レガシー） |
 | `CRYPTOPANIC_API_KEY` | CryptoPanic APIキー |
 | `MARKET_CONTEXT_TABLE` | マーケットコンテキストテーブル名 |
+| `TF_SCORES_TABLE` | TF別スコアテーブル名 |
 | `BEDROCK_MODEL_ID` | Bedrock LLMモデルID (センチメント分析) |
 | `MAX_POSITION_JPY` | 最大ポジション額（円） |
 
@@ -55,11 +56,11 @@
 
 ## price-collector
 
-5分間隔で全通貨の価格を Binance から収集し、DynamoDB に保存。分析トリガーは行わず、純粋な価格収集のみ。
+Step Functions Phase 1 でTF別に全通貨の価格を Binance から収集し、DynamoDB に保存。分析トリガーは行わず、純粋な価格収集のみ。
 
 | 項目 | 値 |
 |---|---|
-| トリガー | EventBridge (5分間隔) |
+| トリガー | Step Functions (Phase 1: CollectPrices) |
 | メモリ | 256MB |
 | タイムアウト | 60秒 |
 | DynamoDB | prices (W) |
@@ -76,7 +77,7 @@
 {
   "statusCode": 200,
   "body": {
-    "pairs_collected": 6,
+    "pairs_collected": 3,
     "errors": 0
   }
 }
@@ -328,7 +329,7 @@ CryptoPanic API から全通貨のニュースを取得し、通貨別にセン�
 ### API最適化
 
 ```
-1回目: ?currencies=ETH,BTC,XRP,SOL,DOGE,AVAX  → 全通貨ニュース一括
+1回目: ?currencies=BTC,ETH,XRP               → 全通貨ニュース一括
 2回目: (通貨指定なし)                          → 全体市場ニュース
 合計: 2 API calls × 48回/日 × 30日 = 2,880/月 (Growth Plan 3,000内)
 ```
@@ -354,7 +355,7 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
 | 優先度 | 条件 | スコア決定方法 |
 |---|---|---|
 | 1 | 投票数 ≥ 5 | 賛否比率 × 信頼度係数 |
-| 2 | 投票数 < 5 | AWS Bedrock (Claude 3.5 Haiku) によるLLMセンチメント分析 |
+| 2 | 投票数 < 5 | AWS Bedrock (Amazon Nova Micro) によるLLMセンチメント分析 |
 | 3 | LLM失敗時 | ルールベースNLPフォールバック（キーワード分析） |
 | 補助 | `panic_score` 存在時 | ±0.10 の微調整（0=ネガ, 2=中立, 4=ポジ） |
 
@@ -368,10 +369,10 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
 
 | 項目 | 値 |
 |---|---|
-| トリガー | Step Functions (Map完了後) |
+| トリガー | Step Functions (Map完了後) / EventBridge (15分間隔, meta_aggregateモード) |
 | メモリ | 512MB |
 | タイムアウト | 120秒 |
-| DynamoDB | signals (W), market-context (R) |
+| DynamoDB | signals (W), tf-scores (R/W), market-context (R) |
 
 ### 入力 (Step Functions Map の出力)
 
@@ -408,8 +409,9 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
    - スコア >= buy_threshold → BUY
    - スコア <= sell_threshold → SELL
    - それ以外 → HOLD
-6. BUY/SELLがある場合のみ、全判定を1つのSQSメッセージとしてバッチ送信
-   - 全てHOLDの場合はキュー送信なし
+6. BUY/SELLがある場合、全判定を DynamoDB signals テーブルに保存
+   - order-executor が EventBridge 15分毎に読み取って執行
+   - 全てHOLDの場合もシグナルとして保存
 7. Slack にランキング + 通貨別判定 + 市場環境付き分析結果を通知
 
 ### 出力
@@ -419,9 +421,9 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
   "decisions": [
     {"pair": "eth_usdt", "coincheck_pair": "eth_jpy", "signal": "BUY", "score": 0.5234},
     {"pair": "btc_usdt", "coincheck_pair": "btc_jpy", "signal": "HOLD", "score": 0.3521},
-    {"pair": "avax_usdt", "coincheck_pair": "avax_jpy", "signal": "SELL", "score": -0.1800}
+    {"pair": "xrp_usdt", "coincheck_pair": "xrp_jpy", "signal": "SELL", "score": -0.1800}
   ],
-  "summary": {"buy": 1, "sell": 1, "hold": 4},
+  "summary": {"buy": 1, "sell": 1, "hold": 1},
   "has_signal": true,
   "ranking": [
     {"pair": "eth_usdt", "name": "Ethereum", "score": 0.5234},
@@ -435,32 +437,23 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
 }
 ```
 
-### SQSバッチメッセージ形式
+### DynamoDB シグナル保存形式
+
+aggregator が DynamoDB signals テーブルに保存するシグナルデータ:
 
 ```json
 {
-  "batch": true,
+  "pair": "eth_usdt",
   "timestamp": 1234567890,
-  "orders": [
-    {
-      "pair": "eth_jpy",
-      "signal": "BUY",
-      "score": 0.5234,
-      "analysis_context": {
-        "components": {"technical": 0.812, "chronos": 0.654, ...},
-        "buy_threshold": 0.2800,
-        "sell_threshold": -0.1500,
-        "weights": {"technical": 0.28, "chronos": 0.42, ...},
-        "chronos_confidence": 0.85
-      }
-    },
-    {
-      "pair": "avax_jpy",
-      "signal": "SELL",
-      "score": -0.1800,
-      "analysis_context": { ... }
-    }
-  ]
+  "signal": "BUY",
+  "score": 0.5234,
+  "analysis_context": {
+    "components": {"technical": 0.812, "chronos": 0.654, "sentiment": 0.15, "market_context": 0.10},
+    "buy_threshold": 0.2800,
+    "sell_threshold": -0.1500,
+    "weights": {"technical": 0.28, "chronos": 0.42, "sentiment": 0.15, "market_context": 0.15},
+    "chronos_confidence": 0.85
+  }
 }
 ```
 
@@ -468,19 +461,19 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
 
 ## order-executor
 
-SQSからバッチ注文メッセージを受信し、Coincheck APIで成行注文を実行。
+EventBridge 15分毎の定期起動で DynamoDB signals テーブルから最新シグナルを読み取り、Coincheck APIで成行注文を実行。
 
 | 項目 | 値 |
 |---|---|
-| トリガー | SQS (order-queue, batch=1) |
+| トリガー | EventBridge (15分間隔) |
 | メモリ | 256MB |
 | タイムアウト | 60秒 |
-| DynamoDB | positions (R/W), trades (W) |
+| DynamoDB | signals (R), positions (R/W), trades (W) |
 | 外部API | Coincheck |
 
 ### バッチ注文処理
 
-aggregatorが1つのSQSメッセージで全通貨のBUY/SELL判定を送信。order-executorはポジション・残高を確認して実際の注文を実行する。
+aggregatorが DynamoDB signals テーブルに全通貨のBUY/SELL/HOLD判定を保存。order-executorはポジション・残高を確認して実際の注文を実行する。
 
 **処理順序**:
 1. **SELL先**: ポジションがあれば売却、なければスキップ（資金確保）
@@ -560,7 +553,7 @@ Coincheck 取引所の通貨別最小注文数量・小数点以下桁数に基�
 5. SL/TP 判定:
    - 現在価格 <= ストップロス(参入-5%、またはトレーリングSL) → 売り指示
    - 現在価格 >= テイクプロフィット(参入+30%) → 売り指示
-6. 売り指示は SQS 経由で order-executor に送信
+6. 売り指示時は SQS 経由で order-executor に送信（ORDER_QUEUE_URL が設定されている場合）または Slack 通知のみ
 
 ---
 
@@ -667,14 +660,14 @@ DLQ滞留等のシステムアラートを Slack Webhook に転送。取引通�
 ### スコア計算
 
 ```
-market_score = fng_score × 0.50 + funding_score × 0.30 + dominance_score × 0.20
+market_score = fng_score × 0.30 + funding_score × 0.35 + dominance_score × 0.35
 ```
 
 | サブスコア | 重み | ロジック |
 |---|---|---|
-| F&G Score | 50% | 逆張り: Extreme Fear(0-10)→+1.0, Extreme Greed(90-100)→-1.0 |
-| Funding Score | 30% | 逆符号: 正のfunding(ロング過多)→売り圧力、負→買いチャンス |
-| Dominance Score | 20% | 50%を中立として ±15%で±1.0にスケール |
+| F&G Score | 30% | 逆張り: Extreme Fear(0-10)→+0.30 (cap), Extreme Greed(90-100)→-0.30 (cap) + トレンド減衰 |
+| Funding Score | 35% | 逆符号: 正のfunding(ロング過多)→売り圧力、負→買いチャンス |
+| Dominance Score | 35% | 50%を中立として ±15%で±1.0にスケール |
 
 ### 出力 (DynamoDB)
 
@@ -708,19 +701,21 @@ market_score = fng_score × 0.50 + funding_score × 0.30 + dominance_score × 0.
 ```mermaid
 flowchart TD
     subgraph 定期実行
-        E1["5分毎"] --> PC["price-collector"]
         E2["5分毎"] --> PM["position-monitor"]
         E3["30分毎"] --> NC["news-collector"]
         E4["30分毎"] --> MC["market-context"]
-        E5["5分毎"] --> MAP
+        E5["TF別 15m/1h/4h/1d"] --> SF
+        E6["15分毎"] --> META["aggregator(meta)"]
+        E7["15分毎"] --> OE["order-executor"]
     end
 
     subgraph Step Functions
-        MAP["Map State"]
-        MAP --> TECH["technical ×6"]
-        MAP --> CHRON["chronos-caller ×6"]
-        MAP --> SENT["sentiment-getter ×6"]
-        TECH & CHRON & SENT --> AGG["aggregator"]
+        SF["Map State ×3通貨"]
+        SF --> PC["price-collector ×3"]
+        SF --> TECH["technical ×3"]
+        SF --> CHRON["chronos-caller ×3"]
+        SF --> SENT["sentiment-getter ×3"]
+        TECH & CHRON & SENT --> AGG["aggregator ×3"]
     end
 
     subgraph 外部API
@@ -734,24 +729,27 @@ flowchart TD
         NC -->|"W"| DB_S["sentiment"]
         MC -->|"W"| DB_MC["market-context"]
         TECH -->|"R"| DB_P
+        TECH -->|"W"| DB_TF["tf-scores"]
         CHRON -->|"R"| DB_P
         SENT -->|"R"| DB_S
         AGG -->|"R"| DB_MC
+        AGG -->|"R"| DB_TF
         AGG -->|"W"| DB_SIG["signals"]
         AGG -->|"R"| DB_POS["positions"]
+        META -->|"R"| DB_SIG
+        META -->|"W"| DB_SIG
+        OE -->|"R"| DB_SIG
         OE -->|"R/W"| DB_POS
         OE -->|"W"| DB_T["trades"]
         PM -->|"R"| DB_POS
     end
 
     subgraph 注文実行
-        AGG -->|"SQS"| OE["order-executor"]
-        PM -->|"SQS"| OE
         OE -->|"Coincheck API"| TRADE["取引"]
     end
 
     subgraph 監視・通知
-        CW["CloudWatch Logs"] -->|"“Subscription Filter"| ER["error-remediator"]
+        CW["CloudWatch Logs"] -->|"Subscription Filter"| ER["error-remediator"]
         ER -->|"通知"| SLACK["Slack"]
     end
 ```
