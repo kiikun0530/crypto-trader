@@ -25,7 +25,7 @@
 | `CRYPTOPANIC_API_KEY` | CryptoPanic APIキー |
 | `MARKET_CONTEXT_TABLE` | マーケットコンテキストテーブル名 |
 | `TF_SCORES_TABLE` | TF別スコアテーブル名 |
-| `BEDROCK_MODEL_ID` | Bedrock LLMモデルID (センチメント分析) |
+| `BEDROCK_MODEL_ID` | Bedrock LLMモデルID (AI分析コメント: Claude 3.5 Haiku / センチメント: Nova Micro) |
 
 ### 通貨ペア設定 (TRADING_PAIRS_CONFIG)
 
@@ -354,7 +354,7 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
 | 優先度 | 条件 | スコア決定方法 |
 |---|---|---|
 | 1 | 投票数 ≥ 5 | 賛否比率 × 信頼度係数 |
-| 2 | 投票数 < 5 | AWS Bedrock (Amazon Nova Micro) によるLLMセンチメント分析 |
+| 2 | 投票数 < 5 | AWS Bedrock (Claude 3.5 Haiku) によるLLMセンチメント分析 |
 | 3 | LLM失敗時 | ルールベースNLPフォールバック（キーワード分析） |
 | 補助 | `panic_score` 存在時 | ±0.10 の微調整（0=ネガ, 2=中立, 4=ポジ） |
 
@@ -403,7 +403,13 @@ CryptoPanic API v2 (Growth Plan) では、記事の通貨情報が `instruments`
    - `buy_threshold = 0.25 × vol_ratio`, `sell_threshold = -0.13 × vol_ratio`
    - F&G連動補正: F&G≤20 → `buy_threshold × 1.35`, F&G≥80 → `buy_threshold × 1.20` (SELL不変)
 3. 全通貨のシグナルを DynamoDB に保存（動的閾値・BB幅・market_context_scoreも記録）
-4. 全通貨をスコア降順でランキング
+4. AI分析コメント生成 (Claude 3.5 Haiku)
+   - テクニカル指標を定性的洞察に変換（RSI/ADX/MACD/BB/SMA200/出来高）
+   - Chronos AI予測を自然言語で解釈
+   - 市場環境（F&G/BTC Dominance）を定性コンテキスト化
+   - マルチTFの方向性を物語として表現
+   - 数値スコア/閾値は一切含めず、専門家レベルの分析を生成
+5. 全通貨をスコア降順でランキング
 5. **通貨毎にBUY/SELL/HOLD判定（ポジション非依存）**:
    - スコア >= buy_threshold → BUY
    - スコア <= sell_threshold → SELL

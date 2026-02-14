@@ -363,12 +363,12 @@ IAM ロールは最小権限原則で設計。各 Lambda は必要な DynamoDB �
 |---|---|---|
 | Lambda | ~$4.00 | 3通貨×4TF分析 + メタ集約 + error-remediator含む |
 | DynamoDB | ~$0.30 | 8テーブル×3通貨×4TF分のR/W |
-| Bedrock | ~$2.00 | Amazon Nova Micro センチメント分析 |
+| Bedrock | ~$10.00 | Claude 3.5 Haiku AI分析コメント (~$8) + Nova Micro センチメント分析 (~$2) |
 | SageMaker Serverless | ~$3-8 | Chronos-2 推論 (3通貨×4TF/周期) |
 | Step Functions | ~$0.15 | 4TF別ワークフロー + メタ集約 |
 | CloudWatch | ~$0.55 | ログ保存14日 + Metric Alarms + Subscription Filters |
 | SNS/EventBridge | ~$0.05 | 軽微 |
-| **AWS合計** | **~$10/月** | |
+| **AWS合計** | **~$18/月** | |
 
 ### 外部API費用
 

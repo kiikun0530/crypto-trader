@@ -200,7 +200,7 @@ total_score = technical × 0.35 + chronos × 0.35 + sentiment × 0.15 + market_c
   → 時間減衰: 新しいほど重み大 (1h以内=1.0, 24h=0.1)
   → スコア決定:
       投票数 ≥5: 賛否比率 × 信頼度係数
-      投票数 <5:  AWS Bedrock (Amazon Nova Micro) によるLLMセンチメント分析:
+      投票数 <5:  AWS Bedrock (Claude 3.5 Haiku) によるLLMセンチメント分析:
         - 全投票不足記事のタイトルを1回のAPIコールでバッチ分析
         - 暠定語、文脈、暗号通貨ドメイン知識を考慮した高精度スコア
         - temperature=0.0 で決定的な出力を確保
