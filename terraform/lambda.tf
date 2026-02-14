@@ -113,7 +113,15 @@ locals {
     MODEL_BUCKET           = "${local.name_prefix}-sagemaker-models-${local.account_id}"
     MODEL_PREFIX           = "chronos-onnx"
     SAGEMAKER_ENDPOINT     = "${local.name_prefix}-chronos-base"
-    BEDROCK_MODEL_ID       = "apac.anthropic.claude-3-5-haiku-20241022-v1:0"
+    BEDROCK_MODEL_ID       = "apac.anthropic.claude-3-haiku-20240307-v1:0"
+  }
+
+  # Lambda関数ごとの環境変数オーバーライド
+  lambda_env_overrides = {
+    news-collector = {
+      # センチメント分析は低コストの Nova Micro で十分
+      BEDROCK_MODEL_ID = "apac.amazon.nova-micro-v1:0"
+    }
   }
 }
 
@@ -145,7 +153,10 @@ resource "aws_lambda_function" "functions" {
   # DynamoDB/S3/Secrets Managerはパブリックエンドポイント経由でアクセス (IAM認証あり)
 
   environment {
-    variables = local.lambda_environment
+    variables = merge(
+      local.lambda_environment,
+      lookup(local.lambda_env_overrides, each.key, {})
+    )
   }
 
   # Lambda Layer設定 (共通レイヤーのみ。chronos-callerはSageMaker経由のため ONNX Runtime Layer 不要)
