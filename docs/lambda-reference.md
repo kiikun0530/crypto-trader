@@ -1,6 +1,6 @@
 # Lambda関数リファレンス
 
-全 9 個の Lambda 関数の仕様、入出力、設定の詳細。
+全 10 個の Lambda 関数の仕様、入出力、設定の詳細。
 
 > **order-executor** / **position-monitor** は [crypto-order](https://github.com/kiikun0530/crypto-order) リポジトリに移行しました
 
@@ -609,6 +609,66 @@ market_score = fng_score × 0.30 + funding_score × 0.35 + dominance_score × 0.
 
 ---
 
+## result-checker
+
+BUY / SELL シグナルの結果を判定する。15分間隔で実行し、`signals` テーブルに保存済みのシグナルに対して最大4つの時間窓（1h / 4h / 12h / 3d）で価格変動を測定・記録する。
+
+| 項目 | 値 |
+|---|---|
+| トリガー | EventBridge (15分間隔) |
+| メモリ | 256MB |
+| タイムアウト | 120秒 |
+| DynamoDB | signals (R/W), prices (R) |
+
+### 処理フロー
+
+1. `signals` テーブルから直近3d+2h以内の BUY / SELL シグナルを取得（HOLD は除外）
+2. 各シグナルのエントリー価格が未記録の場合、`prices` テーブルから 15min→1h フォールバックで価格を取得・記録
+3. 4つの時間窓 (1h / 4h / 12h / 3d) それぞれについて:
+   - 窓の時間が経過していれば、その時点の価格を `prices` テーブルから取得
+   - `price_change_pct = (exit_price - entry_price) / entry_price × 100` を算出
+   - ±0.3% (閾値、環境変数で変更可) で WIN / LOSS / DRAW を判定
+   - BUY は上昇が WIN、SELL は下落が WIN
+4. 結果を `signals` テーブルの既存レコードに追記 (UpdateExpression SET)
+
+### 時間窓
+
+| 窓キー | 経過時間 | 用途 |
+|--------|---------|------|
+| `result_1h` | 1時間 | 短期即応性 |
+| `result_4h` | 4時間 | デフォルト評価窓 |
+| `result_12h` | 12時間 | 中期トレンド追従 |
+| `result_3d` | 3日 | 長期方向性 |
+
+### 判定基準
+
+| 判定 | 条件 (BUY) | 条件 (SELL) |
+|------|-----------|------------|
+| WIN  | change ≥ +0.3% | change ≤ -0.3% |
+| LOSS | change ≤ -0.3% | change ≥ +0.3% |
+| DRAW | -0.3% < change < +0.3% | -0.3% < change < +0.3% |
+
+### 出力 (signals テーブル更新)
+
+```json
+{
+  "result_4h": {
+    "outcome": "WIN",
+    "exit_price": 97520.5,
+    "price_change_pct": 1.23,
+    "checked_at": 1770530000
+  }
+}
+```
+
+### 環境変数
+
+| 変数名 | デフォルト | 説明 |
+|--------|----------|------|
+| `WIN_THRESHOLD_PCT` | `0.3` | WIN/LOSS 判定閾値 (%) |
+
+---
+
 ## データフロー図
 
 ```mermaid
@@ -660,5 +720,12 @@ flowchart TD
     subgraph 監視・通知
         CW["CloudWatch Logs"] -->|"Subscription Filter"| ER["error-remediator"]
         ER -->|"通知"| SLACK["Slack"]
+    end
+
+    subgraph 結果判定
+        RC["result-checker"] -->|"R"| DB_SIG
+        RC -->|"R"| DB_P
+        RC -->|"W"| DB_SIG
+        E7["15分毎"] --> RC
     end
 ```

@@ -150,4 +150,30 @@ resource "aws_lambda_permission" "market_context" {
   source_arn    = aws_cloudwatch_event_rule.market_context.arn
 }
 
+# -----------------------------------------------------------------------------
+# 結果判定 (15分間隔で BUY/SELL シグナルの価格変動を記録)
+# -----------------------------------------------------------------------------
+resource "aws_cloudwatch_event_rule" "result_checker" {
+  name                = "${local.name_prefix}-result-checker"
+  description         = "Check BUY/SELL signal outcomes at multiple time windows (1h/4h/12h/3d)"
+  schedule_expression = "rate(15 minutes)"
+  state               = "ENABLED"
 
+  tags = {
+    Name = "${local.name_prefix}-result-checker"
+  }
+}
+
+resource "aws_cloudwatch_event_target" "result_checker" {
+  rule      = aws_cloudwatch_event_rule.result_checker.name
+  target_id = "ResultCheckerLambda"
+  arn       = aws_lambda_function.functions["result-checker"].arn
+}
+
+resource "aws_lambda_permission" "result_checker" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.functions["result-checker"].function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.result_checker.arn
+}

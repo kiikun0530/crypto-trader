@@ -14,7 +14,8 @@ resource "aws_cloudwatch_log_group" "lambda" {
     "aggregator",
     "news-collector",
     "market-context",
-    "warm-up"
+    "warm-up",
+    "result-checker"
   ])
 
   name              = "/aws/lambda/${local.name_prefix}-${each.key}"
@@ -94,6 +95,12 @@ locals {
       description = "初回データ投入（手動実行・マルチTF対応）"
       timeout     = 600
       memory      = 512
+      handler     = "handler.handler"
+    }
+    result-checker = {
+      description = "結果判定（BUY/SELLシグナル後の価格変動記録）"
+      timeout     = 120
+      memory      = 256
       handler     = "handler.handler"
     }
   }

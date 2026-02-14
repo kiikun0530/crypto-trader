@@ -31,6 +31,7 @@ flowchart LR
         EB_META["15分間隔<br/>meta-aggregator"]
         EB_NEWS["30分間隔<br/>news-collection"]
         EB_MKTCTX["30分間隔<br/>market-context"]
+        EB_RC["15分間隔<br/>result-checker"]
     end
 
     subgraph Lambda["Lambda Functions (VPC外)"]
@@ -42,6 +43,7 @@ flowchart LR
         L_NEWS["news-collector<br/>ニュース収集"]
         L_MKTCTX["market-context<br/>市場環境収集"]
         L_REMEDIATE["error-remediator<br/>エラー自動修復"]
+        L_RC["result-checker<br/>シグナル結果判定"]
     end
 
     subgraph StepFunctions["Step Functions (パラメータ化ワークフロー)"]
@@ -91,6 +93,7 @@ flowchart LR
     EB_META -->|"毎15分"| L_AGG
     EB_NEWS -->|"30分毎"| L_NEWS
     EB_MKTCTX -->|"30分毎"| L_MKTCTX
+    EB_RC -->|"15分毎"| L_RC
 
     %% Step Functions (4フェーズ)
     SF_PRICE --> L_PRICE
@@ -115,6 +118,11 @@ flowchart LR
     L_AGG -->|"R meta_agg"| DB_MKTCTX
     L_AGG -->|"R meta_agg"| DB_TFSCORES
     L_AGG -->|"W"| DB_SIGNALS
+
+    %% 結果判定
+    L_RC -->|"R"| DB_SIGNALS
+    L_RC -->|"R"| DB_PRICES
+    L_RC -->|"W result_*"| DB_SIGNALS
 
     %% 注文実行・ポジション監視は crypto-order リポジトリに移行
 

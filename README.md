@@ -35,7 +35,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | ETH | ETHUSDT | eth_jpy | DeFi基盤、高流動性 |
 | XRP | XRPUSDT | xrp_jpy | 送金特化、高速決済 |
 
-### Lambda関数（9個）
+### Lambda関数（10個）
 
 | 関数名 | 役割 | 実行間隔 |
 |--------|------|----------|
@@ -47,6 +47,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | news-collector | 全通貨ニュース一括取得・BTC相関分析 | 30分 |
 | market-context | F&G / Funding Rate / BTC Dominance 収集 | 30分 |
 | error-remediator | Lambdaエラー検知→Slack通知 | CloudWatch Logs |
+| result-checker | BUY/SELLシグナルの結果判定（1h/4h/12h/3d窓） | EventBridge 15分 |
 | warm-up | 全通貨の初回データ投入（手動） | - |
 
 > **order-executor** / **position-monitor** は [crypto-order](https://github.com/kiikun0530/crypto-order) リポジトリに移行
