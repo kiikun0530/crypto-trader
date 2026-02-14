@@ -1313,21 +1313,21 @@ def generate_ai_comment(scored: dict, thresholds: dict) -> str:
 2. 最も重要な根拠を1-2点だけ挙げる。数値の羅列ではなく「なぜそれが重要か」を説明すること
 3. リスクや注意点を1点挙げる（反対シナリオの可能性）
 4. 数値スコアや閾値の数字は絶対に書かない。指標値（RSI, ADX, Fear&Greed）だけ自然に引用してよい
-5. です・ます調で3文以内、300文字以内
+5. です・ます調で3〜5文、450文字以内
 6. シグナル判定「{signal_jp}」の根拠を自然に織り込む"""
 
         response = bedrock.converse(
             modelId=BEDROCK_MODEL_ID,
             messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig={"maxTokens": 400, "temperature": 0.4},
+            inferenceConfig={"maxTokens": 500, "temperature": 0.4},
         )
 
         comment = response['output']['message']['content'][0]['text'].strip()
         # 改行を除去して1行にする
         comment = comment.replace('\n', ' ').strip()
         # 長すぎる場合は切り詰め
-        if len(comment) > 350:
-            comment = comment[:347] + '...'
+        if len(comment) > 500:
+            comment = comment[:497] + '...'
 
         tokens_in = response.get('usage', {}).get('inputTokens', 0)
         tokens_out = response.get('usage', {}).get('outputTokens', 0)
