@@ -149,6 +149,15 @@ resource "aws_iam_role_policy" "lambda_custom" {
           "arn:aws:bedrock:${var.aws_region}:${local.account_id}:inference-profile/apac.amazon.nova-*",
           "arn:aws:bedrock:${var.aws_region}:${local.account_id}:inference-profile/apac.anthropic.claude-*"
         ]
+      },
+      # AWS Marketplace: Anthropicモデルの自動サブスクリプション有効化に必要
+      {
+        Effect   = "Allow"
+        Action   = [
+          "aws-marketplace:ViewSubscriptions",
+          "aws-marketplace:Subscribe"
+        ]
+        Resource = ["*"]
       }
     ]
   })
