@@ -23,7 +23,7 @@ import urllib.request
 from trading_common import (
     TRADING_PAIRS, POSITIONS_TABLE, SLACK_WEBHOOK_URL,
     TIMEFRAME_CONFIG, ACTIVE_TIMEFRAMES, TIMEFRAME_WEIGHTS,
-    TF_SCORES_TABLE, make_pair_tf_key,
+    TF_SCORES_TABLE, make_pair_tf_key, get_ttl_seconds,
     get_current_price, get_active_position, send_slack_notification, dynamodb
 )
 
@@ -207,7 +207,7 @@ def _save_tf_score(scored: dict, timeframe: str, timestamp: int):
             'weights': to_dynamo_map(scored.get('weights', {})),
             'chronos_confidence': safe_decimal(scored.get('chronos_confidence', 0.5)),
             'bb_width': safe_decimal(scored.get('bb_width', BASELINE_BB_WIDTH), 6),
-            'ttl': timestamp + 86400,  # 24時間で期限切れ
+            'ttl': timestamp + get_ttl_seconds(timeframe),  # TF別TTL (15m:14d, 1h:30d, 4h:90d, 1d:365d)
         }
 
         indicators = scored.get('indicators_detail', {})
