@@ -72,7 +72,7 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 |------|------|
 | Lambda | ~$4.00 |
 | DynamoDB | ~$0.30 |
-| Bedrock (Claude 3.5 Haiku + Nova Micro) | ~$10.00 |
+| Bedrock (Claude 3 Haiku + Nova Micro) | ~$10.00 |
 | SageMaker Serverless (Chronos-2) | ~$3-8 |
 | Step Functions | ~$0.15 |
 | CloudWatch | ~$0.55 |

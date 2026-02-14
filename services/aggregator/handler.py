@@ -1255,7 +1255,7 @@ def _interpret_multi_tf(scored: dict) -> list:
 
 
 def generate_ai_comment(scored: dict, thresholds: dict) -> str:
-    """Bedrock (Claude 3.5 Haiku) で専門家レベルの分析コメントを生成
+    """Bedrock (Claude 3 Haiku) で専門家レベルの分析コメントを生成
 
     数値スコアは一切含めず、定性的な市場解釈を提供する。
     指標値（RSI, ADX, F&G等）は意味のある文脈でのみ引用。
