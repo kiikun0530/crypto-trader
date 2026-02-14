@@ -125,7 +125,6 @@ locals {
     MAX_POSITION_JPY     = tostring(var.max_position_jpy)
     CRYPTOPANIC_API_KEY  = var.cryptopanic_api_key
     SLACK_WEBHOOK_URL      = var.slack_webhook_url
-    ORDER_EXECUTOR_FUNCTION = "${local.name_prefix}-order-executor"
     TRADING_PAIRS_CONFIG   = trimspace(var.trading_pairs_config)
     MODEL_BUCKET           = "${local.name_prefix}-sagemaker-models-${local.account_id}"
     MODEL_PREFIX           = "chronos-onnx"
@@ -158,7 +157,7 @@ resource "aws_lambda_function" "functions" {
   filename         = data.archive_file.lambda[each.key].output_path
   source_code_hash = data.archive_file.lambda[each.key].output_base64sha256
 
-  # VPC外で実行 (コスト削減: NAT Gateway不要)
+  # VPC外で実行 (コスト削減: NAT Gateway $45/月を節約)
   # DynamoDB/S3/Secrets Managerはパブリックエンドポイント経由でアクセス (IAM認証あり)
 
   environment {

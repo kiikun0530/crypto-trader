@@ -18,9 +18,9 @@ from trading_common import (
     get_current_price, get_active_position, send_slack_notification, dynamodb
 )
 
-lambda_client = boto3.client('lambda')
+sqs = boto3.client('sqs')
 
-ORDER_EXECUTOR_FUNCTION = os.environ.get('ORDER_EXECUTOR_FUNCTION', '')
+ORDER_QUEUE_URL = os.environ.get('ORDER_QUEUE_URL', '')
 
 
 def handler(event, context):
@@ -163,26 +163,20 @@ def handler(event, context):
 
 
 def trigger_sell(pair: str, name: str, reason: str, current_price: float, entry_price: float):
-    """売りトリガー発火（order-executor Lambda直接起動）"""
+    """売りトリガー発火"""
     timestamp = int(time.time())
 
-    if ORDER_EXECUTOR_FUNCTION:
-        try:
-            lambda_client.invoke(
-                FunctionName=ORDER_EXECUTOR_FUNCTION,
-                InvocationType='Event',  # 非同期起動（SL/TPの即時実行）
-                Payload=json.dumps({
-                    'direct_sell': True,
-                    'pair': pair,
-                    'signal': 'SELL',
-                    'score': -1.0,
-                    'timestamp': timestamp,
-                    'reason': reason
-                })
-            )
-            print(f"Invoked order-executor for {pair} ({reason})")
-        except Exception as e:
-            print(f"Failed to invoke order-executor: {e}")
+    if ORDER_QUEUE_URL:
+        sqs.send_message(
+            QueueUrl=ORDER_QUEUE_URL,
+            MessageBody=json.dumps({
+                'pair': pair,
+                'signal': 'SELL',
+                'score': -1.0,
+                'timestamp': timestamp,
+                'reason': reason
+            })
+        )
 
     pnl_percent = (current_price - entry_price) / entry_price * 100
     emoji = '🔴' if reason == 'stop_loss' else '💰'

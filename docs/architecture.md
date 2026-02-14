@@ -9,8 +9,8 @@ Crypto Trader のシステム構成と技術選定を説明するドキュメン
 
 ## システム構成図
 
-> **設計方針**: AWS Serverless + VPC外実行でコスト最小化
-> 詳細なコスト情報は非公開リポジトリで管理
+> **推定コスト**: AWS 約$6/月 + CryptoPanic Growth $199/月（オプション）
+> Lambda VPC外実行により NAT Gateway ($45/月) を削減
 
 ```mermaid
 flowchart LR
@@ -178,7 +178,7 @@ flowchart LR
 
 ## 設計原則
 
-### 1. コスト最小化
+### 1. コスト最小化 — 月額 $10 以下
 
 暗号通貨トレーディングボットは24時間365日稼働が必要だが、常にCPUリソースを使う必要はない。「イベント駆動 + Serverless」で、実際に処理が必要な時だけコストが発生する構成にしている。
 
@@ -203,7 +203,7 @@ DynamoDB は全テーブルが `pair` を Partition Key にしており、通貨
 | 選択肢 | メリット | デメリット | 採用 |
 |---|---|---|---|
 | EC2 | 柔軟性が高い | 常時課金、運用負荷 | ❌ |
-| ECS Fargate | コンテナ実行 | 常時課金 | ❌ |
+| ECS Fargate | コンテナ実行 | 常時課金（最低$15/月） | ❌ |
 | Lambda | 実行時のみ課金 | 15分制限、コールドスタート | ✅ |
 
 - 各処理は数秒～数十秒で完了するため、15分制限は問題なし
@@ -211,7 +211,16 @@ DynamoDB は全テーブルが `pair` を Partition Key にしており、通貨
 
 ### AI価格予測 (Chronos) のインフラ選定
 
-スコアリング全体の **25%のウェイト** を占める AI 価格予測コンポーネント。複数の選択肢を比較検討し、SageMaker Serverlessを採用。
+スコアリング全体の **25%のウェイト** を占める AI 価格予測コンポーネントについて、以下の選択肢を比較検討した。
+
+| 選択肢 | 方式 | 月額 | 推論時間 | 精度 | 運用負荷 |
+|---|---|---|---|---|---|
+| モメンタム代替 | Lambda 内計算 | $0 | <1秒 | ❌ 予測ではない | なし |
+| Lambda + ONNX | Chronos-Tiny ONNX変換 | ~$0 | 3-10秒 | ⭕ | 中 |
+| **SageMaker Serverless** | **Chronos-2 (120M)** | **~$3-8** | **2-5秒** | **◎** | **低（クォータ申請済）** |
+| SageMaker Real-time | Chronos-Small (46M) | ~$50-80 | 1-3秒 | ◎ | 低 |
+| ECS Fargate Spot | Chronos-Small コンテナ | ~$15-25 | 2-5秒 | ◎ | 中 |
+| EC2 Spot GPU | Chronos-Large (710M) | ~$25-60 | <1秒 | ◎◎ | 高 |
 
 **選定: SageMaker Serverless Endpoint（Chronos-2）**
 
@@ -237,7 +246,9 @@ ECS/EC2 は常時課金が発生し、現行の「完全サーバーレス」設
 
 ### VPC外実行
 
-Lambda を VPC 外で実行することで NAT Gateway 等のコストを削減。DynamoDB, SNS 等のAWSサービスは IAM 認証でアクセスでき、VPC内にある必要がない。Coincheck の API キーは Secrets Manager（IAMロール保護）で管理。
+**削減コスト**: NAT Gateway $45/月 + Elastic IP $3.6/月 = **$48.6/月**
+
+Lambda を VPC 内に配置すると、外部 API（Binance, Coincheck, CryptoPanic）へのアクセスに NAT Gateway が必須。しかし DynamoDB, SNS 等のAWSサービスは IAM 認証でアクセスでき、VPC内にある必要がない。Coincheck の API キーは Secrets Manager（IAMロール保護）で管理。
 
 ### Binance（分析） + Coincheck（取引）
 
@@ -250,13 +261,13 @@ Lambda を VPC 外で実行することで NAT Gateway 等のコストを削減�
 
 ### マルチタイムフレーム分析間隔
 
-| TF | 実行間隔 | 実行回数/日 |
-|---|---|---|
-| 15m | 15分 | 96 |
-| 1h | 1時間 | 24 |
-| 4h | 4時間 | 6 |
-| 1d | 日次 (UTC 00:05) | 1 |
-| メタ集約 | 15分 | 96 |
+| TF | 実行間隔 | 実行回数/日 | 月額概算 |
+|---|---|---|---|
+| 15m | 15分 | 96 | ~$0.15 |
+| 1h | 1時間 | 24 | ~$0.04 |
+| 4h | 4時間 | 6 | ~$0.01 |
+| 1d | 日次 (UTC 00:05) | 1 | ~$0.002 |
+| メタ集約 | 15分 | 96 | ~$0.02 |
 
 - 各TFが独立したEventBridgeスケジュールでStep Functionsを起動
 - メタアグリゲーターは15分毎に全TFスコアを読み取り、加重平均で最終判定

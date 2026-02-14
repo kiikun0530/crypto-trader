@@ -70,3 +70,14 @@ tf_state.txt
 
 # Data analysis (local dumps & ad-hoc scripts)
 data/
+
+# Debug / test output JSON
+*-out.json
+out.json
+sf-history.json
+warmup-output.json
+
+# Lambda layer pip packages (keep requirements.txt & trading_common.py only)
+lambda_layer/python/*
+!lambda_layer/python/requirements.txt
+!lambda_layer/python/trading_common.py

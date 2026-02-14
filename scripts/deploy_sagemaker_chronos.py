@@ -8,7 +8,7 @@ boto3のみ使用（sagemaker SDK 不要）
     python scripts/deploy_sagemaker_chronos.py
 
 コスト見積もり:
-    - Serverless: 使った分だけ課金
+    - Serverless: 使った分だけ課金 (~$0.5-2/月)
     - メモリ: 6144MB (推論時のみ確保)
     - コールドスタート: 30-60秒 (Chronos-2はBoltベースで高速)
 

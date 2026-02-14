@@ -38,7 +38,7 @@ resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
 #   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 # }
 
-# Lambda用カスタムポリシー (DynamoDB, S3, Secrets Manager, SNS, Lambda)
+# Lambda用カスタムポリシー (DynamoDB, S3, Secrets Manager, SQS, SNS)
 resource "aws_iam_role_policy" "lambda_custom" {
   name = "${local.name_prefix}-lambda-custom"
   role = aws_iam_role.lambda_execution.id
@@ -96,16 +96,6 @@ resource "aws_iam_role_policy" "lambda_custom" {
         ]
         Resource = [
           "arn:aws:sns:${var.aws_region}:${local.account_id}:${local.name_prefix}-*"
-        ]
-      },
-      # Lambda間呼び出し (position-monitor → order-executor)
-      {
-        Effect = "Allow"
-        Action = [
-          "lambda:InvokeFunction"
-        ]
-        Resource = [
-          "arn:aws:lambda:${var.aws_region}:${local.account_id}:function:${local.name_prefix}-order-executor"
         ]
       },
       # S3: ONNXモデル読み取り (Chronos AI価格予測) + モデルアーティファクト

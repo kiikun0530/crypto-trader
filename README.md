@@ -44,12 +44,12 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 
 | 関数名 | 役割 | 実行間隔 |
 |--------|------|----------|
-| price-collector | 全６通貨の価格取得 | 5分 |
+| price-collector | 全6通貨の価格取得・変動検知 | 5分 |
 | technical | テクニカル指標計算（RSI, MACD, SMA, BB, ADX, ATR） | Step Functions (×6) |
 | chronos-caller | AI時系列予測 (ONNX Runtime, Chronos-T5-Tiny) | Step Functions (×6) |
 | sentiment-getter | 通貨別センチメントスコア取得 | Step Functions (×6) |
 | aggregator | 全通貨スコアリング・ランキング・売買判定 | Step Functions |
-| order-executor | Coincheckで成行注文実行（BUYは最高スコア1通貨、SELLは全対象） | EventBridge 15分 |
+| order-executor | Coincheckで成行注文実行（同一通貨重複防止） | SQSトリガー |
 | position-monitor | 全通貨のSL(-5%)/TP(+10%)/トレーリングストップ監視 | 5分 |
 | news-collector | 全通貨ニュース一括取得・BTC相関分析 | 30分 |
 | error-remediator | Lambdaエラー検知→Slack通知→自動修復 | CloudWatch Logs |
@@ -66,11 +66,30 @@ AWS Serverless で構築したマルチ通貨対応の暗号通貨自動売買�
 | trades | - | 取引履歴 |
 | analysis_state | - | 分析状態管理 |
 
-## コスト
+## 推定コスト
 
-AWS Serverless 構成のため、運用コストは非常に低く抑えられています。
+### AWSインフラ費用（6通貨分析時）
 
-> 詳細なコスト情報は非公開リポジトリで管理しています
+| 項目 | 月額 |
+|------|------|
+| Lambda | ~$5.00 |
+| DynamoDB | ~$0.30 |
+| Step Functions | ~$0.10 |
+| CloudWatch | ~$0.50 |
+| Secrets Manager | ~$0.50 |
+| **合計** | **~$7** |
+
+> 詳細な計算式は [docs/architecture.md](docs/architecture.md) を参照
+
+### 外部API費用
+
+| API | 費用 | 備考 |
+|-----|------|------|
+| Binance | 無料 | 価格データ取得のみ（認証不要） |
+| CryptoPanic | 無料 or $199/月 | Growth Planでリアルタイムニュース取得 |
+| Coincheck | 0% | 取引所取引は手数料無料 |
+
+> **総コスト目安**: 無料構成 ~$7/月、Growth Plan ~$206/月
 
 ## 前提条件
 
@@ -146,6 +165,7 @@ cp terraform.tfvars.example terraform.tfvars
 ```hcl
 environment          = "prod"
 aws_region           = "ap-northeast-1"
+volatility_threshold = 0.3        # 価格変動閾値（%）
 max_position_jpy     = 100000     # 最大ポジション（円）
 slack_webhook_url    = "https://hooks.slack.com/services/xxx/xxx/xxx"
 cryptopanic_api_key  = ""         # オプション

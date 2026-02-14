@@ -116,11 +116,14 @@ def handle_tf_score(event, context):
                 result['chronos'] = chronos_results[i]
             merged_results.append(result)
 
-        # 各通貨のper-TFスコアを計算（MarketContextはmeta_aggregateで適用）
+        # マーケットコンテキスト取得（per-TFスコアに市場環境を反映）
+        market_context = fetch_market_context()
+
+        # 各通貨のper-TFスコアを計算（MarketContext含む4成分）
         scored_pairs = []
         for result in merged_results:
             pair = result.get('pair', 'unknown')
-            scored = score_pair(pair, result, market_context=None)
+            scored = score_pair(pair, result, market_context=market_context)
             scored['timeframe'] = timeframe
             scored_pairs.append(scored)
 
@@ -214,6 +217,14 @@ def _save_tf_score(scored: dict, timeframe: str, timestamp: int):
         chronos_detail = scored.get('chronos_detail', {})
         if chronos_detail:
             item['chronos_detail'] = to_dynamo_map(chronos_detail)
+
+        news_headlines = scored.get('news_headlines', [])
+        if news_headlines:
+            item['news_headlines'] = to_dynamo_map({'h': news_headlines[:5]})['h']
+
+        market_detail = scored.get('market_context_detail', {})
+        if market_detail:
+            item['market_detail'] = to_dynamo_map(market_detail)
 
         # per-TF BUY/SELL/HOLDシグナル
         item['signal'] = scored.get('signal', 'HOLD')
@@ -368,6 +379,8 @@ def _read_all_tf_scores(pairs: list) -> dict:
                         'indicators': _dynamo_to_float(item.get('indicators', {})),
                         'chronos_detail': _dynamo_to_float(item.get('chronos_detail', {})),
                         'signal': item.get('signal', 'HOLD'),
+                        'news_headlines': _dynamo_to_float(item.get('news_headlines', [])),
+                        'market_detail': _dynamo_to_float(item.get('market_detail', {})),
                     }
                     age = current_time - ts
                     print(f"  {pair}@{tf}: score={result[pair][tf]['total_score']:+.4f} (age={age}s)")
@@ -388,6 +401,23 @@ def _dynamo_to_float(data):
     elif isinstance(data, Decimal):
         return float(data)
     return data
+
+
+def _collect_news_from_tfs(available_tfs: dict) -> list:
+    """各TFに保存されたニュースヘッドラインを収集・重複除去して返す。
+    最新TF（タイムスタンプが大きい）のニュースを優先。"""
+    seen_titles = set()
+    all_news = []
+    # タイムスタンプが新しいTF順で処理
+    sorted_tfs = sorted(available_tfs.items(),
+                        key=lambda x: x[1].get('timestamp', 0), reverse=True)
+    for tf, data in sorted_tfs:
+        for n in data.get('news_headlines', []):
+            title = n.get('title', '') if isinstance(n, dict) else str(n)
+            if title and title not in seen_titles:
+                seen_titles.add(title)
+                all_news.append(n)
+    return all_news[:5]  # 最大5件
 
 
 def _calculate_multi_tf_score(pair: str, pair_tf_scores: dict,
@@ -454,10 +484,9 @@ def _calculate_multi_tf_score(pair: str, pair_tf_scores: dict,
             elif btc_dom < 40:
                 alt_dominance_adjustment = 0.05
 
-    # 最終スコア = TF加重平均 × (1-MKT_W) + MarketContext × MKT_W + alt調整
-    final_score = (weighted_score * (1 - MARKET_CONTEXT_WEIGHT) +
-                   market_context_normalized * MARKET_CONTEXT_WEIGHT +
-                   alt_dominance_adjustment)
+    # 最終スコア = TF加重平均 + alt調整
+    # ※ MarketContextは各per-TFスコアに含まれているため、ここでは加算しない
+    final_score = weighted_score + alt_dominance_adjustment
     final_score = max(-1.0, min(1.0, final_score))
 
     # BB幅の加重平均
@@ -466,12 +495,11 @@ def _calculate_multi_tf_score(pair: str, pair_tf_scores: dict,
 
     # コンポーネントスコアの加重平均
     avg_components = {}
-    for key in ['technical', 'chronos', 'sentiment']:
+    for key in ['technical', 'chronos', 'sentiment', 'market_context']:
         avg_components[key] = round(sum(
             data.get('components', {}).get(key, 0) * norm_w[tf]
             for tf, data in available_tfs.items()
         ), 3)
-    avg_components['market_context'] = round(market_context_normalized, 3)
 
     # Chronos確信度の加重平均
     avg_conf = sum(data.get('chronos_confidence', 0.5) * norm_w[tf]
@@ -502,7 +530,7 @@ def _calculate_multi_tf_score(pair: str, pair_tf_scores: dict,
         'current_price_usd': current_price_usd,
         'indicators_detail': indicators_detail,
         'chronos_detail': chronos_detail,
-        'news_headlines': [],
+        'news_headlines': _collect_news_from_tfs(available_tfs),
         'tf_breakdown': {
             tf: {
                 'score': round(data['total_score'], 4),
@@ -1093,16 +1121,47 @@ AI予測: {comp.get('chronos', 0):+.3f} (変化率={chr_d.get('predicted_change_
 市場環境: {comp.get('market_context', 0):+.3f} (F&G={mkt.get('fng_value', 'N/A')}, BTC Dom={mkt.get('btc_dominance', 'N/A')}%)
 TF整合性: {alignment}"""
 
-        # マルチTFブレークダウン
+        # マルチTFブレークダウン（シグナル名を明記）
         if tf_breakdown:
             tf_lines = []
             for tf in ['15m', '1h', '4h', '1d']:
                 if tf in tf_breakdown:
                     tf_data = tf_breakdown[tf]
                     w = tf_data.get('weight', 0)
-                    tf_lines.append(f"  {tf}: score={tf_data['score']:+.4f} (weight={w:.0%})")
+                    tf_sig = tf_data.get('signal', 'HOLD')
+                    tf_comp = tf_data.get('components', {})
+                    tf_lines.append(
+                        f"  {tf}: シグナル={tf_sig}, score={tf_data['score']:+.4f}, weight={w:.0%}"
+                        f" (tech={tf_comp.get('technical', 0):+.3f}, chronos={tf_comp.get('chronos', 0):+.3f},"
+                        f" sent={tf_comp.get('sentiment', 0):+.3f}, mkt={tf_comp.get('market_context', 0):+.3f})"
+                    )
             if tf_lines:
-                materials += "\nTFブレークダウン:\n" + '\n'.join(tf_lines)"""
+                materials += "\nTFブレークダウン:\n" + '\n'.join(tf_lines)
+
+            # TF間の方向性分析
+            tf_signals = {tf: tf_breakdown[tf].get('signal', 'HOLD') for tf in ['15m', '1h', '4h', '1d'] if tf in tf_breakdown}
+            buy_tfs = [tf for tf, s in tf_signals.items() if s == 'BUY']
+            sell_tfs = [tf for tf, s in tf_signals.items() if s == 'SELL']
+            hold_tfs = [tf for tf, s in tf_signals.items() if s == 'HOLD']
+            materials += f"\nTFシグナル集計: BUY={buy_tfs or 'なし'}, SELL={sell_tfs or 'なし'}, HOLD={hold_tfs or 'なし'}"
+
+            # 短期 vs 長期の方向性比較
+            short_tfs = {tf: tf_breakdown[tf] for tf in ['15m', '1h'] if tf in tf_breakdown}
+            long_tfs = {tf: tf_breakdown[tf] for tf in ['4h', '1d'] if tf in tf_breakdown}
+            if short_tfs and long_tfs:
+                short_avg = sum(d['score'] for d in short_tfs.values()) / len(short_tfs)
+                long_avg = sum(d['score'] for d in long_tfs.values()) / len(long_tfs)
+                if short_avg > 0.01 and long_avg > 0.01:
+                    tf_relation = "短期・長期ともに強気方向で一致"
+                elif short_avg < -0.01 and long_avg < -0.01:
+                    tf_relation = "短期・長期ともに弱気方向で一致"
+                elif short_avg > 0.01 and long_avg < -0.01:
+                    tf_relation = "短期は強気だが長期は弱気で乖離あり"
+                elif short_avg < -0.01 and long_avg > 0.01:
+                    tf_relation = "短期は弱気だが長期は強気で乖離あり"
+                else:
+                    tf_relation = "短期・長期ともに方向感が弱く中立"
+                materials += f"\n短期(15m,1h)平均={short_avg:+.4f} vs 長期(4h,1d)平均={long_avg:+.4f} → {tf_relation}"
 
         if news:
             headlines = '\n'.join(f"  - {n.get('title', '')} (score: {n.get('score', 0.5)})" for n in news[:3])
@@ -1115,9 +1174,10 @@ TF整合性: {alignment}"""
 ルール:
 - 敬体（です・ます調）で書く
 - なぜそのシグナル（BUY/SELL/HOLD）になったかを閾値と主要因を引用して説明する
-- 複数タイムフレームの方向性一致度（整合性）に言及する
+- 各TFのシグナル名（BUY/SELL/HOLD）は「TFブレークダウン」に記載された通りに正確に引用すること。スコアが負でもシグナルがHOLDならHOLDと書け。絶対に捏造しないでください
+- 短期(15m,1h)と長期(4h,1d)の方向性の一致・乖離に言及すること
 - データに基づいた客観的な分析を述べる
-- 150文字以内に収める"""
+- 200文字以内に収める"""
 
         response = bedrock.converse(
             modelId=BEDROCK_MODEL_ID,
@@ -1129,8 +1189,8 @@ TF整合性: {alignment}"""
         # 改行を除去して1行にする
         comment = comment.replace('\n', ' ').strip()
         # 長すぎる場合は切り詰め
-        if len(comment) > 200:
-            comment = comment[:197] + '...'
+        if len(comment) > 250:
+            comment = comment[:247] + '...'
 
         tokens_in = response.get('usage', {}).get('inputTokens', 0)
         tokens_out = response.get('usage', {}).get('outputTokens', 0)
@@ -1183,7 +1243,7 @@ def save_signal(scored: dict, buy_threshold: float, sell_threshold: float):
 
         news_headlines = scored.get('news_headlines', [])
         if news_headlines:
-            item['news_headlines'] = to_dynamo_map({'h': news_headlines[:3]})['h']
+            item['news_headlines'] = to_dynamo_map({'h': news_headlines[:5]})['h']
 
         market_detail = scored.get('market_context_detail', {})
         if market_detail:
