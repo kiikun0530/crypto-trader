@@ -45,9 +45,12 @@ MARKET_CONTEXT_WEIGHT = float(os.environ.get('MARKET_CONTEXT_WEIGHT', '0.15'))
 # ボラティリティ適応型閾値
 # 基準閾値（平均的なボラティリティ時に使用）
 # Phase 4: Tech重み削減(0.45→0.35)でスコア圧縮 + AI均等化
-# 旧 BUY=0.28 / SELL=-0.15 → 新 BUY=0.25 / SELL=-0.13
-BASE_BUY_THRESHOLD = float(os.environ.get('BASE_BUY_THRESHOLD', '0.25'))
-BASE_SELL_THRESHOLD = float(os.environ.get('BASE_SELL_THRESHOLD', '-0.13'))
+# 旧 BUY=0.28 / SELL=-0.15 → Phase 4 BUY=0.25 / SELL=-0.13
+# Phase 5: 4成分×4TFの同方向合意が高閾値で困難 → BUY=0.18 / SELL=-0.10
+#   0.18でも Tech(+0.3)+Chronos(+0.2)+Sent(+0.1)+MKT(+0.1)=0.23 → BUY
+#   少なくとも2主要成分がポジティブでないとシグナル発生しない
+BASE_BUY_THRESHOLD = float(os.environ.get('BASE_BUY_THRESHOLD', '0.18'))
+BASE_SELL_THRESHOLD = float(os.environ.get('BASE_SELL_THRESHOLD', '-0.10'))
 # BB幅の基準値（暗号通貨の典型的なBB幅 ≈ 3%）
 BASELINE_BB_WIDTH = float(os.environ.get('BASELINE_BB_WIDTH', '0.03'))
 # ボラティリティ補正のクランプ範囲

@@ -21,6 +21,7 @@
 12. [02/12 シグナル根拠データの保存拡張](#12-0212-シグナル根拠データの保存拡張)
 13. [02/12 テクニカルスコア計算の過剰反応修正（RSI/BB/SMA）](#13-0212-テクニカルスコア計算の過剰反応修正rsibbs ma)
 14. [02/12 ニュース日時のJST変換保存](#14-0212-ニュース日時のjst変換保存)
+15. [02/17 BUY/SELL閾値緩和 + HOLD的中判定追加](#15-0217-buysell閾値緩和--hold的中判定追加)
 
 ---
 
@@ -767,3 +768,63 @@ CryptoPanicから取得するニュース記事の `published_at`（ISO 8601 UTC
 ### API制限への影響
 
 なし。API呼び出し回数は変更なし（2 calls/実行 × 30分間隔 = 2,880/月、Growth Plan 3,000内）。
+
+---
+
+## 15. 02/17 BUY/SELL閾値緩和 + HOLD的中判定追加
+
+### 概要
+
+Phase 4 の閾値 (BUY=0.25 / SELL=-0.13) が保守的すぎ、4成分×4TFの同方向合意を要求した結果、
+実運用で継続的にHOLDのみ発生。パフォーマンス実績ページ(Phase 2)のデータが蓄積されず、
+サービスとしての価値証明が不可能だった。
+
+### 問題の数学的根拠
+
+- total_score = tech(0.35) × 0.35 + chronos(0.35) × 0.35 + sent(0.15) × 0.15 + mkt(0.15) × 0.15
+- BUY閾値 0.25 に到達するには: Tech/Chronosの両方が +0.35 以上かつ他が中立以上が必要
+- TF間不一致ペナルティ(×0.85)やF&G補正(+0.06)でさらにハードルが上がる
+- 結果: 普通の市場環境ではBUY/SELLがほぼ発生しない
+
+### 修正
+
+| 変更 | 旧値 | 新値 |
+|---|---|---|
+| BASE_BUY_THRESHOLD | 0.25 | 0.18 |
+| BASE_SELL_THRESHOLD | -0.13 | -0.10 |
+
+**0.18 でも堅実な理由:**
+- Tech(+0.3) + Chronos(+0.2) + Sent(+0.1) + MKT(+0.1) = 0.23 → BUY
+- 2主要成分がポジティブでないとシグナル発生しない
+- ボラ補正 + F&G補正で実効閾値はさらに上がる
+
+### HOLD的中判定の追加
+
+result-checker に HOLD シグナルの正確性判定ロジックを追加:
+
+| 判定 | 条件 |
+|---|---|
+| CORRECT | |価格変動| ≤ 0.3% → 動かなかったのでHOLDは正解 |
+| MISSED | |価格変動| > 0.3% → 動いたので機会損失の可能性 |
+
+- HOLD用時間窓: hold_result_4h, hold_result_12h
+- フロントエンドに「HOLD判断の正確性」セクション追加
+- WIN/LOSS/DRAW/CORRECT/MISSEDの判定基準をUIに明示
+
+### 変更ファイル
+
+| ファイル | 変更内容 |
+|---|---|
+| `crypto-trader/services/aggregator/handler.py` | BASE_BUY_THRESHOLD: 0.25→0.18, BASE_SELL_THRESHOLD: -0.13→-0.10 |
+| `crypto-trader/services/result-checker/handler.py` | `_check_hold_results()` 追加, HOLD判定用時間窓追加 |
+| `crypto-signal/backend/api/handler.py` | HOLD正確性データ返却対応, DEFAULT_BUY/SELL更新 |
+| `crypto-signal/frontend/index.html` | 判定基準パネル, HOLD正確性セクション追加 |
+| `crypto-trader/docs/trading-strategy.md` | 閾値・結果判定ロジックのドキュメント更新 |
+
+### コスト影響
+
+- DynamoDB Write: HOLD判定で UpdateItem が追加（HOLD 1件 × 2窓 = 最大2回/HOLD）
+  - 15分に3通貨 × 2窓 = 6 UpdateItem/15分 = 576回/日
+  - WCU消費: 1件あたり約1WCU → ピーク影響なし（既存の25 WCUプロビジョン内）
+- Lambda実行時間: result-checker のHOLDチェック分で数秒増加（誤差範囲）
+- **月額追加費用: ≈ $0（DynamoDB Free Tier / プロビジョン内）**

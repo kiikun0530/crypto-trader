@@ -32,12 +32,22 @@ RESULT_WINDOWS = {
 # 的中判定閾値 (%)
 WIN_THRESHOLD_PCT = float(os.environ.get('WIN_THRESHOLD_PCT', '0.3'))
 
+# HOLD的中判定閾値 (%): 価格変動がこれ以下ならHOLDは正解
+# BUY/SELLの的中閾値と同じ値を使用（対称的な評価）
+HOLD_CORRECT_PCT = float(os.environ.get('HOLD_CORRECT_PCT', '0.3'))
+
+# HOLD判定用の時間窓: 4h と 12h のみ（短すぎる1hは常に小変動、3dは長すぎてHOLD不適切）
+HOLD_RESULT_WINDOWS = {
+    'hold_result_4h':  14400,
+    'hold_result_12h': 43200,
+}
+
 # 検索対象期間 (最大窓 3d + 2h バッファ)
 LOOKBACK_SECONDS = 259200 + 7200
 
 
 def handler(event, context):
-    """メインハンドラ: 全通貨のBUY/SELLシグナルの結果を判定"""
+    """メインハンドラ: 全通貨のBUY/SELL/HOLDシグナルの結果を判定"""
     try:
         now = int(time.time())
         signals_table = dynamodb.Table(SIGNALS_TABLE)
@@ -45,6 +55,8 @@ def handler(event, context):
         total_updated = 0
         total_checked = 0
         total_completed = 0
+        hold_updated = 0
+        hold_checked = 0
 
         for pair in TRADING_PAIRS:
             # 直近 3d+2h 分のシグナルを取得
@@ -58,6 +70,11 @@ def handler(event, context):
             for item in items:
                 signal = item.get('signal', 'HOLD')
                 if signal == 'HOLD':
+                    # HOLD的中判定: 価格変動が小さければHOLDは正解
+                    hold_checked += 1
+                    h_updated, _ = _check_hold_results(item, pair, now)
+                    if h_updated:
+                        hold_updated += 1
                     continue
 
                 total_checked += 1
@@ -67,14 +84,17 @@ def handler(event, context):
                 if completed:
                     total_completed += 1
 
-        print(f"[result-checker] Done: checked={total_checked}, "
+        print(f"[result-checker] Done: BUY/SELL checked={total_checked}, "
               f"updated={total_updated}, fully_completed={total_completed}")
+        print(f"[result-checker] HOLD: checked={hold_checked}, updated={hold_updated}")
 
         return {
             'statusCode': 200,
             'checked': total_checked,
             'updated': total_updated,
             'completed': total_completed,
+            'hold_checked': hold_checked,
+            'hold_updated': hold_updated,
         }
 
     except Exception as e:
@@ -86,6 +106,67 @@ def handler(event, context):
 # =============================================================================
 # 結果判定ロジック
 # =============================================================================
+
+def _check_hold_results(item: dict, pair: str, now: int) -> tuple:
+    """
+    HOLDシグナルの的中判定。
+
+    HOLDの正解条件: 観察窓内の価格変動が ±HOLD_CORRECT_PCT 以内。
+    つまり「動かなかったから何もしなくて正解」を記録する。
+
+    Returns:
+        (updated: bool, all_completed: bool)
+    """
+    signal_ts = int(item['timestamp'])
+
+    # entry_price の取得
+    entry_price = float(item.get('entry_price', 0))
+    if entry_price <= 0:
+        entry_price = _get_price_at(pair, signal_ts)
+        if entry_price <= 0:
+            return False, False
+
+    updates = {}
+    pending_windows = 0
+
+    for window_key, window_seconds in HOLD_RESULT_WINDOWS.items():
+        # 既に記入済みならスキップ
+        if item.get(window_key):
+            continue
+
+        target_ts = signal_ts + window_seconds
+        if now < target_ts:
+            pending_windows += 1
+            continue
+
+        exit_price = _get_price_at(pair, target_ts)
+        if exit_price <= 0:
+            pending_windows += 1
+            continue
+
+        # 変動率計算
+        pct = (exit_price - entry_price) / entry_price * 100
+        abs_pct = abs(pct)
+
+        # HOLD的中判定:
+        # CORRECT: 変動 ≤ HOLD_CORRECT_PCT → HOLDで正解（動かなかった）
+        # MISSED:  変動 > HOLD_CORRECT_PCT → 機会損失の可能性あり
+        outcome = 'CORRECT' if abs_pct <= HOLD_CORRECT_PCT else 'MISSED'
+
+        updates[window_key] = {
+            'price_change_pct': round(pct, 3),
+            'abs_change_pct': round(abs_pct, 3),
+            'outcome': outcome,
+            'exit_price': round(exit_price, 8),
+        }
+
+    if not updates:
+        return False, (pending_windows == 0)
+
+    _update_signal(pair, signal_ts, entry_price, updates)
+    all_completed = (pending_windows == 0)
+    return True, all_completed
+
 
 def _check_signal_results(item: dict, pair: str, now: int) -> tuple:
     """
